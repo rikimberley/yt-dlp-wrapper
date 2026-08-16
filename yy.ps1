@@ -5,7 +5,8 @@
 # Description:
 # - stores a positional URL into ./current_url.txt and downloads it
 # - uses -t <temp_url> to download a one-off URL without persisting it
-# - uses -U to run only the updater and skip any download
+# - uses -U to update ./yt-dlp and refresh this script from the head of master
+#   on GitHub, then skip any download
 # - uses -o to open the channels in ./channel-ids.txt that published a public
 #   video after the epoch timestamp in ./checkpoint.txt, and skip any download
 #   (exits 1 if any channel could not be checked)
@@ -72,6 +73,8 @@ $requestHeaders = @{
 }
 $fetchTimeoutSec = 45
 $fetchAttempts = 3
+# Head of master in the wrapper's own repo, used by -U to refresh this script.
+$scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master'
 
 $Url = ''
 $TempUrl = ''
@@ -348,6 +351,63 @@ function Get-WebContent {
     return $null
 }
 
+# Refresh this wrapper in place from the head of master on GitHub, so a copy
+# living outside a git clone (this is the Windows box) still tracks the repo.
+# $Sentinel is the first line the payload must start with; anything else is
+# assumed to be an error page or a captive-portal interstitial and is refused,
+# because writing it would leave the machine with no working wrapper at all.
+# Returns $true on success (including "already up to date").
+function Update-Self {
+    param([string]$Name, [string]$Sentinel)
+
+    $uri = "$scriptRawBase/$Name"
+    $body = Get-WebContent $uri "$Name from master"
+    if ($null -eq $body -or $body -eq '') {
+        [Console]::Error.WriteLine("Warning: could not refresh $Name from master")
+        return $false
+    }
+    if (-not $body.StartsWith($Sentinel)) {
+        [Console]::Error.WriteLine(
+            "Warning: refusing to overwrite ${Name}: fetched body does not start with $Sentinel")
+        return $false
+    }
+
+    $target = Join-Path $PSScriptRoot $Name
+    $normalized = $body.TrimEnd("`r", "`n") + "`n"
+    if (Test-Path -LiteralPath $target) {
+        $existing = [System.IO.File]::ReadAllText($target)
+        if ($existing.TrimEnd("`r", "`n") -ceq $normalized.TrimEnd("`r", "`n")) {
+            Write-Host "$Name is already up to date"
+            return $true
+        }
+    }
+
+    # Write to a same-directory temp file and rename, so an interrupted write can
+    # never truncate the running script. UTF-8 *without* a BOM: Set-Content
+    # -Encoding UTF8 on 5.1 would prepend one and the file would stop matching
+    # the repo byte for byte. The .bak is the escape hatch for a clone that had
+    # uncommitted local edits.
+    $temp = "$target.new.$PID"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temp, $normalized, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $target) {
+            Copy-Item -LiteralPath $target -Destination "$target.bak" -Force
+        }
+        Move-Item -LiteralPath $temp -Destination $target -Force
+    }
+    catch {
+        [Console]::Error.WriteLine("Warning: could not write ${Name}: $($_.Exception.Message)")
+        if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+        return $false
+    }
+
+    Write-Host "Updated $Name from master (previous copy saved as $Name.bak)"
+    return $true
+}
+
 # Extract the UC… channel id from a channel page, trying each known shape.
 function Get-ChannelId {
     param([string]$Html)
@@ -593,7 +653,8 @@ if ($Update) {
         exit 1
     }
     Invoke-YCommand $exe -U
-    exit 0
+    if (Update-Self 'yy.ps1' '#!/usr/bin/env pwsh') { exit 0 }
+    exit 1
 }
 
 $openFailures = 0

@@ -3,7 +3,7 @@
 Personal wrapper around a vendored [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 binary for downloading videos/playlists to a local scratch directory.
 
-**This directory is a git repository** — a *private* repo on the maintainer's
+**This directory is a git repository** — a *public* repo on the maintainer's
 **personal** GitHub account (`rikimberley`), not a LinkedIn one. Nothing here
 is LinkedIn work. Read `## Git and GitHub` below before running any git command,
 and read the parent `../AGENTS.md` (sharing and secret-handling rules still
@@ -19,7 +19,7 @@ apply — the parent tree itself remains untracked).
 | `README.md`        | Public-facing docs for the repo, including how to fetch the uncommitted binary. |
 | `.gitignore`       | Secrets, the binary, runtime state and output. Treat as safety-critical. |
 | `current_url.txt` | Persisted "last URL" — single line, rewritten whenever a positional URL is passed. *(gitignored)* |
-| `channel-ids.txt` | Input for `-o`/`-O`. One YouTube channel handle per line (a leading `@` is optional, non-ASCII handles are fine). A raw `UC…` channel id is also accepted and skips handle resolution entirely. Blank lines and `#` comments are skipped. |
+| `channel-ids.txt` | Input for `-o`/`-O`. One YouTube channel handle per line (a leading `@` is optional, non-ASCII handles are fine). A raw `UC…` channel id is also accepted and skips handle resolution entirely. Blank lines and `#` comments are skipped. *(gitignored — it is a subscription list, and the repo is public)* |
 | `checkpoint.txt`  | Input for `-o`, rewritten by `-c`. Single epoch timestamp; 12+ digits is read as milliseconds, shorter as seconds. *(gitignored)* |
 | `channel-id-cache.txt` | Generated cache mapping each handle to its `UC…` channel id, TAB separated, one per line. Pure cache — safe to delete, costs one page fetch per channel to rebuild. *(gitignored)* |
 | `cookies.txt`            | **SECRET.** Netscape-format YouTube cookie jar with live session tokens. *(gitignored)* |
@@ -38,7 +38,9 @@ Both `yy.zsh` and `yy.ps1` implement the same interface:
 - `-t <temp_url>` — downloads this URL instead, **without** persisting it
   (a positional `<url>` given alongside `-t` is still persisted but not used
   for this run)
-- `-U` — runs `./yt-dlp -U` (self-update) only, and exits without downloading
+- `-U` — runs `./yt-dlp -U` (self-update), then refreshes the wrapper itself
+  from the head of `master` on GitHub, and exits without downloading. Exits
+  non-zero if the refresh failed.
 - `-o` — for each channel in `channel-ids.txt`, opens
   `https://www.youtube.com/@<channel-id>/videos` in the default browser **only
   if** that channel has a public video published after `checkpoint.txt`;
@@ -80,6 +82,38 @@ Every fetch is retried (3 attempts, linear backoff) except on a settled 4xx
 other than 408/429, and requests are gzipped: a channel page is ~1.2 MB raw but
 ~270 KB compressed, and the uncompressed transfer is what kept timing out on
 Windows PowerShell 5.1 and surfacing as "no public videos found".
+
+### How `-U` refreshes the wrapper
+
+Each wrapper refreshes **only itself** — `yy.zsh` fetches `yy.zsh`, `yy.ps1`
+fetches `yy.ps1` — from
+`https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master/<name>`,
+reusing the same gzip + retry fetch path as `-o`. This exists because the
+Windows copy is not a git clone and has no other way to track the repo.
+
+Three invariants, both wrappers:
+
+- **Refuse a payload that does not start with the expected shebang**
+  (`#!/bin/zsh`, `#!/usr/bin/env pwsh`). A captive portal or an error page
+  written over the wrapper would leave the machine with no working wrapper at
+  all — and no way to self-update out of it.
+- **Write to a same-directory temp file, then rename.** An interrupted write
+  must never truncate the running script, and a cross-filesystem `/tmp` staging
+  file would lose the atomic rename.
+- **Keep the replaced copy as `<name>.bak`.** On the Mac the wrapper *is* the
+  git working tree, so `-U` can clobber uncommitted edits; the `.bak` is the
+  only way back. Both `*.bak` and `*.new.*` are gitignored.
+
+The file is written as **UTF-8 with no BOM** and left with LF endings, so it
+stays byte-identical to the repo. In `yy.ps1` that means
+`[System.IO.File]::WriteAllText` with `UTF8Encoding($false)` — 5.1's
+`Set-Content -Encoding UTF8` prepends a BOM and would make every run see a diff.
+
+`Update-Self` reports progress with `Write-Host`, never `Write-Output`:
+`Write-Output` would join the message into the function's return value and the
+`if (Update-Self …)` test would stop meaning anything.
+
+### The download invocation
 
 The download invocation is exactly:
 
@@ -160,7 +194,8 @@ isolation below is deliberate. Do not "simplify" any of it.
 
 | Setting | Value | Why |
 |---|---|---|
-| Repo | `rikimberley/yt-dlp-wrapper` (**private**) | Named `-wrapper` so it is not mistaken for upstream `yt-dlp`, whose name is taken |
+| Repo | `rikimberley/yt-dlp-wrapper` (**public**) | Named `-wrapper` so it is not mistaken for upstream `yt-dlp`, whose name is taken. Public so `-U` can fetch the wrapper from `raw.githubusercontent.com` with no credentials — a token-authenticated fetch would mean shipping a token to every machine that runs it. |
+| Default branch | `master` | Renamed from `main`; `$script_raw_base` / `$scriptRawBase` in both wrappers point at `.../master/`, so renaming the branch again breaks `-U` on every already-deployed copy |
 | Remote | `git@github.com:rikimberley/yt-dlp-wrapper.git` | Plain github.com; the key is pinned by `core.sshCommand`, not by an SSH `Host` alias |
 | `user.name` | `rikimberley` | Not the work account name |
 | `user.email` | `85369872+rikimberley@users.noreply.github.com` | GitHub noreply — never publishes a real or work email |
@@ -266,9 +301,9 @@ LFS — it buys nothing here.
 `.gitignore` is safety-critical, not tidiness. Before any `git add`, confirm:
 
 ```bash
-git check-ignore -v cookies.txt yt-dlp current_url.txt checkpoint.txt channel-id-cache.txt
+git check-ignore -v cookies.txt yt-dlp current_url.txt checkpoint.txt channel-id-cache.txt channel-ids.txt
 git add -An            # dry run: review exactly what would be tracked
-git ls-files           # after committing: must be 6 files, no secrets
+git ls-files           # after committing: must be 5 files, no secrets
 ```
 
 - `cookies.txt` is the one that matters. It holds live `SID`, `SAPISID`,
@@ -279,9 +314,11 @@ git ls-files           # after committing: must be 6 files, no secrets
 - If a secret is ever committed, the fix is **revoke first**: sign out of
   YouTube everywhere to kill the sessions, re-export cookies, *then* rewrite
   history. Rewriting history alone does not un-leak anything already pushed.
-- `channel-ids.txt` is committed and reveals what the maintainer subscribes to.
-  That is acceptable only because the repo is private — if it is ever made
-  public, reconsider.
+- `channel-ids.txt` reveals what the maintainer subscribes to, so it is
+  **gitignored**. It was tracked while the repo was private; that history was
+  purged with `git filter-branch` before the repo went public, so no commit
+  reachable from `master` contains it. Do not re-add it — `git add -f` would put
+  it straight back into a public history.
 
 ### Work-vs-personal separation
 
@@ -309,9 +346,14 @@ Rules for anyone (human or agent) working in this repo:
   explains a real constraint; do not expand on it.
 - **Ownership is a question for the user, not for an agent.** Developing a
   personal project on a corporate-managed machine can implicate IP-assignment
-  policy. Keeping the repo private limits exposure, but if the user asks about
-  making it public, tell them to confirm with their manager or legal rather
-  than answering it yourself.
+  policy. The repo is now **public**, which removes the containment that being
+  private provided — the maintainer was told to confirm with their manager or
+  legal, and that remains their call, not an agent's. Do not answer it yourself,
+  and do not treat "it is already public" as settling the question.
+- **Public repo tightens the "never commit" rules, it does not relax them.**
+  Every `git push` is now world-readable and immediately mirrored by third-party
+  crawlers, so a leaked `cookies.txt` is exposed the moment it lands rather than
+  only to collaborators. Re-read `### Never commit` before any `git add`.
 
 
 

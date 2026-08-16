@@ -21,10 +21,20 @@ yt-dlp.exe
 
 # ---------------------------------------------------------------------------
 # Runtime state and personal viewing history — local to each machine.
+# channel-ids.txt is a subscription list: it names exactly who the maintainer
+# follows, which is not something to publish from a public repo.
 # ---------------------------------------------------------------------------
 current_url.txt
 checkpoint.txt
 channel-id-cache.txt
+channel-ids.txt
+
+# ---------------------------------------------------------------------------
+# Scratch files written by the -U self-update: a same-directory temp file that
+# is renamed into place, and the backup of the wrapper it replaced.
+# ---------------------------------------------------------------------------
+*.new.*
+*.bak
 
 # ---------------------------------------------------------------------------
 # Download output. Disposable scratch, and never redistribute downloaded media.

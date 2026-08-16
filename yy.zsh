@@ -5,7 +5,8 @@
 # Description:
 # - stores a positional URL into ./current_url.txt and downloads it
 # - uses -t <temp_url> to download a one-off URL without persisting it
-# - uses -U to run only the updater and skip any download
+# - uses -U to update ./yt-dlp and refresh this script from the head of master
+#   on GitHub, then skip any download
 # - uses -o to open the channels in ./channel-ids.txt that published a public
 #   video after the epoch timestamp in ./checkpoint.txt, and skip any download
 #   (exits 1 if any channel could not be checked)
@@ -41,6 +42,8 @@ consent_cookie="SOCS=CAI; CONSENT=YES+cb"
 accept_language="en-US,en;q=0.9"
 fetch_timeout_sec=45
 fetch_attempts=3
+# Head of master in the wrapper's own repo, used by -U to refresh this script.
+script_raw_base="https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master"
 current_url=""
 temp_url=""
 do_update=0
@@ -174,6 +177,42 @@ fetch_url() {
   done
   printf 'Warning: giving up on %s (%s): %s\n' "$what" "$url" "$fetch_error" >&2
   return 1
+}
+
+# Refresh this wrapper in place from the head of master on GitHub, so a copy
+# living outside a git clone (the Windows box) still tracks the repo. $2 is the
+# first line the payload must start with; anything else is assumed to be an
+# error page or a captive-portal interstitial and is refused, because writing it
+# would leave the machine with no working wrapper at all.
+update_self() {
+  local name=$1 sentinel=$2 url body tmp
+  url="${script_raw_base}/${name}"
+  body=$(fetch_url "$url" "${name} from master") || {
+    printf 'Warning: could not refresh %s from master\n' "$name" >&2
+    return 1
+  }
+  if [[ "$body" != "${sentinel}"* ]]; then
+    printf 'Warning: refusing to overwrite %s: fetched body does not start with %s\n' \
+      "$name" "$sentinel" >&2
+    return 1
+  fi
+  if [[ -f "./$name" && "$(<"./$name")" == "$body" ]]; then
+    printf '%s is already up to date\n' "$name"
+    return 0
+  fi
+  # Write to a same-directory temp file and rename, so an interrupted write can
+  # never truncate the running script. The .bak is the escape hatch for a clone
+  # that had uncommitted local edits.
+  tmp="./${name}.new.$$"
+  print -r -- "$body" > "$tmp" || return 1
+  if [[ -x "./$name" ]]; then
+    chmod +x "$tmp" || true
+  fi
+  if [[ -f "./$name" ]]; then
+    cp -p -- "./$name" "./${name}.bak" || true
+  fi
+  mv -f -- "$tmp" "./$name" || return 1
+  printf 'Updated %s from master (previous copy saved as %s.bak)\n' "$name" "$name"
 }
 
 # Percent-encode $1 so a non-ASCII channel handle always travels as UTF-8.
@@ -489,7 +528,9 @@ if (( do_update )); then
     exit 1
   }
   run_cmd "$ytdlp_exe" -U
-  exit 0
+  update_status=0
+  update_self "yy.zsh" '#!/bin/zsh' || update_status=1
+  exit $update_status
 fi
 
 open_failures=0

@@ -32,6 +32,17 @@ signed updater:
 ./yy.zsh -U
 ```
 
+`-U` also refreshes the wrapper itself from the head of `master` in this repo,
+so a copy that lives outside a git clone stays current. The download is refused
+unless it starts with the expected shebang, and the copy it replaces is kept as
+`yy.zsh.bak` / `yy.ps1.bak` — so if you had uncommitted local edits, they are
+recoverable there.
+
+You also need a `channel-ids.txt` next to the wrappers if you want `-o`/`-O` —
+one channel handle (a leading `@` is optional) or raw `UC…` id per line, with
+`#` comments and blank lines ignored. It is gitignored, because a subscription
+list names exactly who you follow.
+
 You also need a `cookies.txt` next to the wrappers — a Netscape-format cookie
 jar exported from a browser where you are signed in to YouTube. It is
 gitignored and must stay that way: it holds live session tokens. Cookies
@@ -49,13 +60,14 @@ re-exporting.
 | `<url>` | Persist to `current_url.txt`, then download it |
 | *(no args)* | Re-download the URL in `current_url.txt` |
 | `-t <url>` | Download this URL once, without persisting it |
-| `-U` | Self-update the binary, then exit |
+| `-U` | Self-update the binary *and* this wrapper from `master`, then exit |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
 | `-c` | Write the current timestamp to `checkpoint.txt`, then exit |
 
 Precedence: `-U`, then `-o`/`-O`, then `-c`, then download. `-o` and `-O` are
-mutually exclusive. `-o` exits non-zero if any channel could not be checked.
+mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
+`-U` exits non-zero if the wrapper could not be refreshed.
 
 `./yy.zsh -o -c` means "open whatever is new, then mark everything as seen".
 
@@ -64,7 +76,7 @@ mutually exclusive. `-o` exits non-zero if any channel could not be checked.
 | Path | Role |
 |---|---|
 | `yy.zsh` / `yy.ps1` | The wrappers. Behaviourally identical; keep them in sync. |
-| `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored |
+| `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored *(gitignored)* |
 | `checkpoint.txt` | Epoch timestamp `-o` compares against *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
