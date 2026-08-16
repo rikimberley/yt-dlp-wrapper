@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# SECRETS — never commit. cookies.txt is a Netscape cookie jar holding live
+# YouTube session tokens (SID, SAPISID, __Secure-*PSID, LOGIN_INFO); leaking it
+# is an account takeover, not just a lost login. If it ever lands in a commit,
+# sign out of YouTube everywhere to revoke the session, then rewrite history.
+# ---------------------------------------------------------------------------
+cookies.txt
+*cookies*
+.env
+*.token
+*.key
+*credentials*
+
+# ---------------------------------------------------------------------------
+# Vendored binary (~38 MB). Deliberately not committed: ./yy.zsh -U rewrites it
+# in place, so every update would add another 38 MB blob to history forever.
+# See README.md for how to fetch it.
+# ---------------------------------------------------------------------------
+yt-dlp
+yt-dlp.exe
+
+# ---------------------------------------------------------------------------
+# Runtime state and personal viewing history — local to each machine.
+# ---------------------------------------------------------------------------
+current_url.txt
+checkpoint.txt
+channel-id-cache.txt
+
+# ---------------------------------------------------------------------------
+# Download output. Disposable scratch, and never redistribute downloaded media.
+# ---------------------------------------------------------------------------
+t/
+
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+*.swp
