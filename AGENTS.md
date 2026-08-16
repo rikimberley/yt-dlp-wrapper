@@ -316,9 +316,16 @@ git ls-files           # after committing: must be 5 files, no secrets
   history. Rewriting history alone does not un-leak anything already pushed.
 - `channel-ids.txt` reveals what the maintainer subscribes to, so it is
   **gitignored**. It was tracked while the repo was private; that history was
-  purged with `git filter-branch` before the repo went public, so no commit
-  reachable from `master` contains it. Do not re-add it — `git add -f` would put
-  it straight back into a public history.
+  purged with `git filter-branch`, so no commit reachable from `master` contains
+  it. Do not re-add it — `git add -f` would put it straight back into a public
+  history.
+  Note the purge is *not* a revocation: GitHub still serves orphaned commits by
+  direct SHA until its own GC runs, so the pre-rewrite blob remains fetchable at
+  the old SHAs. That was accepted deliberately — the exposure is two channel
+  handles — rather than deleting and recreating the repo. Do not repeat this
+  reasoning for anything sensitive: for a real secret the rewrite is worthless
+  on its own, and the rule in this section stands (**revoke first**, then
+  rewrite).
 
 ### Work-vs-personal separation
 
