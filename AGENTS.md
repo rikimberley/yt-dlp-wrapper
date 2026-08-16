@@ -195,6 +195,25 @@ the *wrong identity*. The per-repo `core.sshCommand` with `IdentitiesOnly=yes`
 volunteer the corporate key) closes both holes without touching any
 corporate-managed file. Keep personal config out of corporate files.
 
+### Pushing
+
+Copilot CLI on this machine blocks the `ssh` command via a security hook, so an
+agent cannot run `ssh -T git@github.com` or push. Pushes are a **user action**
+from a normal terminal. Do not work around the hook, and do not switch the
+remote to HTTPS to dodge it — HTTPS would fall back to the `osxkeychain`
+credential helper, which holds the *work* GitHub token, and the push would
+authenticate as the wrong account.
+
+Verify isolation from a normal terminal before the first push:
+
+```bash
+ssh -i ~/.ssh/rikimberley_github_ed25519 -o IdentitiesOnly=yes \
+    -o IdentityAgent=none -T git@github.com
+```
+
+It must greet you as `rikimberley`. If it says `qihuang_LinkedIn`, stop — the
+corporate key is being offered and the isolation is broken.
+
 ### The binary is intentionally not committed
 
 `yt-dlp` (~38 MB) is gitignored. `./yy.zsh -U` rewrites it in place, so
