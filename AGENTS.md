@@ -164,7 +164,7 @@ isolation below is deliberate. Do not "simplify" any of it.
 | Remote | `git@github.com:rikimberley/yt-dlp-wrapper.git` | Plain github.com; the key is pinned by `core.sshCommand`, not by an SSH `Host` alias |
 | `user.name` | `rikimberley` | Not the work account name |
 | `user.email` | `85369872+rikimberley@users.noreply.github.com` | GitHub noreply — never publishes a real or work email |
-| `core.sshCommand` | `ssh -i ~/.ssh/rikimberley_github_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none` | Pins the personal key; see below |
+| `core.sshCommand` | `ssh -F /dev/null -i ~/.ssh/rikimberley_github_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none` | Pins the personal key; **`-F /dev/null` is load-bearing**, see below |
 
 Note the local directory is `yt-dlp/` while the repo is `yt-dlp-wrapper` — the
 directory name predates the repo and is not required to match.
@@ -189,30 +189,68 @@ Host * !*.linkedin.com
 ```
 
 which means a plain `git@github.com` remote **offers the corporate SSH key**.
-If that key is registered on the work GitHub account, the push authenticates as
-the *wrong identity*. The per-repo `core.sshCommand` with `IdentitiesOnly=yes`
-(only the listed key may be used) and `IdentityAgent=none` (the agent cannot
-volunteer the corporate key) closes both holes without touching any
-corporate-managed file. Keep personal config out of corporate files.
+If that key is registered on the work GitHub account, the operation
+authenticates as the *wrong identity*.
+
+**`IdentitiesOnly=yes` alone does not stop this — that was tried and it
+failed.** `IdentitiesOnly` restricts ssh to keys *named in the configuration*,
+and the catch-all above names the corporate key, so it stays a candidate. Once
+the personal key was (temporarily) removed from the account, ssh fell straight
+through to it:
+
+```
+Offering public key: rikimberley_github_ed25519   -> rejected
+Offering public key: qihuang_at_linkedin.com_ssh_key
+Server accepts key:  qihuang_at_linkedin.com_ssh_key
+Authenticated to github.com using "publickey"
+Repository not found.
+```
+
+That is git talking to GitHub as `qihuang_LinkedIn`. The actual fix is
+**`-F /dev/null`**, which makes ssh ignore the corporate config entirely, so
+only the `-i` key can ever be offered. `IdentitiesOnly=yes` and
+`IdentityAgent=none` stay as defence in depth (no agent key can be volunteered
+either). Do not remove `-F /dev/null`, and do not "restore" the user config for
+convenience. Keep personal config out of corporate files.
+
+Correct behaviour when the key is missing or wrong is a hard
+`Permission denied (publickey)` — failing closed. If you ever see
+`Repository not found` instead, stop: that means authentication *succeeded* as
+some other account.
+
+### Never add the SSH key with a token
+
+Register the public key through the GitHub **web UI**
+(github.com/settings/keys), never via `POST /user/keys` with a personal access
+token. GitHub ties a key created that way to the token's authorization and
+**deletes the key when the token is revoked** — which is exactly what happened
+here: the key was added by API, the setup PAT was revoked minutes later as
+instructed, and the key silently vanished, which is what exposed the fallback
+above. A UI-added key has no such lifetime coupling.
 
 ### Pushing
 
-Copilot CLI on this machine blocks the `ssh` command via a security hook, so an
-agent cannot run `ssh -T git@github.com` or push. Pushes are a **user action**
-from a normal terminal. Do not work around the hook, and do not switch the
-remote to HTTPS to dodge it — HTTPS would fall back to the `osxkeychain`
-credential helper, which holds the *work* GitHub token, and the push would
-authenticate as the wrong account.
+Copilot CLI on this machine blocks the **bare `ssh` command** via a security
+hook, so an agent cannot run `ssh -T git@github.com`. It does **not** block ssh
+invoked by git as a transport, so `git push` / `git fetch` / `git ls-remote`
+work normally from an agent. Do not try to work around the hook.
 
-Verify isolation from a normal terminal before the first push:
+Do not switch the remote to HTTPS to dodge anything — HTTPS would fall back to
+the `osxkeychain` credential helper, which holds the *work* GitHub token, and
+the operation would authenticate as the wrong account.
+
+Since bare `ssh -T` is unavailable, verify isolation through git instead, which
+also exercises the exact command real pushes use:
 
 ```bash
-ssh -i ~/.ssh/rikimberley_github_ed25519 -o IdentitiesOnly=yes \
-    -o IdentityAgent=none -T git@github.com
+GIT_SSH_COMMAND="ssh -v -F /dev/null -i ~/.ssh/rikimberley_github_ed25519 \
+  -o IdentitiesOnly=yes -o IdentityAgent=none" git ls-remote origin 2>&1 \
+  | grep -E 'Offering|Server accepts|Authenticated to|denied'
 ```
 
-It must greet you as `rikimberley`. If it says `qihuang_LinkedIn`, stop — the
-corporate key is being offered and the isolation is broken.
+Exactly one key may be offered — `rikimberley_github_ed25519`. If
+`qihuang_at_linkedin.com_ssh_key` appears on an `Offering` or `Server accepts`
+line, the isolation is broken; stop and fix it before pushing.
 
 ### The binary is intentionally not committed
 
