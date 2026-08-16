@@ -166,8 +166,9 @@ isolation below is deliberate. Do not "simplify" any of it.
 | `user.email` | `85369872+rikimberley@users.noreply.github.com` | GitHub noreply — never publishes a real or work email |
 | `core.sshCommand` | `ssh -F /dev/null -i ~/.ssh/rikimberley_github_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none` | Pins the personal key; **`-F /dev/null` is load-bearing**, see below |
 
-Note the local directory is `yt-dlp/` while the repo is `yt-dlp-wrapper` — the
-directory name predates the repo and is not required to match.
+Note the local directory `yt-dlp-wrapper/` matches the repo name. The repo is
+named `-wrapper` because `yt-dlp` is upstream's name and this is only a set of
+wrapper scripts around their binary.
 
 All of these are set **locally in this repo only** (`git config --local`),
 never globally. Verify with:
