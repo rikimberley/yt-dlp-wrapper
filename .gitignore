@@ -19,6 +19,12 @@ cookies.txt
 yt-dlp
 yt-dlp.exe
 
+# Optional local media/runtime tools. Large machine-specific binaries.
+deno.exe
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+
 # ---------------------------------------------------------------------------
 # Runtime state and personal viewing history — local to each machine.
 # channel-ids.txt is a subscription list: it names exactly who the maintainer
