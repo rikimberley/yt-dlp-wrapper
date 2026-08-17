@@ -93,3 +93,5 @@ videos and is therefore public by construction.
 
 All the actual work is done by [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 (Unlicense). This repo is only a pair of wrapper scripts around it.
+
+<!-- Git operation test. -->
