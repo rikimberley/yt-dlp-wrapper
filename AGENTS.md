@@ -50,7 +50,8 @@ Both `yy.zsh` and `yy.ps1` implement the same interface:
   downloading.
 - `-c` — overwrites `checkpoint.txt` with the current epoch-ms timestamp. Runs
   **after** `-o`/`-O`, so `./yy.zsh -o -c` means "open whatever is new, then
-  mark everything as seen". Exits without downloading.
+  mark everything as seen". If at least three `-o` checks fail, or every listed
+  channel check fails, the checkpoint is not updated. Exits without downloading.
 - `-o` and `-O` are mutually exclusive; `-U` takes precedence over both
 - error + non-zero exit when no URL is available from any source
 

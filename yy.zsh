@@ -425,10 +425,22 @@ set_checkpoint_now() {
   printf 'Checkpoint updated: %s\n' "$now"
 }
 
+# Protect a checkpoint from advancing past too many channels that were not
+# successfully checked. "All" only applies when at least one channel was listed.
+should_skip_checkpoint() {
+  local failures=$1 channel_count=$2
+  (( failures >= 3 || (channel_count > 0 && failures == channel_count) ))
+}
+
 # Implement -o (check against the checkpoint) and -O (open everything).
-# Returns non-zero when any channel's check could not be completed.
+# Records the listed-channel and failed-check counts in globals, and returns
+# non-zero when any channel's check could not be completed.
+open_failure_count=0
+open_channel_count=0
 run_open_mode() {
   local mode=$1 checkpoint_ms=0 line channel channel_url newest failures=0
+  open_failure_count=0
+  open_channel_count=0
   if [[ ! -f "$channels_file" ]]; then
     printf 'Error: %s does not exist\n' "$channels_file" >&2
     return 1
@@ -440,6 +452,7 @@ run_open_mode() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     channel=$(trim "$line")
     [[ -n "$channel" && "$channel" != '#'* ]] || continue
+    (( open_channel_count++ ))
     channel=${channel#@}
     channel_url=$(channel_url_for "$channel")
     if [[ "$mode" == "open" ]]; then
@@ -459,6 +472,7 @@ run_open_mode() {
       printf '%s: up to date (%s <= %s)\n' "$channel" "$newest" "$checkpoint_ms"
     fi
   done < "$channels_file"
+  open_failure_count=$failures
   if (( failures > 0 )); then
     printf 'Error: %s channel check(s) failed\n' "$failures" >&2
     return 1
@@ -539,7 +553,13 @@ if [[ -n "$open_mode" ]]; then
 fi
 
 if (( set_checkpoint )); then
-  set_checkpoint_now
+  if [[ "$open_mode" == "check" ]] &&
+      should_skip_checkpoint "$open_failure_count" "$open_channel_count"; then
+    printf 'Checkpoint not updated: %s of %s channel check(s) failed\n' \
+      "$open_failure_count" "$open_channel_count" >&2
+  else
+    set_checkpoint_now
+  fi
 fi
 
 if [[ -n "$open_mode" ]] || (( set_checkpoint )); then
