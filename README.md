@@ -70,6 +70,8 @@ mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
 `./yy.zsh -o -c` means "open whatever is new, then mark everything as seen".
+The checkpoint is not updated if at least three channel checks fail, or if all
+listed channels fail to be checked.
 
 ## Files
 

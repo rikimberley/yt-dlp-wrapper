@@ -579,8 +579,15 @@ function Set-CheckpointNow {
     Write-Host "Checkpoint updated: $now"
 }
 
+# Protect a checkpoint from advancing past too many channels that were not
+# successfully checked. "All" only applies when at least one channel was listed.
+function Test-ShouldSkipCheckpoint {
+    param([int]$Failures, [int]$ChannelCount)
+    return $Failures -ge 3 -or ($ChannelCount -gt 0 -and $Failures -eq $ChannelCount)
+}
+
 # Implement -o (check against the checkpoint) and -O (open everything).
-# Returns the number of channels whose check could not be completed.
+# Returns the number of listed channels and the number whose check failed.
 function Invoke-OpenMode {
     param([string]$Mode)
 
@@ -595,11 +602,13 @@ function Invoke-OpenMode {
     }
     $cache = Read-ChannelIdCache
     $failures = 0
+    $channelCount = 0
     # -Encoding UTF8 matters: Windows PowerShell 5.1 otherwise reads the file as
     # ANSI and mangles non-ASCII channel handles.
     foreach ($line in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
         $channel = ([string]$line).TrimStart([char]0xFEFF).Trim()
         if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
+        $channelCount++
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
         $channelUrl = Get-ChannelUrl $channel
 
@@ -627,7 +636,7 @@ function Invoke-OpenMode {
     if ($failures -gt 0) {
         [Console]::Error.WriteLine("Error: $failures channel check(s) failed")
     }
-    return $failures
+    return @{ Failures = $failures; ChannelCount = $channelCount }
 }
 
 $currentUrl = ''
@@ -658,12 +667,23 @@ if ($Update) {
 }
 
 $openFailures = 0
+$openChannelCount = 0
 if ($OpenMode -ne '') {
-    $openFailures = Invoke-OpenMode $OpenMode
+    $openResult = Invoke-OpenMode $OpenMode
+    $openFailures = $openResult.Failures
+    $openChannelCount = $openResult.ChannelCount
 }
 
 if ($SetCheckpoint) {
-    Set-CheckpointNow
+    $tooManyCheckFailures = $OpenMode -eq 'check' -and
+        (Test-ShouldSkipCheckpoint $openFailures $openChannelCount)
+    if ($tooManyCheckFailures) {
+        [Console]::Error.WriteLine(
+            "Checkpoint not updated: $openFailures of $openChannelCount channel check(s) failed")
+    }
+    else {
+        Set-CheckpointNow
+    }
 }
 
 if ($OpenMode -ne '' -or $SetCheckpoint) {
