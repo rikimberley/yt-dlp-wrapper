@@ -386,6 +386,52 @@ feed_newest_ms() {
   print -r -- "$newest"
 }
 
+# Fall back to the newest few entries in the channel's uploads playlist when
+# the legacy Atom feed is unavailable or unusable. Resolve the entries so
+# yt-dlp can provide exact timestamps and public availability. No cookies are
+# sent. Prints -1 when the fallback failed and 0 when no public entry was seen.
+ytdlp_newest_public_ms() {
+  local channel_id=$1 exe uploads_id uploads_url out status=0 line timestamp newest=0
+  exe=$(ytdlp_path) || {
+    printf 'Warning: yt-dlp binary not found for uploads fallback for %s\n' "$channel_id" >&2
+    print -r -- -1
+    return 0
+  }
+  uploads_id="UU${channel_id#UC}"
+  uploads_url="https://www.youtube.com/playlist?list=${uploads_id}"
+  out=$("$exe" --ignore-config --no-warnings --skip-download \
+    --playlist-items '1:5' --print 'fallback:%(timestamp)s:%(availability)s' \
+    "$uploads_url" 2>/dev/null) || status=$?
+  for line in ${(f)out}; do
+    if [[ "$line" =~ ^fallback:([0-9]+):public$ ]]; then
+      timestamp=${match[1]}
+      (( timestamp *= 1000 ))
+      (( timestamp > newest )) && newest=$timestamp
+    fi
+  done
+  if (( newest > 0 )); then
+    print -r -- "$newest"
+  elif (( status != 0 )); then
+    printf 'Warning: yt-dlp uploads fallback failed for %s (%s)\n' \
+      "$channel_id" "$uploads_url" >&2
+    print -r -- -1
+  else
+    print -r -- 0
+  fi
+}
+
+# Try the cheap Atom feed first, then the logged-out uploads-playlist fallback.
+public_newest_ms_for_channel_id() {
+  local channel_id=$1 newest
+  newest=$(feed_newest_ms "$channel_id")
+  if (( newest > 0 )); then
+    print -r -- "$newest"
+    return 0
+  fi
+  printf 'Warning: using yt-dlp uploads fallback for %s\n' "$channel_id" >&2
+  ytdlp_newest_public_ms "$channel_id"
+}
+
 # Print the epoch-ms publish time of the newest public video on a channel,
 # 0 when the channel genuinely has none, or -1 when the check could not be
 # completed.
@@ -397,22 +443,22 @@ newest_public_ms() {
   fi
   channel_id=$resolved_channel_id
   source=$resolved_source
-  newest=$(feed_newest_ms "$channel_id")
+  newest=$(public_newest_ms_for_channel_id "$channel_id")
 
-  # An empty feed for a cached id usually means the handle now points at a
-  # different channel, so drop the stale entry and resolve once more.
-  if (( newest <= 0 )) && [[ "$source" == "cache" ]]; then
+  # If neither source can check a cached id, the handle may now point at a
+  # different channel. Drop the stale entry and resolve once more.
+  if (( newest < 0 )) && [[ "$source" == "cache" ]]; then
     store_channel_id "$handle" ""
     if ! resolve_channel_id "$handle" "$channel_url" "skip-cache"; then
       print -r -- -1
       return 0
     fi
     channel_id=$resolved_channel_id
-    newest=$(feed_newest_ms "$channel_id")
+    newest=$(public_newest_ms_for_channel_id "$channel_id")
   fi
 
   if (( newest == 0 )); then
-    printf 'Warning: no <published> entries in the feed for %s (@%s)\n' \
+    printf 'Warning: no public videos found via the feed or uploads fallback for %s (@%s)\n' \
       "$channel_id" "$handle" >&2
   fi
   print -r -- "$newest"

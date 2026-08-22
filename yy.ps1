@@ -544,6 +544,65 @@ function Get-FeedNewestMs {
     return $newest
 }
 
+# Fall back to the newest few entries in the channel's uploads playlist when
+# the legacy Atom feed is unavailable or unusable. Resolve the entries so
+# yt-dlp can provide exact timestamps and public availability. No cookies are
+# sent. Returns -1 when the fallback failed and 0 when no public entry was seen.
+function Get-YtDlpNewestPublicMs {
+    param([string]$ChannelId)
+
+    $exe = Get-YtDlpPath
+    if ($exe -eq '') {
+        [Console]::Error.WriteLine(
+            "Warning: yt-dlp binary not found for uploads fallback for $ChannelId")
+        return [long](-1)
+    }
+
+    $uploadsId = 'UU' + $ChannelId.Substring(2)
+    $uploadsUrl = 'https://www.youtube.com/playlist?list=' + $uploadsId
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $exe --ignore-config --no-warnings --skip-download `
+            --playlist-items '1:5' --print 'fallback:%(timestamp)s:%(availability)s' `
+            $uploadsUrl 2>$null
+        $status = $LASTEXITCODE
+    }
+    catch {
+        $output = $null
+        $status = 1
+    }
+    finally { $ErrorActionPreference = $previous }
+    $global:LASTEXITCODE = 0
+
+    $newest = [long]0
+    foreach ($line in @($output)) {
+        $text = ([string]$line).Trim()
+        if ($text -match '^fallback:([0-9]+):public$') {
+            $epochMs = [long]$Matches[1] * 1000
+            if ($epochMs -gt $newest) { $newest = $epochMs }
+        }
+    }
+    if ($newest -gt 0) { return $newest }
+    if ($status -ne 0) {
+        [Console]::Error.WriteLine(
+            "Warning: yt-dlp uploads fallback failed for $ChannelId ($uploadsUrl)")
+        return [long](-1)
+    }
+    return [long]0
+}
+
+# Try the cheap Atom feed first, then the logged-out uploads-playlist fallback.
+function Get-PublicNewestMsForChannelId {
+    param([string]$ChannelId)
+
+    $newest = Get-FeedNewestMs $ChannelId
+    if ($newest -gt 0) { return $newest }
+    [Console]::Error.WriteLine(
+        "Warning: using yt-dlp uploads fallback for $ChannelId")
+    return Get-YtDlpNewestPublicMs $ChannelId
+}
+
 # Return the epoch-ms publish time of the newest public video on a channel,
 # 0 when the channel genuinely has none, or -1 when the check could not be
 # completed.
@@ -553,21 +612,21 @@ function Get-NewestPublicMs {
     $resolved = Resolve-ChannelId -Handle $Handle -ChannelUrl $ChannelUrl -Cache $Cache
     if ($resolved.Id -eq '') { return [long](-1) }
 
-    $newest = Get-FeedNewestMs $resolved.Id
+    $newest = Get-PublicNewestMsForChannelId $resolved.Id
 
-    # An empty feed for a cached id usually means the handle now points at a
-    # different channel, so drop the stale entry and resolve once more.
-    if ($newest -le 0 -and $resolved.Source -eq 'cache') {
+    # If neither source can check a cached id, the handle may now point at a
+    # different channel. Drop the stale entry and resolve once more.
+    if ($newest -lt 0 -and $resolved.Source -eq 'cache') {
         [void]$Cache.Remove($Handle)
         Write-ChannelIdCache $Cache
         $resolved = Resolve-ChannelId -Handle $Handle -ChannelUrl $ChannelUrl -Cache $Cache -SkipCache
         if ($resolved.Id -eq '') { return [long](-1) }
-        $newest = Get-FeedNewestMs $resolved.Id
+        $newest = Get-PublicNewestMsForChannelId $resolved.Id
     }
 
     if ($newest -eq 0) {
         [Console]::Error.WriteLine(
-            "Warning: no <published> entries in the feed for $($resolved.Id) (@$Handle)")
+            "Warning: no public videos found via the feed or uploads fallback for $($resolved.Id) (@$Handle)")
     }
     return $newest
 }
