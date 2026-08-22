@@ -64,7 +64,10 @@ Per channel: resolve the handle to its `UC…` id, then fetch
 `https://www.youtube.com/feeds/videos.xml?channel_id=<id>` and take the newest
 `<published>` across **all** entries (the feed is not reliably date-sorted).
 That Atom feed omits members-only videos, so it is public-by-construction — no
-extra members-only filtering is needed, and no cookies are sent.
+extra members-only filtering is needed, and no cookies are sent. If the legacy
+feed is unavailable or unusable, use logged-out `yt-dlp` on the channel's
+derived `UU…` uploads playlist, resolve its five newest entries, keep only
+entries explicitly marked public, and take the newest exact timestamp.
 
 Handle resolution is layered, cheapest first, and each result is written
 through to `channel-id-cache.txt`:

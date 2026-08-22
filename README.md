@@ -87,9 +87,11 @@ listed channels fail to be checked.
 
 ## Notes
 
-`-o` never sends account cookies: it resolves the channel id, then reads the
-public Atom feed at `feeds/videos.xml?channel_id=…`, which omits members-only
-videos and is therefore public by construction.
+`-o` never sends account cookies. It first reads the public Atom feed at
+`feeds/videos.xml?channel_id=…`. If that legacy feed is unavailable or
+unusable, it asks the vendored `yt-dlp` for exact timestamps and availability
+from the five newest entries in the channel's uploads playlist. Only entries
+explicitly reported as public are considered.
 
 ## Credits
 
