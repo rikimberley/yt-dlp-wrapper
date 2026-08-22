@@ -67,7 +67,9 @@ That Atom feed omits members-only videos, so it is public-by-construction — no
 extra members-only filtering is needed, and no cookies are sent. If the legacy
 feed is unavailable or unusable, use logged-out `yt-dlp` on the channel's
 derived `UU…` uploads playlist, resolve its five newest entries, keep only
-entries explicitly marked public, and take the newest exact timestamp.
+entries explicitly marked public, and take the newest exact timestamp. Once
+three channels exhaust their feed-fetch retries in one `-o` run, skip feed
+fetching for every remaining channel and go directly to the uploads fallback.
 
 Handle resolution is layered, cheapest first, and each result is written
 through to `channel-id-cache.txt`:

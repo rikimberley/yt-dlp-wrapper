@@ -73,6 +73,11 @@ $requestHeaders = @{
 }
 $fetchTimeoutSec = 45
 $fetchAttempts = 3
+$feedFailureLimit = 3
+$feedFetchFailures = 0
+$skipFeedFetches = $false
+$feedFetchFailed = $false
+$feedFailureCountedForChannel = $false
 # Head of master in the wrapper's own repo, used by -U to refresh this script.
 $scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master'
 
@@ -525,9 +530,13 @@ function Resolve-ChannelId {
 function Get-FeedNewestMs {
     param([string]$ChannelId)
 
+    $script:feedFetchFailed = $false
     $feedUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=' + $ChannelId
     $feed = Get-WebContent $feedUrl "video feed for $ChannelId"
-    if ($null -eq $feed) { return [long](-1) }
+    if ($null -eq $feed) {
+        $script:feedFetchFailed = $true
+        return [long](-1)
+    }
 
     # Entries are not guaranteed to be date-sorted, so scan them all.
     $newest = [long]0
@@ -596,7 +605,22 @@ function Get-YtDlpNewestPublicMs {
 function Get-PublicNewestMsForChannelId {
     param([string]$ChannelId)
 
+    if ($script:skipFeedFetches) {
+        [Console]::Error.WriteLine(
+            "Warning: skipping unreliable video feed for $ChannelId; using yt-dlp uploads fallback")
+        return Get-YtDlpNewestPublicMs $ChannelId
+    }
+
     $newest = Get-FeedNewestMs $ChannelId
+    if ($script:feedFetchFailed -and -not $script:feedFailureCountedForChannel) {
+        $script:feedFailureCountedForChannel = $true
+        $script:feedFetchFailures++
+        if ($script:feedFetchFailures -ge $script:feedFailureLimit) {
+            $script:skipFeedFetches = $true
+            [Console]::Error.WriteLine(
+                "Warning: $($script:feedFetchFailures) video feeds failed; skipping feed fetches for remaining channels")
+        }
+    }
     if ($newest -gt 0) { return $newest }
     [Console]::Error.WriteLine(
         "Warning: using yt-dlp uploads fallback for $ChannelId")
@@ -609,6 +633,7 @@ function Get-PublicNewestMsForChannelId {
 function Get-NewestPublicMs {
     param([string]$Handle, [string]$ChannelUrl, [hashtable]$Cache)
 
+    $script:feedFailureCountedForChannel = $false
     $resolved = Resolve-ChannelId -Handle $Handle -ChannelUrl $ChannelUrl -Cache $Cache
     if ($resolved.Id -eq '') { return [long](-1) }
 
@@ -656,6 +681,8 @@ function Invoke-OpenMode {
     }
     $checkpointMs = [long]0
     if ($Mode -eq 'check') {
+        $script:feedFetchFailures = 0
+        $script:skipFeedFetches = $false
         $checkpointMs = Read-CheckpointMs
         Write-Host "Checkpoint: $checkpointMs"
     }

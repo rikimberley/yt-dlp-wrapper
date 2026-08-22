@@ -91,7 +91,9 @@ listed channels fail to be checked.
 `feeds/videos.xml?channel_id=…`. If that legacy feed is unavailable or
 unusable, it asks the vendored `yt-dlp` for exact timestamps and availability
 from the five newest entries in the channel's uploads playlist. Only entries
-explicitly reported as public are considered.
+explicitly reported as public are considered. After three channels exhaust the
+feed-fetch retries in one `-o` run, the remaining channels skip the unreliable
+feed and go directly to this fallback.
 
 ## Credits
 

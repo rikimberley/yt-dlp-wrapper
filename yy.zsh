@@ -42,6 +42,10 @@ consent_cookie="SOCS=CAI; CONSENT=YES+cb"
 accept_language="en-US,en;q=0.9"
 fetch_timeout_sec=45
 fetch_attempts=3
+feed_failure_limit=3
+feed_fetch_failures=0
+skip_feed_fetches=0
+feed_failure_counted_for_channel=0
 # Head of master in the wrapper's own repo, used by -U to refresh this script.
 script_raw_base="https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master"
 current_url=""
@@ -359,14 +363,15 @@ resolve_channel_id() {
 }
 
 # Print the newest <published> in a channel's Atom feed, in epoch ms.
-# Prints -1 when the feed could not be read and 0 when it holds no entries —
-# the two must stay distinguishable, or a network failure reads as an empty
-# channel. That feed omits members-only videos, so it is public-by-construction.
+# Prints "-1 fetch" when the feed could not be read, otherwise "<ms> ok"; 0
+# milliseconds means it holds no entries. Those cases must stay distinguishable,
+# or a network failure reads as an empty channel. The feed omits members-only
+# videos, so it is public-by-construction.
 feed_newest_ms() {
   local channel_id=$1 feed feed_url ts epoch newest=0 seen=0
   feed_url="https://www.youtube.com/feeds/videos.xml?channel_id=${channel_id}"
   if ! feed=$(fetch_url "$feed_url" "video feed for ${channel_id}"); then
-    print -r -- -1
+    print -r -- '-1 fetch'
     return 0
   fi
   # Entries are not guaranteed to be date-sorted, so scan them all.
@@ -380,10 +385,10 @@ feed_newest_ms() {
     (( epoch > newest )) && newest=$epoch
   done
   if (( seen > 0 && newest == 0 )); then
-    print -r -- -1
+    print -r -- '-1 ok'
     return 0
   fi
-  print -r -- "$newest"
+  print -r -- "$newest ok"
 }
 
 # Fall back to the newest few entries in the channel's uploads playlist when
@@ -421,47 +426,69 @@ ytdlp_newest_public_ms() {
 }
 
 # Try the cheap Atom feed first, then the logged-out uploads-playlist fallback.
+# Leave the timestamp in $public_newest_ms_result so feed-failure state survives
+# in the caller rather than being lost in a command-substitution subshell.
+public_newest_ms_result=-1
 public_newest_ms_for_channel_id() {
-  local channel_id=$1 newest
-  newest=$(feed_newest_ms "$channel_id")
+  local channel_id=$1 newest state
+  public_newest_ms_result=-1
+  if (( skip_feed_fetches )); then
+    printf 'Warning: skipping unreliable video feed for %s; using yt-dlp uploads fallback\n' \
+      "$channel_id" >&2
+    public_newest_ms_result=$(ytdlp_newest_public_ms "$channel_id")
+    return 0
+  fi
+  read -r newest state <<< "$(feed_newest_ms "$channel_id")"
+  if [[ "$state" == "fetch" ]] && (( ! feed_failure_counted_for_channel )); then
+    feed_failure_counted_for_channel=1
+    (( ++feed_fetch_failures ))
+    if (( feed_fetch_failures >= feed_failure_limit )); then
+      skip_feed_fetches=1
+      printf 'Warning: %s video feeds failed; skipping feed fetches for remaining channels\n' \
+        "$feed_fetch_failures" >&2
+    fi
+  fi
   if (( newest > 0 )); then
-    print -r -- "$newest"
+    public_newest_ms_result=$newest
     return 0
   fi
   printf 'Warning: using yt-dlp uploads fallback for %s\n' "$channel_id" >&2
-  ytdlp_newest_public_ms "$channel_id"
+  public_newest_ms_result=$(ytdlp_newest_public_ms "$channel_id")
 }
 
-# Print the epoch-ms publish time of the newest public video on a channel,
-# 0 when the channel genuinely has none, or -1 when the check could not be
-# completed.
+# Leave the epoch-ms publish time of the newest public video in
+# $newest_public_ms_result: 0 when the channel genuinely has none, or -1 when
+# the check could not be completed.
+newest_public_ms_result=-1
 newest_public_ms() {
   local handle=$1 channel_url=$2 newest channel_id source
+  newest_public_ms_result=-1
+  feed_failure_counted_for_channel=0
   if ! resolve_channel_id "$handle" "$channel_url"; then
-    print -r -- -1
     return 0
   fi
   channel_id=$resolved_channel_id
   source=$resolved_source
-  newest=$(public_newest_ms_for_channel_id "$channel_id")
+  public_newest_ms_for_channel_id "$channel_id"
+  newest=$public_newest_ms_result
 
   # If neither source can check a cached id, the handle may now point at a
   # different channel. Drop the stale entry and resolve once more.
   if (( newest < 0 )) && [[ "$source" == "cache" ]]; then
     store_channel_id "$handle" ""
     if ! resolve_channel_id "$handle" "$channel_url" "skip-cache"; then
-      print -r -- -1
       return 0
     fi
     channel_id=$resolved_channel_id
-    newest=$(public_newest_ms_for_channel_id "$channel_id")
+    public_newest_ms_for_channel_id "$channel_id"
+    newest=$public_newest_ms_result
   fi
 
   if (( newest == 0 )); then
     printf 'Warning: no public videos found via the feed or uploads fallback for %s (@%s)\n' \
       "$channel_id" "$handle" >&2
   fi
-  print -r -- "$newest"
+  newest_public_ms_result=$newest
 }
 
 # Overwrite ./checkpoint.txt with the current time in epoch milliseconds.
@@ -492,6 +519,8 @@ run_open_mode() {
     return 1
   fi
   if [[ "$mode" == "check" ]]; then
+    feed_fetch_failures=0
+    skip_feed_fetches=0
     checkpoint_ms=$(read_checkpoint_ms) || return 1
     printf 'Checkpoint: %s\n' "$checkpoint_ms"
   fi
@@ -505,7 +534,8 @@ run_open_mode() {
       open_url "$channel_url"
       continue
     fi
-    newest=$(newest_public_ms "$channel" "$channel_url")
+    newest_public_ms "$channel" "$channel_url"
+    newest=$newest_public_ms_result
     if (( newest < 0 )); then
       (( failures++ ))
       printf '%s: CHECK FAILED (see warnings above; not opened)\n' "$channel"
