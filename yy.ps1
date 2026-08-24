@@ -12,6 +12,7 @@
 #   (exits 1 if any channel could not be checked)
 # - uses -O to open every channel in ./channel-ids.txt unconditionally, and
 #   skip any download
+# - uses --html to generate a local 6-column video grid with y1/y2 selections
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -23,6 +24,7 @@
 #   ./yy.ps1 -U
 #   ./yy.ps1 -o
 #   ./yy.ps1 -O
+#   ./yy.ps1 --html
 #   ./yy.ps1 -c
 #   ./yy.ps1 -o -c
 #
@@ -73,6 +75,9 @@ $requestHeaders = @{
 }
 $fetchTimeoutSec = 45
 $fetchAttempts = 3
+$ytDlpTimeoutSec = 15
+$ytDlpAttempts = 1
+$ytDlpDeadlineSec = 10
 $feedFailureLimit = 3
 $feedFetchFailures = 0
 $skipFeedFetches = $false
@@ -85,7 +90,9 @@ $Url = ''
 $TempUrl = ''
 $Update = $false
 $OpenMode = ''
+$HtmlMode = $false
 $SetCheckpoint = $false
+$htmlFailureCount = 0
 
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
@@ -101,11 +108,19 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         $Update = $true
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
-        if ($OpenMode -ne '') {
+        if ($OpenMode -ne '' -or $HtmlMode) {
             [Console]::Error.WriteLine('Error: -o and -O cannot be combined')
             exit 1
         }
         $OpenMode = if ($a -ceq '-o') { 'check' } else { 'open' }
+    }
+    elseif ($a -ceq '--html') {
+        if ($OpenMode -ne '') {
+            [Console]::Error.WriteLine('Error: --html cannot be combined with -o or -O')
+            exit 1
+        }
+        $OpenMode = 'html'
+        $HtmlMode = $true
     }
     elseif ($a -ceq '-c') {
         $SetCheckpoint = $true
@@ -472,17 +487,11 @@ function Get-ChannelIdViaYtDlp {
     $exe = Get-YtDlpPath
     if ($exe -eq '') { return '' }
 
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $output = & $exe --ignore-config --no-warnings --flat-playlist `
-            --playlist-items 0 --print 'playlist:%(channel_id)s' $ChannelUrl 2>$null
-    }
-    catch {
-        $output = $null
-    }
-    finally { $ErrorActionPreference = $previous }
-    $global:LASTEXITCODE = 0
+    $result = Invoke-YtDlpMetadata -What "channel id for $ChannelUrl" -Arguments @(
+        '--ignore-config', '--no-warnings', '--socket-timeout', $ytDlpTimeoutSec,
+        '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
+        '--flat-playlist', '--playlist-items', '0', '--print', 'playlist:%(channel_id)s', $ChannelUrl)
+    $output = $result.Output
 
     foreach ($line in @($output)) {
         $candidate = ([string]$line).Trim()
@@ -553,6 +562,76 @@ function Get-FeedNewestMs {
     return $newest
 }
 
+# Return the newest public feed entries as tab-separated video rows for --html.
+# The public Atom feed supplies the video id, canonical URL, title and thumbnail
+# without invoking yt-dlp for every channel.
+function Get-FeedVideoRows {
+    param([string]$ChannelId)
+
+    $feedUrl = 'https://www.youtube.com/feeds/videos.xml?channel_id=' + $ChannelId
+    $feed = Get-WebContent $feedUrl "video feed for $ChannelId"
+    if ($null -eq $feed) { return @() }
+    $rows = @()
+    foreach ($entryMatch in [regex]::Matches($feed, '<entry>(.*?)</entry>',
+                                               [System.Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $entry = $entryMatch.Groups[1].Value
+        $id = [regex]::Match($entry, '<yt:videoId>([^<]+)</yt:videoId>').Groups[1].Value
+        $url = [regex]::Match($entry, '<link rel="alternate" href="([^"]+)"').Groups[1].Value
+        $thumbnail = [regex]::Match($entry, '<media:thumbnail url="([^"]+)"').Groups[1].Value
+        $title = [regex]::Match($entry, '<title>(.*?)</title>',
+                                 [System.Text.RegularExpressions.RegexOptions]::Singleline).Groups[1].Value
+        if ($id -ne '' -and $url -ne '') {
+            $rows += ('video:' + $id + "`t" + $url + "`t" + $thumbnail + "`t" +
+                      [System.Net.WebUtility]::HtmlDecode($title))
+        }
+    }
+    return $rows
+}
+
+# Metadata probes must not outlive the wrapper indefinitely. yt-dlp's own
+# socket timeout does not cover every extractor subprocess on Windows.
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+
+    foreach ($child in @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" -ErrorAction SilentlyContinue)) {
+        Stop-ProcessTree -ProcessId $child.ProcessId
+    }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function ConvertTo-ProcessArgument {
+    param([string]$Value)
+
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + (($Value -replace '(\\*)"', '$1$1\\"') -replace '(\\*)$', '$1$1') + '"'
+}
+
+# Run a logged-out yt-dlp metadata command with a wall-clock deadline. Returns
+# its output and exit code; callers retain their existing failure reporting.
+function Invoke-YtDlpMetadata {
+    param([string[]]$Arguments, [string]$What)
+
+    $exe = Get-YtDlpPath
+    if ($exe -eq '') { return @{ Output = @(); ExitCode = 1 } }
+    $token = [guid]::NewGuid().ToString('N')
+    $stdout = Join-Path $PSScriptRoot "yt-dlp.$token.stdout"
+    $stderr = Join-Path $PSScriptRoot "yt-dlp.$token.stderr"
+    try {
+        $argumentLine = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' ')
+        $process = Start-Process -FilePath $exe -ArgumentList $argumentLine -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        if (-not $process.WaitForExit($ytDlpDeadlineSec * 1000)) {
+            Stop-ProcessTree -ProcessId $process.Id
+            [Console]::Error.WriteLine("Warning: yt-dlp metadata probe timed out after $ytDlpDeadlineSec seconds for $What")
+            return @{ Output = @(); ExitCode = 124 }
+        }
+        return @{ Output = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue); ExitCode = $process.ExitCode }
+    }
+    finally {
+        Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Fall back to the newest few entries in the channel's uploads playlist when
 # the legacy Atom feed is unavailable or unusable. Resolve the entries so
 # yt-dlp can provide exact timestamps and public availability. No cookies are
@@ -569,20 +648,13 @@ function Get-YtDlpNewestPublicMs {
 
     $uploadsId = 'UU' + $ChannelId.Substring(2)
     $uploadsUrl = 'https://www.youtube.com/playlist?list=' + $uploadsId
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $output = & $exe --ignore-config --no-warnings --skip-download `
-            --playlist-items '1:5' --print 'fallback:%(timestamp)s:%(availability)s' `
-            $uploadsUrl 2>$null
-        $status = $LASTEXITCODE
-    }
-    catch {
-        $output = $null
-        $status = 1
-    }
-    finally { $ErrorActionPreference = $previous }
-    $global:LASTEXITCODE = 0
+    $result = Invoke-YtDlpMetadata -What "uploads fallback for $ChannelId" -Arguments @(
+        '--ignore-config', '--no-warnings', '--socket-timeout', $ytDlpTimeoutSec,
+        '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
+        '--skip-download', '--playlist-items', '1:5', '--print',
+        'fallback:%(timestamp)s:%(availability)s', $uploadsUrl)
+    $output = $result.Output
+    $status = $result.ExitCode
 
     $newest = [long]0
     foreach ($line in @($output)) {
@@ -659,8 +731,14 @@ function Get-NewestPublicMs {
 # Overwrite ./checkpoint.txt with the current time in epoch milliseconds.
 function Set-CheckpointNow {
     $now = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    Set-Content -LiteralPath $checkpointFile -Value ([string]$now) -Encoding ASCII
-    Write-Host "Checkpoint updated: $now"
+    Set-CheckpointAt $now
+}
+
+function Set-CheckpointAt {
+    param([long]$TimestampMs)
+
+    Set-Content -LiteralPath $checkpointFile -Value ([string]$TimestampMs) -Encoding ASCII
+    Write-Host "Checkpoint updated: $TimestampMs"
 }
 
 # Protect a checkpoint from advancing past too many channels that were not
@@ -668,6 +746,260 @@ function Set-CheckpointNow {
 function Test-ShouldSkipCheckpoint {
     param([int]$Failures, [int]$ChannelCount)
     return $Failures -ge 3 -or ($ChannelCount -gt 0 -and $Failures -eq $ChannelCount)
+}
+
+# Build a local page from the newest public uploads. Its token-protected
+# loopback callback starts the selected yy1/yy2 local PowerShell hooks.
+function New-VideoHtml {
+    param([string]$CallbackUrl)
+    $exe = Get-YtDlpPath
+    if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
+    if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
+    $checkpointMs = Read-CheckpointMs
+    $script:feedFetchFailures = 0
+    $script:skipFeedFetches = $false
+    $failures = 0
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title>')
+    [void]$sb.AppendLine('<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>')
+    [void]$sb.AppendLine('<h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook.</p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><main>')
+    $cache = Read-ChannelIdCache
+    foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
+        $channel = ([string]$rawLine).TrimStart([char]0xFEFF).Trim()
+        if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
+        if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
+        $channelUrl = Get-ChannelUrl $channel
+        $newest = Get-NewestPublicMs -Handle $channel -ChannelUrl $channelUrl -Cache $cache
+        if ($newest -lt 0) { $failures++; continue }
+        if ($newest -le $checkpointMs) { continue }
+        $resolved = Resolve-ChannelId -Handle $channel -ChannelUrl $channelUrl -Cache $cache
+        if ($resolved.Id -eq '') { [Console]::Error.WriteLine("Warning: skipping $channel in HTML because its channel id could not be resolved"); continue }
+        $uploadsUrl = 'https://www.youtube.com/playlist?list=UU' + $resolved.Id.Substring(2)
+        $rows = @(Get-FeedVideoRows $resolved.Id)
+        $status = 0
+        if ($rows.Count -eq 0) {
+            $result = Invoke-YtDlpMetadata -What "videos for @$channel" -Arguments @(
+                '--ignore-config', '--no-warnings', '--socket-timeout', $ytDlpTimeoutSec,
+                '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
+                '--skip-download', '--playlist-items', '1:12', '--match-filter',
+                'availability = public', '--print', ("video:%(id)s`t%(webpage_url)s`t%(thumbnail)s`t%(title)s"), $uploadsUrl)
+            $rows = $result.Output
+            $status = $result.ExitCode
+        }
+        if ($status -ne 0) { [Console]::Error.WriteLine("Warning: could not collect videos for @$channel"); continue }
+        [void]$sb.AppendLine('<section class="channel"><div class="channel-title"><h2>' + [System.Net.WebUtility]::HtmlEncode($channel) + '</h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">')
+        foreach ($row in @($rows)) {
+            $parts = [regex]::Split([string]$row, "`t", 4)
+            if ($parts.Count -lt 4 -or -not $parts[0].StartsWith('video:')) { continue }
+            $id = $parts[0].Substring(6); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]
+            if ($id -eq '' -or $url -eq '') { continue }
+            $eUrl = [System.Net.WebUtility]::HtmlEncode($url); $eThumb = [System.Net.WebUtility]::HtmlEncode($thumb); $eTitle = [System.Net.WebUtility]::HtmlEncode($title)
+            $card = '<article class="card"><a class="video-link" href="{2}" target="_blank" rel="noopener noreferrer"><div class="preview"><img src="{0}" alt=""></div><div class="video-title">{1}</div></a><div class="checks"><label><input class="y1" data-url="{2}" type="checkbox"> y1</label><label><input class="y2" data-url="{2}" type="checkbox"> y2</label></div></article>' -f $eThumb, $eTitle, $eUrl
+            [void]$sb.AppendLine($card)
+        }
+        [void]$sb.AppendLine('</div></section>')
+    }
+    [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
+    $pageText = $sb.ToString().Replace('if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}', 'setTimeout(showJobs,1000)}catch(e){status.textContent="Server stopped";window.close();setTimeout(()=>location.replace("about:blank"),150)}')
+    $pageText = $pageText.Replace('jobLog.textContent=(b.logs||[]).join("\n");', 'jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;')
+    $sb.Clear() | Out-Null
+    [void]$sb.Append($pageText)
+    $path = Join-Path $PSScriptRoot 'yy.html'
+    [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    $script:htmlFailureCount = $failures
+    Write-Host "Generated ./yy.html"
+    return $true
+}
+
+# The browser submits structured selections to this one-shot, loopback-only
+# listener. It never accepts shell text: each item must name yy1/yy2 and a
+# YouTube URL before the corresponding local PowerShell hook is started.
+function Test-VideoSelection {
+    param($Item)
+
+    if ($null -eq $Item -or $Item.target -notin @('y1', 'y2')) { return $false }
+    try { $uri = [uri]$Item.url } catch { return $false }
+    if ($uri.Scheme -notin @('http', 'https')) { return $false }
+    return $uri.Host -eq 'youtu.be' -or $uri.Host -eq 'youtube.com' -or $uri.Host.EndsWith('.youtube.com')
+}
+
+function Start-SelectedVideoHooks {
+    param($Items, [hashtable]$Jobs)
+
+    $selected = @($Items)
+    if ($selected.Count -eq 0) { throw 'No video selections received' }
+    $started = 0
+    # yy2 must drain before yy1, while preserving the page's order within each
+    # destination. Only the scheduler below starts processes.
+    foreach ($item in @($selected | Sort-Object @{ Expression = { if ($_.target -eq 'y2') { 0 } else { 1 } }; Ascending = $true })) {
+        if (-not (Test-VideoSelection $item)) { throw 'Invalid video selection received' }
+        $hookName = 'y' + $item.target + '.ps1'
+        $hook = Get-Command $hookName -CommandType ExternalScript -ErrorAction SilentlyContinue
+        if ($null -eq $hook) { throw "Local $hookName hook was not found" }
+        $Jobs[[guid]::NewGuid().ToString('N')] = [pscustomobject]@{
+            Target = [string]$item.target; Url = [string]$item.url; Hook = [string]$hook.Source; Order = $started; Process = $null; State = 'queued'; ExitCode = $null; OutputPath = ''; ErrorPath = ''; OutputLines = 0; ErrorLines = 0; Logs = @(); Succeeded = $false
+        }
+        Write-Host "Queued: $($hook.Source) -t $($item.url)"
+        $started++
+    }
+    return $started
+}
+
+function Start-NextDownloadJob {
+    param([hashtable]$Jobs)
+
+    $job = @($Jobs.Values | Where-Object { $_.State -eq 'queued' } | Sort-Object Order) | Select-Object -First 1
+    if ($null -eq $job) { return $false }
+    $safeHook = ([string]$job.Hook).Replace("'", "''")
+    $safeUrl = ([string]$job.Url).Replace("'", "''")
+    $command = "`$ProgressPreference = 'SilentlyContinue'; & '$safeHook' '-t' '$safeUrl'; exit `$LASTEXITCODE"
+    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
+    $logBase = Join-Path $env:TEMP ('yy-html-job-' + [guid]::NewGuid().ToString('N'))
+    Write-Host "Running: $($job.Hook) -t $($job.Url)"
+    $job.Process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-OutputFormat', 'Text', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand) -RedirectStandardOutput ($logBase + '.out') -RedirectStandardError ($logBase + '.err') -PassThru
+    $job.OutputPath = $logBase + '.out'; $job.ErrorPath = $logBase + '.err'; $job.State = 'running'
+    return $true
+}
+
+function Get-DownloadJobStatus {
+    param([hashtable]$Jobs, [System.Collections.ArrayList]$ServerLogs)
+
+    $running = 0; $queued = 0; $completed = 0; $failed = 0
+    foreach ($job in @($Jobs.Values)) {
+        foreach ($logSource in @(@{ Path = $job.OutputPath; Count = 'OutputLines' }, @{ Path = $job.ErrorPath; Count = 'ErrorLines' })) {
+            if ($logSource.Path -eq '') { continue }
+            if (-not (Test-Path -LiteralPath $logSource.Path)) { continue }
+            $lines = @(Get-Content -LiteralPath $logSource.Path -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '^(#< CLIXML|<Objs Version=)' })
+            $oldCount = [int]$job.PSObject.Properties[$logSource.Count].Value
+            if ($lines.Count -gt $oldCount) {
+                foreach ($line in @($lines[$oldCount..($lines.Count - 1)])) {
+                    $entry = "[$($job.Target)] $line"
+                    Write-Host $entry
+                    [void]$ServerLogs.Add($entry)
+                    if ($line -match '^\[download\].*(has already been downloaded|100%)') { $job.Succeeded = $true }
+                }
+                $job.PSObject.Properties[$logSource.Count].Value = $lines.Count
+            }
+        }
+        if ($job.State -eq 'running') {
+            try {
+                if ($job.Process.HasExited) {
+                    $job.ExitCode = $job.Process.ExitCode
+                    $job.State = if ($job.ExitCode -eq 0 -or $job.Succeeded) { 'completed' } else { 'failed' }
+                }
+            }
+            catch { $job.State = 'failed' }
+        }
+        if ($job.State -eq 'running') { $running++ }
+        elseif ($job.State -eq 'queued') { $queued++ }
+        elseif ($job.State -eq 'completed') { $completed++ }
+        else { $failed++ }
+    }
+    if ($running -eq 0 -and $queued -gt 0) {
+        [void](Start-NextDownloadJob $Jobs)
+        $running = 1; $queued--
+    }
+    return @{ running = $running; queued = $queued; completed = $completed; failed = $failed; logs = @($ServerLogs | Select-Object -Last 80) }
+}
+
+function Send-CallbackJson {
+    param($Context, [int]$StatusCode, $Value)
+
+    $body = [System.Text.Encoding]::UTF8.GetBytes(($Value | ConvertTo-Json -Compress))
+    $Context.Response.StatusCode = $StatusCode
+    $Context.Response.Headers['Access-Control-Allow-Origin'] = '*'
+    $Context.Response.Headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+    $Context.Response.Headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    $Context.Response.ContentType = 'application/json; charset=utf-8'
+    $Context.Response.ContentLength64 = $body.Length
+    $Context.Response.OutputStream.Write($body, 0, $body.Length)
+    $Context.Response.Close()
+}
+
+function Send-CallbackResponse {
+    param($Context, [int]$StatusCode, [string]$Message)
+
+    Send-CallbackJson $Context $StatusCode @{ message = $Message }
+}
+
+function Invoke-HtmlCallbackServer {
+    param([string]$Token)
+
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add('http://127.0.0.1:8080/')
+    $jobs = @{}
+    $serverLogs = New-Object System.Collections.ArrayList
+    $script:htmlStopRequested = $false
+    $script:htmlListener = $listener
+    $cancelHandler = [ConsoleCancelEventHandler]{
+        param($sender, $event)
+        $event.Cancel = $true
+        $script:htmlStopRequested = $true
+        if ($script:htmlListener.IsListening) { $script:htmlListener.Stop() }
+    }
+    try { $listener.Start() }
+    catch {
+        [Console]::Error.WriteLine("Error: http://127.0.0.1:8080 is unavailable: $($_.Exception.Message)")
+        return $false
+    }
+    try {
+        [Console]::add_CancelKeyPress($cancelHandler)
+        Open-Url 'http://127.0.0.1:8080/'
+        Write-Host 'Waiting for DOWNLOAD SELECTED on http://127.0.0.1:8080/ (Ctrl+C or STOP SERVER exits)'
+        while ($listener.IsListening -and -not $script:htmlStopRequested) {
+            try { $context = $listener.GetContext() }
+            catch {
+                if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
+                throw
+            }
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq '/') {
+                $body = [System.IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'yy.html'))
+                $context.Response.ContentType = 'text/html; charset=utf-8'
+                $context.Response.ContentLength64 = $body.Length
+                $context.Response.OutputStream.Write($body, 0, $body.Length)
+                $context.Response.Close()
+                continue
+            }
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/status/$Token") {
+                Send-CallbackJson $context 200 (Get-DownloadJobStatus $jobs $serverLogs)
+                continue
+            }
+            if ($context.Request.HttpMethod -eq 'OPTIONS' -and $context.Request.Url.AbsolutePath -in @("/download/$Token", "/stop/$Token")) {
+                $context.Response.StatusCode = 204
+                $context.Response.Headers['Access-Control-Allow-Origin'] = '*'
+                $context.Response.Headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+                $context.Response.Headers['Access-Control-Allow-Headers'] = 'Content-Type'
+                $context.Response.Close()
+                continue
+            }
+            if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -eq "/stop/$Token") {
+                Send-CallbackResponse $context 200 'Server stopped.'
+                break
+            }
+            if ($context.Request.HttpMethod -ne 'POST' -or $context.Request.Url.AbsolutePath -ne "/download/$Token") {
+                Send-CallbackResponse $context 404 'Not found'
+                continue
+            }
+            $reader = New-Object System.IO.StreamReader($context.Request.InputStream, [System.Text.Encoding]::UTF8)
+            try { $payload = $reader.ReadToEnd() | ConvertFrom-Json }
+            finally { $reader.Dispose() }
+            try {
+                $started = Start-SelectedVideoHooks $payload.items $jobs
+                Send-CallbackResponse $context 200 "Started $started local download job(s)."
+                continue
+            }
+            catch {
+                Send-CallbackResponse $context 400 $_.Exception.Message
+                continue
+            }
+        }
+    }
+    finally {
+        [Console]::remove_CancelKeyPress($cancelHandler)
+        $script:htmlListener = $null
+        if ($listener.IsListening) { $listener.Stop() }
+        $listener.Close()
+    }
 }
 
 # Implement -o (check against the checkpoint) and -O (open everything).
@@ -754,10 +1086,22 @@ if ($Update) {
 
 $openFailures = 0
 $openChannelCount = 0
+$checkpointAfterChecksMs = [long]0
 if ($OpenMode -ne '') {
-    $openResult = Invoke-OpenMode $OpenMode
-    $openFailures = $openResult.Failures
-    $openChannelCount = $openResult.ChannelCount
+    if ($OpenMode -eq 'html') {
+        $token = [guid]::NewGuid().ToString('N')
+        $callbackUrl = 'http://127.0.0.1:8080/download/' + $token
+        if (-not (New-VideoHtml -CallbackUrl $callbackUrl)) { $openFailures = 1 }
+        if ($openFailures -eq 0) { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+        if ($openFailures -eq 0 -and -not (Invoke-HtmlCallbackServer -Token $token)) { $openFailures = 1 }
+        if ($htmlFailureCount -gt 0) { $openFailures = 1 }
+    }
+    else {
+        $openResult = Invoke-OpenMode $OpenMode
+        $openFailures = $openResult.Failures
+        $openChannelCount = $openResult.ChannelCount
+        if ($OpenMode -eq 'check') { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+    }
 }
 
 if ($SetCheckpoint) {
@@ -768,7 +1112,8 @@ if ($SetCheckpoint) {
             "Checkpoint not updated: $openFailures of $openChannelCount channel check(s) failed")
     }
     else {
-        Set-CheckpointNow
+        if ($checkpointAfterChecksMs -gt 0) { Set-CheckpointAt $checkpointAfterChecksMs }
+        else { Set-CheckpointNow }
     }
 }
 
