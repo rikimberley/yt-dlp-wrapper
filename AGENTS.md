@@ -23,14 +23,14 @@ apply — the parent tree itself remains untracked).
 | `checkpoint.txt`  | Input for `-o`, rewritten by `-c`. Single epoch timestamp; 12+ digits is read as milliseconds, shorter as seconds. *(gitignored)* |
 | `channel-id-cache.txt` | Generated cache mapping each handle to its `UC…` channel id, TAB separated, one per line. Pure cache — safe to delete, costs one page fetch per channel to rebuild. *(gitignored)* |
 | `cookies.txt`            | **SECRET.** Netscape-format YouTube cookie jar with live session tokens. *(gitignored)* |
-| `t/`               | Download output directory (`--paths ./t`). Treat as disposable scratch. *(gitignored)* |
+| `t/`               | Default download output directory (`--paths ./t`). Treat as disposable scratch. *(gitignored)* |
 
 ## Wrapper Contract
 
 Both `yy.zsh` and `yy.ps1` implement the same interface:
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-U] [-o | -O] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html] [-c]
 ```
 
 - positional `<url>` — persisted to `current_url.txt`, then downloaded
@@ -38,6 +38,7 @@ Both `yy.zsh` and `yy.ps1` implement the same interface:
 - `-t <temp_url>` — downloads this URL instead, **without** persisting it
   (a positional `<url>` given alongside `-t` is still persisted but not used
   for this run)
+- `-p <path>` — downloads into `<path>` instead of the default `./t`
 - `-U` — runs `./yt-dlp -U` (self-update), then refreshes the wrapper itself
   from the head of `master` on GitHub, and exits without downloading. Exits
   non-zero if the refresh failed.
@@ -124,10 +125,10 @@ stays byte-identical to the repo. In `yy.ps1` that means
 The download invocation is exactly:
 
 ```
-./yt-dlp --cookies ./cookies.txt --paths ./t <url>
+./yt-dlp --cookies ./cookies.txt --paths <path> <url>
 ```
 
-Each command is echoed in blue before running.
+`<path>` defaults to `./t`. Each command is echoed in blue before running.
 
 ## Rules for Agents
 
@@ -185,7 +186,8 @@ Each command is echoed in blue before running.
   something to work around by disabling `--cookies`.
 - Do not add new dependencies (Python, pip, ffmpeg wrappers, venvs). The point
   of the vendored binary is zero setup.
-- Do not change the output directory away from `./t`, and do not delete
+- Keep `./t` as the default output directory. `-p <path>` may override it;
+  the HTML callback uses `./<channel entry>` directories. Do not delete
   downloaded media without being asked.
 - Do not "upgrade" `yt-dlp` by downloading a new binary from the internet — use
   `./yy.zsh -U`, which uses yt-dlp's own signed updater.
