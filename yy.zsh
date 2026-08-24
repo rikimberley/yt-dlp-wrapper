@@ -12,6 +12,7 @@
 #   (exits 1 if any channel could not be checked)
 # - uses -O to open every channel in ./channel-ids.txt unconditionally, and
 #   skip any download
+# - uses --html to generate a local 4-column video grid with y1/y2 selections
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -23,6 +24,7 @@
 #   ./yy.zsh -U
 #   ./yy.zsh -o
 #   ./yy.zsh -O
+#   ./yy.zsh --html
 #   ./yy.zsh -c
 #   ./yy.zsh -o -c
 
@@ -42,6 +44,9 @@ consent_cookie="SOCS=CAI; CONSENT=YES+cb"
 accept_language="en-US,en;q=0.9"
 fetch_timeout_sec=45
 fetch_attempts=3
+ytdlp_timeout_sec=15
+ytdlp_attempts=1
+ytdlp_deadline_sec=10
 feed_failure_limit=3
 feed_fetch_failures=0
 skip_feed_fetches=0
@@ -53,6 +58,8 @@ temp_url=""
 do_update=0
 open_mode=""
 set_checkpoint=0
+html_checkpoint_ms=0
+html_file="./yy.html"
 
 run_cmd() {
   local -a cmd
@@ -316,8 +323,10 @@ scrape_channel_id() {
 channel_id_via_ytdlp() {
   local url=$1 exe out id
   exe=$(ytdlp_path) || return 1
-  out=$("$exe" --ignore-config --no-warnings --flat-playlist \
-    --playlist-items 0 --print 'playlist:%(channel_id)s' "$url" 2>/dev/null) || out=""
+  run_ytdlp_metadata "$exe" --ignore-config --no-warnings --socket-timeout "$ytdlp_timeout_sec" \
+    --retries "$ytdlp_attempts" --extractor-retries "$ytdlp_attempts" --flat-playlist \
+    --playlist-items 0 --print 'playlist:%(channel_id)s' "$url" || return 1
+  out=$ytdlp_output
   id=$(printf '%s\n' "$out" | grep -o '^UC[A-Za-z0-9_-]*$' | head -n 1) || id=""
   [[ -n "$id" ]] || return 1
   print -r -- "$id"
@@ -391,6 +400,49 @@ feed_newest_ms() {
   print -r -- "$newest ok"
 }
 
+# Print the newest public feed entries as tab-separated video rows for --html.
+# The public Atom feed supplies the video id, canonical URL, title and thumbnail
+# without invoking yt-dlp for every channel.
+feed_video_rows() {
+  local channel_id=$1 feed feed_url entry id url thumb title
+  feed_url="https://www.youtube.com/feeds/videos.xml?channel_id=${channel_id}"
+  feed=$(fetch_url "$feed_url" "video feed for ${channel_id}") || return 1
+  while IFS= read -r entry; do
+    [[ "$entry" == *'<entry>'* ]] || continue
+    id=$(printf '%s' "$entry" | sed -n 's#.*<yt:videoId>\([^<]*\)</yt:videoId>.*#\1#p')
+    url=$(printf '%s' "$entry" | sed -n 's#.*<link rel="alternate" href="\([^"]*\)".*#\1#p')
+    thumb=$(printf '%s' "$entry" | sed -n 's#.*<media:thumbnail url="\([^"]*\)".*#\1#p')
+    title=$(printf '%s' "$entry" | sed -n 's#.*<title>\(.*\)</title>.*#\1#p')
+    [[ -n "$id" && -n "$url" ]] || continue
+    printf 'video:%s\t%s\t%s\t%s\n' "$id" "$url" "$thumb" "$title"
+  done < <(printf '%s' "$feed" | sed 's#</entry>#</entry>\n#g')
+}
+
+# Metadata probes must not outlive the wrapper indefinitely. yt-dlp's own
+# socket timeout does not cover every extractor subprocess on every platform.
+ytdlp_output=""
+run_ytdlp_metadata() {
+  local tmp pid waited=0 status=0
+  ytdlp_output=""
+  tmp=$(mktemp) || return 1
+  "$@" >"$tmp" 2>/dev/null & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= ytdlp_deadline_sec )); then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f -- "$tmp"
+      printf 'Warning: yt-dlp metadata probe timed out after %s seconds\n' "$ytdlp_deadline_sec" >&2
+      return 124
+    fi
+    sleep 1
+    (( ++waited ))
+  done
+  wait "$pid" || status=$?
+  ytdlp_output=$(<"$tmp")
+  rm -f -- "$tmp"
+  return "$status"
+}
+
 # Fall back to the newest few entries in the channel's uploads playlist when
 # the legacy Atom feed is unavailable or unusable. Resolve the entries so
 # yt-dlp can provide exact timestamps and public availability. No cookies are
@@ -404,9 +456,11 @@ ytdlp_newest_public_ms() {
   }
   uploads_id="UU${channel_id#UC}"
   uploads_url="https://www.youtube.com/playlist?list=${uploads_id}"
-  out=$("$exe" --ignore-config --no-warnings --skip-download \
+  run_ytdlp_metadata "$exe" --ignore-config --no-warnings --socket-timeout "$ytdlp_timeout_sec" \
+    --retries "$ytdlp_attempts" --extractor-retries "$ytdlp_attempts" --skip-download \
     --playlist-items '1:5' --print 'fallback:%(timestamp)s:%(availability)s' \
-    "$uploads_url" 2>/dev/null) || status=$?
+    "$uploads_url" || status=$?
+  out=$ytdlp_output
   for line in ${(f)out}; do
     if [[ "$line" =~ ^fallback:([0-9]+):public$ ]]; then
       timestamp=${match[1]}
@@ -494,8 +548,13 @@ newest_public_ms() {
 # Overwrite ./checkpoint.txt with the current time in epoch milliseconds.
 set_checkpoint_now() {
   local now=$(( $(date +%s) * 1000 ))
-  print -r -- "$now" >| "$checkpoint_file"
-  printf 'Checkpoint updated: %s\n' "$now"
+  set_checkpoint_at "$now"
+}
+
+set_checkpoint_at() {
+  local timestamp_ms=$1
+  print -r -- "$timestamp_ms" >| "$checkpoint_file"
+  printf 'Checkpoint updated: %s\n' "$timestamp_ms"
 }
 
 # Protect a checkpoint from advancing past too many channels that were not
@@ -556,6 +615,67 @@ run_open_mode() {
   return 0
 }
 
+# Escape text inserted into the generated HTML document.
+html_escape() {
+  local s=$1
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  s=${s//\"/&quot;}
+  s=${s//\'/&#39;}
+  print -r -- "$s"
+}
+
+# Build a local page from the newest public uploads. A file:// page cannot
+# execute host commands, so the button downloads a script containing yy1/yy2
+# commands for the selected videos.
+generate_html() {
+  local line channel channel_url channel_id uploads_url exe output id url thumb title checkpoint_ms newest failures=0
+  local tmp="${html_file}.new.$$"
+  exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
+  [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
+  checkpoint_ms=$(read_checkpoint_ms) || return 1
+  feed_fetch_failures=0; skip_feed_fetches=0
+  print -r -- '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>yy video grid</title>' >| "$tmp"
+  print -r -- '<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>' >> "$tmp"
+  print -r -- '<h1>yy video grid</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED. The button downloads a command script; run it next to yy1/yy2.</p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><main>' >> "$tmp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    channel=$(trim "$line"); [[ -n "$channel" && "$channel" != '#'* ]] || continue
+    channel=${channel#@}; channel_url=$(channel_url_for "$channel")
+    newest_public_ms "$channel" "$channel_url"; newest=$newest_public_ms_result
+    if (( newest < 0 )); then failures=$(( failures + 1 )); continue; fi
+    (( newest > checkpoint_ms )) || continue
+    if ! resolve_channel_id "$channel" "$channel_url"; then
+      printf 'Warning: skipping %s in HTML because its channel id could not be resolved\n' "$channel" >&2; continue
+    fi
+    channel_id=$resolved_channel_id; uploads_url="https://www.youtube.com/playlist?list=UU${channel_id#UC}"
+    output=$(feed_video_rows "$channel_id") || {
+      run_ytdlp_metadata "$exe" --ignore-config --no-warnings --socket-timeout "$ytdlp_timeout_sec" \
+        --retries "$ytdlp_attempts" --extractor-retries "$ytdlp_attempts" --skip-download \
+        --playlist-items '1:12' --match-filter 'availability = public' \
+        --print 'video:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s' "$uploads_url" || {
+        printf 'Warning: could not collect videos for @%s\n' "$channel" >&2; continue
+      }
+      output=$ytdlp_output
+    }
+    print -r -- "<section class=channel><div class=channel-title><h2>$(html_escape "$channel")</h2><div class=controls><button data-action=y1 type=button>y1</button><button data-action=y2 type=button>y2</button><button data-action=none type=button>none</button></div></div><div class=grid>" >> "$tmp"
+    while IFS=$'\t' read -r line; do
+      [[ "$line" == video:* ]] || continue
+      line=${line#video:}; IFS=$'\t' read -r id url thumb title <<< "$line"
+      [[ -n "$id" && -n "$url" ]] || continue
+      printf '<article class=card><a class=video-link href="%s" target="_blank" rel="noopener noreferrer"><div class=preview><img src="%s" alt=""></div><div class=video-title>%s</div></a><div class=checks><label><input class=y1 data-url="%s" type=checkbox> y1</label><label><input class=y2 data-url="%s" type=checkbox> y2</label></div></article>\n' \
+        "$(html_escape "$url")" "$(html_escape "$thumb")" "$(html_escape "$title")" "$(html_escape "$url")" "$(html_escape "$url")" >> "$tmp"
+    done <<< "$output"
+    print -r -- '</div></section>' >> "$tmp"
+  done < "$channels_file"
+  print -r -- '<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:&quot;smooth&quot;})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true});document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=()=>{const q=[...document.querySelectorAll("input:checked")],lines=q.map(x=>(x.className==="y1"?"yy1":"yy2")+" -t "+JSON.stringify(x.dataset.url));if(!lines.length){alert("Select at least one video");return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["#!/bin/sh\nset -eu\n"+lines.join("\n")+"\n"],{type:"text/plain"}));a.download="yy-download.sh";a.click()};const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>' >> "$tmp"
+  mv -f -- "$tmp" "$html_file"
+  html_checkpoint_ms=$(( $(date +%s) * 1000 ))
+  open_url "$(pwd)/${html_file#./}"
+  printf 'Generated %s\n' "$html_file"
+  (( failures == 0 ))
+}
+
 while (( $# > 0 )); do
   case "$1" in
     -t)
@@ -582,6 +702,13 @@ while (( $# > 0 )); do
         exit 1
       fi
       open_mode="open"
+      ;;
+    --html)
+      if [[ -n "$open_mode" ]]; then
+        printf 'Error: --html cannot be combined with -o or -O\n' >&2
+        exit 1
+      fi
+      open_mode="html"
       ;;
     -c)
       set_checkpoint=1
@@ -624,8 +751,15 @@ if (( do_update )); then
 fi
 
 open_failures=0
+checkpoint_after_checks_ms=0
 if [[ -n "$open_mode" ]]; then
-  run_open_mode "$open_mode" || open_failures=1
+  if [[ "$open_mode" == "html" ]]; then
+    generate_html || open_failures=1
+    if (( open_failures == 0 )); then checkpoint_after_checks_ms=$html_checkpoint_ms; fi
+  else
+    run_open_mode "$open_mode" || open_failures=1
+    if [[ "$open_mode" == "check" ]]; then checkpoint_after_checks_ms=$(( $(date +%s) * 1000 )); fi
+  fi
 fi
 
 if (( set_checkpoint )); then
@@ -634,7 +768,11 @@ if (( set_checkpoint )); then
     printf 'Checkpoint not updated: %s of %s channel check(s) failed\n' \
       "$open_failure_count" "$open_channel_count" >&2
   else
-    set_checkpoint_now
+    if (( checkpoint_after_checks_ms > 0 )); then
+      set_checkpoint_at "$checkpoint_after_checks_ms"
+    else
+      set_checkpoint_now
+    fi
   fi
 fi
 

@@ -41,6 +41,9 @@ channel-ids.txt
 # ---------------------------------------------------------------------------
 *.new.*
 *.bak
+yy.html
+yt-dlp.*.stdout
+yt-dlp.*.stderr
 
 # ---------------------------------------------------------------------------
 # Download output. Disposable scratch, and never redistribute downloaded media.
