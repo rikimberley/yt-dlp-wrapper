@@ -32,6 +32,7 @@ ffprobe.exe
 # ---------------------------------------------------------------------------
 current_url.txt
 checkpoint.txt
+channel-check-status.json
 channel-id-cache.txt
 channel-ids.txt
 
@@ -49,6 +50,7 @@ yt-dlp.*.stderr
 # Download output. Disposable scratch, and never redistribute downloaded media.
 # ---------------------------------------------------------------------------
 t/
+UC*/
 
 # ---------------------------------------------------------------------------
 # OS / editor noise

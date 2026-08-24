@@ -5,6 +5,7 @@
 # Description:
 # - stores a positional URL into ./current_url.txt and downloads it
 # - uses -t <temp_url> to download a one-off URL without persisting it
+# - uses -p <path> to override the default ./t download directory
 # - uses -U to update ./yt-dlp and refresh this script from the head of master
 #   on GitHub, then skip any download
 # - uses -o to open the channels in ./channel-ids.txt that published a public
@@ -44,9 +45,9 @@ consent_cookie="SOCS=CAI; CONSENT=YES+cb"
 accept_language="en-US,en;q=0.9"
 fetch_timeout_sec=45
 fetch_attempts=3
-ytdlp_timeout_sec=15
+ytdlp_timeout_sec=30
 ytdlp_attempts=1
-ytdlp_deadline_sec=10
+ytdlp_deadline_sec=30
 feed_failure_limit=3
 feed_fetch_failures=0
 skip_feed_fetches=0
@@ -55,6 +56,7 @@ feed_failure_counted_for_channel=0
 script_raw_base="https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master"
 current_url=""
 temp_url=""
+output_path="./t"
 do_update=0
 open_mode=""
 set_checkpoint=0
@@ -630,7 +632,7 @@ html_escape() {
 # execute host commands, so the button downloads a script containing yy1/yy2
 # commands for the selected videos.
 generate_html() {
-  local line channel channel_url channel_id uploads_url exe output id url thumb title checkpoint_ms newest failures=0
+  local line channel channel_url channel_id uploads_url exe output id url thumb title timestamp video_ms checkpoint_ms newest failures=0 cards
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
@@ -649,26 +651,30 @@ generate_html() {
       printf 'Warning: skipping %s in HTML because its channel id could not be resolved\n' "$channel" >&2; continue
     fi
     channel_id=$resolved_channel_id; uploads_url="https://www.youtube.com/playlist?list=UU${channel_id#UC}"
-    output=$(feed_video_rows "$channel_id") || {
-      run_ytdlp_metadata "$exe" --ignore-config --no-warnings --socket-timeout "$ytdlp_timeout_sec" \
-        --retries "$ytdlp_attempts" --extractor-retries "$ytdlp_attempts" --skip-download \
-        --playlist-items '1:12' --match-filter 'availability = public' \
-        --print 'video:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s' "$uploads_url" || {
-        printf 'Warning: could not collect videos for @%s\n' "$channel" >&2; continue
-      }
-      output=$ytdlp_output
+    run_ytdlp_metadata "$exe" --ignore-config --no-warnings --socket-timeout "$ytdlp_timeout_sec" \
+      --retries "$ytdlp_attempts" --extractor-retries "$ytdlp_attempts" --skip-download \
+      --playlist-items '1:12' --match-filter 'availability = public' \
+      --print 'video:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s\t%(timestamp)s' "$uploads_url" || {
+      printf 'Warning: could not collect videos for @%s\n' "$channel" >&2; continue
     }
-    print -r -- "<section class=channel><div class=channel-title><h2>$(html_escape "$channel")</h2><div class=controls><button data-action=y1 type=button>y1</button><button data-action=y2 type=button>y2</button><button data-action=none type=button>none</button></div></div><div class=grid>" >> "$tmp"
+    output=$ytdlp_output
+    cards=""
     while IFS=$'\t' read -r line; do
       [[ "$line" == video:* ]] || continue
-      line=${line#video:}; IFS=$'\t' read -r id url thumb title <<< "$line"
-      [[ -n "$id" && -n "$url" ]] || continue
-      printf '<article class=card><a class=video-link href="%s" target="_blank" rel="noopener noreferrer"><div class=preview><img src="%s" alt=""></div><div class=video-title>%s</div></a><div class=checks><label><input class=y1 data-url="%s" type=checkbox> y1</label><label><input class=y2 data-url="%s" type=checkbox> y2</label></div></article>\n' \
-        "$(html_escape "$url")" "$(html_escape "$thumb")" "$(html_escape "$title")" "$(html_escape "$url")" "$(html_escape "$url")" >> "$tmp"
+      line=${line#video:}; IFS=$'\t' read -r id url thumb title timestamp <<< "$line"
+      [[ -n "$id" && -n "$url" && "$timestamp" =~ ^[0-9]+$ ]] || continue
+      video_ms=$(( timestamp * 1000 ))
+      (( video_ms > checkpoint_ms )) || continue
+      cards+=$(printf '<article class=card><a class=video-link href="%s" target="_blank" rel="noopener noreferrer"><div class=preview><img src="%s" alt=""></div><div class=video-title>%s</div></a><div class=checks><label><input class=y1 data-url="%s" data-path="./%s" type=checkbox> y1</label><label><input class=y2 data-url="%s" data-path="./%s" type=checkbox> y2</label></div></article>\n' \
+        "$(html_escape "$url")" "$(html_escape "$thumb")" "$(html_escape "$title")" "$(html_escape "$url")" "$(html_escape "$channel")" "$(html_escape "$url")" "$(html_escape "$channel")")
     done <<< "$output"
-    print -r -- '</div></section>' >> "$tmp"
+    if [[ -n "$cards" ]]; then
+      print -r -- "<section class=channel><div class=channel-title><h2>$(html_escape "$channel")</h2><div class=controls><button data-action=y1 type=button>y1</button><button data-action=y2 type=button>y2</button><button data-action=none type=button>none</button></div></div><div class=grid>" >> "$tmp"
+      print -r -- "$cards" >> "$tmp"
+      print -r -- '</div></section>' >> "$tmp"
+    fi
   done < "$channels_file"
-  print -r -- '<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:&quot;smooth&quot;})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true});document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=()=>{const q=[...document.querySelectorAll("input:checked")],lines=q.map(x=>(x.className==="y1"?"yy1":"yy2")+" -t "+JSON.stringify(x.dataset.url));if(!lines.length){alert("Select at least one video");return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["#!/bin/sh\nset -eu\n"+lines.join("\n")+"\n"],{type:"text/plain"}));a.download="yy-download.sh";a.click()};const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>' >> "$tmp"
+  print -r -- '<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:&quot;smooth&quot;})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true});document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=()=>{const q=[...document.querySelectorAll("input:checked")],lines=q.map(x=>(x.className==="y1"?"yy1":"yy2")+" -p "+JSON.stringify(x.dataset.path)+" -t "+JSON.stringify(x.dataset.url));if(!lines.length){alert("Select at least one video");return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["#!/bin/sh\nset -eu\n"+lines.join("\n")+"\n"],{type:"text/plain"}));a.download="yy-download.sh";a.click()};const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>' >> "$tmp"
   mv -f -- "$tmp" "$html_file"
   html_checkpoint_ms=$(( $(date +%s) * 1000 ))
   open_url "$(pwd)/${html_file#./}"
@@ -685,6 +691,14 @@ while (( $# > 0 )); do
         exit 1
       fi
       temp_url=$1
+      ;;
+    -p)
+      shift
+      if (( $# == 0 )) || [[ -z "$1" ]]; then
+        printf 'Error: -p requires a non-empty path argument\n' >&2
+        exit 1
+      fi
+      output_path=$1
       ;;
     -U)
       do_update=1
@@ -785,7 +799,7 @@ if [[ -n "$run_url" ]]; then
     printf 'Error: yt-dlp binary not found next to this script\n' >&2
     exit 1
   }
-  run_cmd "$ytdlp_exe" --cookies ./cookies.txt --paths ./t "$run_url"
+  run_cmd "$ytdlp_exe" --cookies ./cookies.txt --paths "$output_path" "$run_url"
 else
   printf 'Error: no URL provided, and %s does not exist or is empty\n' "$url_file" >&2
   exit 1

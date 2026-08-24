@@ -52,7 +52,7 @@ re-exporting.
 ## Usage
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-U] [-o | -O | --html] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html] [-c]
 ```
 
 | Flag | Effect |
@@ -61,6 +61,7 @@ re-exporting.
 | *(no args)* | Re-download the URL in `current_url.txt` |
 | `-t <url>` | Download this URL once, without persisting it |
 | `-U` | Self-update the binary *and* this wrapper from `master`, then exit |
+| `-p <path>` | Download into `<path>` instead of the default `./t` |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
@@ -82,22 +83,26 @@ In PowerShell, `--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
 loopback listener; `yy.ps1` validates the structured selections and starts the
-matching local `yy1.ps1 -t "<url>"` / `yy2.ps1 -t "<url>"` hook without making
+matching local `yy1.ps1 -p "./<channel-entry>" -t "<url>"` / `yy2.ps1 -p "./<channel-entry>" -t "<url>"` hook without making
 the page wait for downloads to finish; it reports queued, running, completed,
 and failed job counts plus recent yy/yt-dlp output in the page and the wrapper
 console. Jobs run sequentially: all y2 selections first, then y1 selections.
 Use `STOP SERVER` in the page, or Ctrl+C in the wrapper console, to end the
 loopback server; the button attempts to close its page (and falls back to a
-blank page when the browser disallows programmatic closing). Closing a browser
-tab alone does not stop the server. Port 8080 must be available. The callback
-never accepts arbitrary command text.
+blank page when the browser disallows programmatic closing). Closing the page
+also stops the server after its 30-second heartbeat timeout. Port 8080 must be
+available. The callback never accepts arbitrary command text.
 
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
 boxes; none clears both destinations' boxes in its scope.
 
+Each displayed video must itself be newer than `checkpoint.txt`. HTML download
+jobs use the normalized entry from `channel-ids.txt` as their relative output
+folder—for example, `liguiHD` downloads to `./liguiHD`.
+
 The logged-out yt-dlp metadata lookups used by `-o` and `--html` have a
-15-second socket timeout, one retry, and a 10-second wall-clock deadline, so a
+30-second socket timeout, one retry, and a 30-second wall-clock deadline, so a
 stalled YouTube request fails as a channel-check error instead of leaving the
 wrapper running indefinitely.
 
