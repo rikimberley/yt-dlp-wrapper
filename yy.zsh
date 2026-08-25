@@ -402,18 +402,55 @@ feed_newest_ms() {
   print -r -- "$newest ok"
 }
 
+# Format an epoch-ms timestamp as a compact age for console progress messages.
+format_relative_ms() {
+  local timestamp_ms=$1 seconds count unit i
+  local -a units divisors
+  units=(year month week day hour minute)
+  divisors=(31536000 2592000 604800 86400 3600 60)
+  seconds=$(( $(date +%s) - timestamp_ms / 1000 ))
+  (( seconds < 0 )) && seconds=0
+  for i in {1..6}; do
+    unit=${units[$i]}
+    count=$(( seconds / divisors[$i] ))
+    if (( count >= 1 )); then
+      if (( count == 1 )); then
+        printf '%s %s ago\n' "$count" "$unit"
+      else
+        printf '%s %ss ago\n' "$count" "$unit"
+      fi
+      return 0
+    fi
+  done
+  print -r -- 'just now'
+}
+
 # Metadata probes must not outlive the wrapper indefinitely. yt-dlp's own
 # socket timeout does not cover every extractor subprocess on every platform.
 ytdlp_output=""
 run_ytdlp_metadata() {
-  local tmp pid waited=0 status=0 deadline=$ytdlp_deadline_sec
-  if [[ "${1:-}" == "--no-deadline" ]]; then
-    deadline=0
-    shift
-  fi
+  local tmp pid waited=0 status=0 deadline=$ytdlp_deadline_sec show_progress=0 progress_label="yt-dlp"
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --no-deadline) deadline=0; shift ;;
+      --show-progress) show_progress=1; progress_label=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
   ytdlp_output=""
   tmp=$(mktemp) || return 1
-  "$@" >"$tmp" 2>/dev/null & pid=$!
+  if (( show_progress )); then
+    "$@" >"$tmp" 2> >(
+      while IFS= read -r line; do
+        if [[ "$line" != '[debug]'* && \
+              ( "$line" == \[* || "$line" == ERROR:* || "$line" == WARNING:* || "$line" == 'Aborting '* ) ]]; then
+          printf '[%s] %s\n' "$progress_label" "$line" >&2
+        fi
+      done
+    ) & pid=$!
+  else
+    "$@" >"$tmp" 2>/dev/null & pid=$!
+  fi
   while kill -0 "$pid" 2>/dev/null; do
     if (( deadline > 0 && waited >= deadline )); then
       kill "$pid" 2>/dev/null || true
@@ -424,6 +461,9 @@ run_ytdlp_metadata() {
     fi
     sleep 1
     (( ++waited ))
+    if (( show_progress && waited % 15 == 0 )); then
+      printf '[%s] Still running yt-dlp... %s seconds elapsed\n' "$progress_label" "$waited"
+    fi
   done
   wait "$pid" || status=$?
   ytdlp_output=$(<"$tmp")
@@ -619,38 +659,50 @@ html_escape() {
 # execute host commands, so the button downloads a script containing yy1/yy2
 # commands for the selected videos.
 generate_html() {
-  local line channel channel_url exe output id url thumb title timestamp video_ms checkpoint_ms failures=0 cards
+  local line channel channel_url exe output id url thumb title timestamp video_ms checkpoint_ms checkpoint_sec status qualified_count failures=0 cards
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
   checkpoint_ms=$(read_checkpoint_ms) || return 1
+  checkpoint_sec=$(( checkpoint_ms / 1000 ))
+  printf 'Generating HTML from /videos tabs newer than checkpoint %s (%s)...\n' \
+    "$checkpoint_ms" "$(format_relative_ms "$checkpoint_ms")"
   print -r -- '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>yy video grid</title>' >| "$tmp"
   print -r -- '<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>' >> "$tmp"
-  print -r -- "<h1>yy video grid</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED. The button downloads a command script; run it next to yy1/yy2.</p><div class=\"controls\"><span>Checkpoint: ${checkpoint_ms}</span><button id=\"download\" type=\"button\">DOWNLOAD SELECTED</button><button data-action=\"y1\" type=\"button\">y1</button><button data-action=\"y2\" type=\"button\">y2</button><button data-action=\"none\" type=\"button\">none</button></div><main>" >> "$tmp"
+  print -r -- "<h1>yy video grid</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED. The button downloads a command script; run it next to yy1/yy2. <span>Checkpoint: ${checkpoint_ms}</span></p><div class=\"controls\"><button id=\"download\" type=\"button\">DOWNLOAD SELECTED</button><button data-action=\"y1\" type=\"button\">y1</button><button data-action=\"y2\" type=\"button\">y2</button><button data-action=\"none\" type=\"button\">none</button></div><main>" >> "$tmp"
   while IFS= read -r line || [[ -n "$line" ]]; do
     channel=$(trim "$line"); [[ -n "$channel" && "$channel" != '#'* ]] || continue
     channel=${channel#@}; channel_url=$(channel_url_for "$channel")
-    # /videos excludes Shorts; no item cap lets yt-dlp follow every continuation
-    # page. Large channels are allowed to exceed the normal metadata deadline.
-    run_ytdlp_metadata --no-deadline "$exe" --ignore-config --no-warnings \
+    printf 'Checking @%s...\n' "$channel"
+    # /videos excludes Shorts. Resolve lazily and stop after the first public
+    # entry at or before the checkpoint. Exit 101 is yt-dlp's intentional break.
+    status=0
+    run_ytdlp_metadata --no-deadline --show-progress "@$channel" "$exe" --ignore-config --verbose \
+      --ignore-errors --lazy-playlist \
       --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
       --extractor-retries "$ytdlp_attempts" --skip-download \
       --match-filter 'availability = public' \
-      --print 'video:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s\t%(timestamp)s' "$channel_url" || {
+      --break-match-filters "timestamp > ${checkpoint_sec}" \
+      --print 'row:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s\t%(timestamp)s' \
+      "$channel_url" || status=$?
+    if (( status != 0 && status != 101 )); then
       printf 'Warning: could not collect the videos tab for @%s\n' "$channel" >&2
       failures=$(( failures + 1 )); continue
-    }
+    fi
     output=$ytdlp_output
     cards=""
+    qualified_count=0
     while IFS=$'\t' read -r line; do
-      [[ "$line" == video:* ]] || continue
-      line=${line#video:}; IFS=$'\t' read -r id url thumb title timestamp <<< "$line"
+      [[ "$line" == row:* ]] || continue
+      line=${line#row:}; IFS=$'\t' read -r id url thumb title timestamp <<< "$line"
       [[ -n "$id" && -n "$url" && "$timestamp" =~ ^[0-9]+$ ]] || continue
       video_ms=$(( timestamp * 1000 ))
       (( video_ms > checkpoint_ms )) || continue
       cards+=$(printf '<article class=card><a class=video-link href="%s" target="_blank" rel="noopener noreferrer"><div class=preview><img src="%s" alt=""></div><div class=video-title>%s</div></a><div class=checks><label><input class=y1 data-url="%s" data-path="./%s" type=checkbox> y1</label><label><input class=y2 data-url="%s" data-path="./%s" type=checkbox> y2</label></div></article>\n' \
         "$(html_escape "$url")" "$(html_escape "$thumb")" "$(html_escape "$title")" "$(html_escape "$url")" "$(html_escape "$channel")" "$(html_escape "$url")" "$(html_escape "$channel")")
+      (( ++qualified_count ))
     done <<< "$output"
+    printf '@%s: %s new public video(s)\n' "$channel" "$qualified_count"
     if [[ -n "$cards" ]]; then
       print -r -- "<section class=channel><div class=channel-title><h2>$(html_escape "$channel")</h2><div class=controls><button data-action=y1 type=button>y1</button><button data-action=y2 type=button>y2</button><button data-action=none type=button>none</button></div></div><div class=grid>" >> "$tmp"
       print -r -- "$cards" >> "$tmp"

@@ -77,11 +77,15 @@ listed channels fail to be checked. With `-o -c` and `--html -c`, the saved
 timestamp is captured after the check pass, before channels/pages are opened;
 it is written when that operation returns (after the HTML server stops).
 
-`--html` traverses every continuation page of each channel's `/videos` tab and
-shows all public videos newer than the checkpoint, without sending account
-cookies. Shorts that appear only on `/shorts` are excluded. The generated page
+`--html` traverses each channel's `/videos` tab and shows all public videos newer
+than the checkpoint, without sending account cookies. It follows continuation
+pages as needed and stops after reaching an older public video; inaccessible
+age-restricted and members-only entries are skipped. Shorts that appear only on
+`/shorts` are excluded. The generated page
 displays the current checkpoint; in PowerShell it updates immediately when the
-`CHECKPOINT` button is clicked.
+`CHECKPOINT` button is clicked. While generating the page, the wrapper prints
+each channel as it starts, live yt-dlp extraction/network messages, a periodic
+elapsed-time heartbeat, and the number of qualifying videos it found.
 In PowerShell, `--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
