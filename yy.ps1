@@ -826,6 +826,7 @@ function New-VideoHtml {
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
     $checkpointMs = Read-CheckpointMs
     $checkpointSec = [Math]::Floor($checkpointMs / 1000)
+    $scanCutoffSec = [Math]::Max(0, $checkpointSec - 86400)
     $checkpointAge = Format-RelativeVideoTime $checkpointMs
     $failures = 0
     $checkBatchMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -841,21 +842,53 @@ function New-VideoHtml {
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
         $channelUrl = Get-ChannelUrl $channel
         Write-Host "Checking @$channel..."
-        # Traversing the explicit /videos tab excludes Shorts. Resolve entries
-        # lazily and stop at the first public video at or before the checkpoint;
-        # inaccessible age-restricted/members-only entries are skipped without
-        # discarding valid public rows already collected. yt-dlp uses exit 101
-        # to report the intentional --break-match-filters stop.
-        $result = Invoke-YtDlpMetadata -What "videos tab for @$channel" -DeadlineSec 0 `
-            -ProgressLabel "@$channel" -Arguments @(
-            '--ignore-config', '--verbose', '--ignore-errors', '--lazy-playlist',
+        # First scan the /videos tab without opening individual watch pages.
+        # Approximate tab dates select a conservative candidate set; the second
+        # pass resolves only those candidates for exact final filtering.
+        $scan = Invoke-YtDlpMetadata -What "videos tab scan for @$channel" -DeadlineSec 0 `
+            -ProgressLabel "@$channel scan" -Arguments @(
+            '--ignore-config', '--verbose', '--cookies', './cookies.txt',
+            '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
             '--socket-timeout', $ytDlpTimeoutSec,
             '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
-            '--skip-download', '--match-filter', 'availability = public',
-            '--break-match-filters', "timestamp > $checkpointSec", '--print',
-            ("row:%(id)s`t%(webpage_url)s`t%(thumbnail)s`t%(title)s`t%(timestamp)s"), $channelUrl)
-        $rows = $result.Output
-        if ($result.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not collect the videos tab for @$channel"); $failures++; continue }
+            '--skip-download', '--break-match-filters', "timestamp > $scanCutoffSec", '--print',
+            ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
+        if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
+        $candidateUrls = New-Object System.Collections.ArrayList
+        $rows = New-Object System.Collections.ArrayList
+        foreach ($scanRow in @($scan.Output)) {
+            $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
+            if ($scanParts.Count -lt 5 -or -not $scanParts[0].StartsWith('scan:')) { continue }
+            if ($scanParts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
+            [long]$approximateMs = 0
+            if (-not [long]::TryParse($scanParts[3], [ref]$approximateMs)) { continue }
+            if ($approximateMs -lt 100000000000) { $approximateMs *= 1000 }
+            if ($approximateMs -gt ($checkpointMs + 86400000)) {
+                $scanId = $scanParts[0].Substring(5)
+                $scanThumbnail = "https://i.ytimg.com/vi/$scanId/hqdefault.jpg"
+                [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs")
+            }
+            elseif ($scanParts[1] -ne '') {
+                [void]$candidateUrls.Add($scanParts[1])
+            }
+        }
+        Write-Host "@${channel}: $($rows.Count) clear match(es), resolving $($candidateUrls.Count) checkpoint-boundary candidate(s)..."
+        if ($candidateUrls.Count -gt 0) {
+            $resolveArguments = @(
+                '--ignore-config', '--verbose', '--cookies', './cookies.txt', '--ignore-errors',
+                '--socket-timeout', $ytDlpTimeoutSec, '--retries', $ytDlpAttempts,
+                '--extractor-retries', $ytDlpAttempts, '--skip-download',
+                '--match-filter', 'availability = public', '--print',
+                ("row:%(id)s`t%(webpage_url)s`t%(thumbnail)s`t%(title)s`t%(timestamp)s")) + @($candidateUrls)
+            $resolved = Invoke-YtDlpMetadata -What "candidate videos for @$channel" -DeadlineSec 0 `
+                -ProgressLabel "@$channel resolve" -Arguments $resolveArguments
+            foreach ($resolvedRow in @($resolved.Output)) { [void]$rows.Add($resolvedRow) }
+            if ($resolved.ExitCode -ne 0 -and $resolved.Output.Count -eq 0) {
+                [Console]::Error.WriteLine("Warning: could not resolve candidate videos for @$channel")
+                $failures++
+                continue
+            }
+        }
         $cards = New-Object System.Text.StringBuilder
         $newest = [long]0
         $qualifiedCount = 0
@@ -918,7 +951,7 @@ function New-VideoHtml {
     Save-ChannelCheckStatus $ChannelStatus
     [void]$sb.AppendLine('</tbody></table></section>')
     [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
-    $pageText = $sb.ToString().Replace('if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}', 'setTimeout(showJobs,1000)}catch(e){status.textContent="Server stopped";window.close();setTimeout(()=>location.replace("about:blank"),150)}')
+    $pageText = $sb.ToString().Replace('if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}', 'setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}')
     $pageText = $pageText.Replace('jobLog.textContent=(b.logs||[]).join("\n");', 'jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;')
     $heartbeatUrl = $CallbackUrl -replace '/download/', '/heartbeat/'
     $pageText = $pageText.Replace('showJobs();const backToTop', 'setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop')
@@ -1145,6 +1178,10 @@ function Invoke-HtmlCallbackServer {
                 if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus)) {
                     [Console]::Error.WriteLine('Warning: could not refresh the page; keeping the previous page.')
                 }
+                # Heartbeats cannot be accepted while the single-threaded server
+                # is regenerating the page. Do not mistake that expected pause
+                # for the browser having closed as soon as generation finishes.
+                $lastHeartbeat = [System.DateTime]::UtcNow
                 continue
             }
             if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -eq "/channel/$Token") {

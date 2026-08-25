@@ -77,11 +77,12 @@ listed channels fail to be checked. With `-o -c` and `--html -c`, the saved
 timestamp is captured after the check pass, before channels/pages are opened;
 it is written when that operation returns (after the HTML server stops).
 
-`--html` traverses each channel's `/videos` tab and shows all public videos newer
-than the checkpoint, without sending account cookies. It follows continuation
-pages as needed and stops after reaching an older public video; inaccessible
-age-restricted and members-only entries are skipped. Shorts that appear only on
-`/shorts` are excluded. The generated page
+`--html` first scans each channel's `/videos` tab as a flat playlist using
+yt-dlp's approximate tab dates, accepts entries safely beyond a one-day margin,
+then resolves only non-members candidates near the checkpoint for exact
+timestamps and public availability. Both phases use
+`cookies.txt`, allowing age-restricted public videos to be checked; members-only
+entries remain excluded. Shorts that appear only on `/shorts` are excluded. The generated page
 displays the current checkpoint; in PowerShell it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints
 each channel as it starts, live yt-dlp extraction/network messages, a periodic
@@ -97,7 +98,9 @@ console. Jobs run sequentially: all y2 selections first, then y1 selections.
 Use `STOP SERVER` in the page, or Ctrl+C in the wrapper console, to end the
 loopback server; the button attempts to close its page (and falls back to a
 blank page when the browser disallows programmatic closing). Closing the page
-also stops the server after its 30-second heartbeat timeout. Port 8080 must be
+also stops the server after its 30-second heartbeat timeout. Time spent
+regenerating the page during a refresh does not count toward that timeout.
+Temporary status-request failures do not close the page. Port 8080 must be
 available. The callback never accepts arbitrary command text.
 
 The page has y1, y2, and none selection controls beside Download selected and

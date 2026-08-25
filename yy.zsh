@@ -659,12 +659,15 @@ html_escape() {
 # execute host commands, so the button downloads a script containing yy1/yy2
 # commands for the selected videos.
 generate_html() {
-  local line channel channel_url exe output id url thumb title timestamp video_ms checkpoint_ms checkpoint_sec status qualified_count failures=0 cards
+  local line channel channel_url exe output rows_output id url thumb title timestamp availability approximate_ms video_ms checkpoint_ms checkpoint_sec scan_cutoff_sec status clear_count qualified_count failures=0 cards
+  local -a candidate_urls resolve_args
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
   checkpoint_ms=$(read_checkpoint_ms) || return 1
   checkpoint_sec=$(( checkpoint_ms / 1000 ))
+  scan_cutoff_sec=$(( checkpoint_sec - 86400 ))
+  (( scan_cutoff_sec < 0 )) && scan_cutoff_sec=0
   printf 'Generating HTML from /videos tabs newer than checkpoint %s (%s)...\n' \
     "$checkpoint_ms" "$(format_relative_ms "$checkpoint_ms")"
   print -r -- '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>yy video grid</title>' >| "$tmp"
@@ -674,22 +677,58 @@ generate_html() {
     channel=$(trim "$line"); [[ -n "$channel" && "$channel" != '#'* ]] || continue
     channel=${channel#@}; channel_url=$(channel_url_for "$channel")
     printf 'Checking @%s...\n' "$channel"
-    # /videos excludes Shorts. Resolve lazily and stop after the first public
-    # entry at or before the checkpoint. Exit 101 is yt-dlp's intentional break.
+    # Scan /videos flat first, then resolve only the conservative candidate set.
     status=0
-    run_ytdlp_metadata --no-deadline --show-progress "@$channel" "$exe" --ignore-config --verbose \
-      --ignore-errors --lazy-playlist \
+    run_ytdlp_metadata --no-deadline --show-progress "@$channel scan" "$exe" --ignore-config --verbose \
+      --cookies ./cookies.txt --flat-playlist --lazy-playlist \
+      --extractor-args 'youtubetab:approximate_date' \
       --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
       --extractor-retries "$ytdlp_attempts" --skip-download \
-      --match-filter 'availability = public' \
-      --break-match-filters "timestamp > ${checkpoint_sec}" \
-      --print 'row:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s\t%(timestamp)s' \
+      --break-match-filters "timestamp > ${scan_cutoff_sec}" \
+      --print 'scan:%(id)s\t%(webpage_url)s\t%(title)s\t%(timestamp)s\t%(availability)s' \
       "$channel_url" || status=$?
     if (( status != 0 && status != 101 )); then
-      printf 'Warning: could not collect the videos tab for @%s\n' "$channel" >&2
+      printf 'Warning: could not scan the videos tab for @%s\n' "$channel" >&2
       failures=$(( failures + 1 )); continue
     fi
     output=$ytdlp_output
+    candidate_urls=()
+    rows_output=""
+    clear_count=0
+    while IFS=$'\t' read -r line; do
+      [[ "$line" == scan:* ]] || continue
+      line=${line#scan:}; IFS=$'\t' read -r id url title timestamp availability <<< "$line"
+      [[ -n "$id" && -n "$url" && "$timestamp" =~ ^[0-9]+$ ]] || continue
+      [[ "$availability" == subscriber_only || "$availability" == private || "$availability" == premium_only ]] && continue
+      approximate_ms=$(( timestamp * 1000 ))
+      if (( approximate_ms > checkpoint_ms + 86400000 )); then
+        rows_output+=$(printf 'row:%s\t%s\thttps://i.ytimg.com/vi/%s/hqdefault.jpg\t%s\t%s\n' \
+          "$id" "$url" "$id" "$title" "$approximate_ms")
+        rows_output+=$'\n'
+        (( ++clear_count ))
+      else
+        candidate_urls+=("$url")
+      fi
+    done <<< "$output"
+    printf '@%s: %s clear match(es), resolving %s checkpoint-boundary candidate(s)...\n' \
+      "$channel" "$clear_count" "${#candidate_urls}"
+    output=""
+    if (( ${#candidate_urls} > 0 )); then
+      status=0
+      resolve_args=(--ignore-config --verbose --cookies ./cookies.txt --ignore-errors \
+        --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
+        --extractor-retries "$ytdlp_attempts" --skip-download \
+        --match-filter 'availability = public' \
+        --print 'row:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s\t%(timestamp)s')
+      run_ytdlp_metadata --no-deadline --show-progress "@$channel resolve" "$exe" \
+        "${resolve_args[@]}" "${candidate_urls[@]}" || status=$?
+      output=$ytdlp_output
+      if (( status != 0 )) && [[ -z "$output" ]]; then
+        printf 'Warning: could not resolve candidate videos for @%s\n' "$channel" >&2
+        failures=$(( failures + 1 )); continue
+      fi
+    fi
+    output="${rows_output}${output}"
     cards=""
     qualified_count=0
     while IFS=$'\t' read -r line; do
