@@ -77,8 +77,11 @@ listed channels fail to be checked. With `-o -c` and `--html -c`, the saved
 timestamp is captured after the check pass, before channels/pages are opened;
 it is written when that operation returns (after the HTML server stops).
 
-`--html` checks the checkpoint like `-o` and collects the newest 12 public
-uploads for each channel with something new, without sending account cookies.
+`--html` traverses every continuation page of each channel's `/videos` tab and
+shows all public videos newer than the checkpoint, without sending account
+cookies. Shorts that appear only on `/shorts` are excluded. The generated page
+displays the current checkpoint; in PowerShell it updates immediately when the
+`CHECKPOINT` button is clicked.
 In PowerShell, `--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
@@ -101,10 +104,10 @@ Each displayed video must itself be newer than `checkpoint.txt`. HTML download
 jobs use the normalized entry from `channel-ids.txt` as their relative output
 folder—for example, `liguiHD` downloads to `./liguiHD`.
 
-The logged-out yt-dlp metadata lookups used by `-o` and `--html` have a
-30-second socket timeout, one retry, and a 30-second wall-clock deadline, so a
-stalled YouTube request fails as a channel-check error instead of leaving the
-wrapper running indefinitely.
+The logged-out yt-dlp metadata lookups use a 30-second socket timeout and one
+retry. The small `-o` fallback also has a 30-second wall-clock deadline. The
+complete `/videos` traversal used by `--html` has no wall-clock deadline because
+large channels can require many continuation pages.
 
 ## Files
 
