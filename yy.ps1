@@ -826,7 +826,8 @@ function New-VideoHtml {
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
     $checkpointMs = Read-CheckpointMs
     $checkpointSec = [Math]::Floor($checkpointMs / 1000)
-    $scanCutoffSec = [Math]::Max(0, $checkpointSec - 86400)
+    $checkpointDayStartSec = $checkpointSec - ($checkpointSec % 86400)
+    $scanCutoffSec = [Math]::Max(0, $checkpointDayStartSec - 86400)
     $checkpointAge = Format-RelativeVideoTime $checkpointMs
     $failures = 0
     $checkBatchMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -842,19 +843,18 @@ function New-VideoHtml {
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
         $channelUrl = Get-ChannelUrl $channel
         Write-Host "Checking @$channel..."
-        # First scan the /videos tab without opening individual watch pages.
-        # Approximate tab dates select a conservative candidate set; the second
-        # pass resolves only those candidates for exact final filtering.
+        # Approximate tab dates can precede the exact publication time. Start at
+        # midnight UTC on the day before the checkpoint date and keep the overlap
+        # rather than resolving watch pages; this favors coverage over precision.
         $scan = Invoke-YtDlpMetadata -What "videos tab scan for @$channel" -DeadlineSec 0 `
             -ProgressLabel "@$channel scan" -Arguments @(
             '--ignore-config', '--verbose', '--cookies', './cookies.txt',
             '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
             '--socket-timeout', $ytDlpTimeoutSec,
             '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
-            '--skip-download', '--break-match-filters', "timestamp > $scanCutoffSec", '--print',
+            '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
             ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
         if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
-        $candidateUrls = New-Object System.Collections.ArrayList
         $rows = New-Object System.Collections.ArrayList
         foreach ($scanRow in @($scan.Output)) {
             $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
@@ -863,31 +863,9 @@ function New-VideoHtml {
             [long]$approximateMs = 0
             if (-not [long]::TryParse($scanParts[3], [ref]$approximateMs)) { continue }
             if ($approximateMs -lt 100000000000) { $approximateMs *= 1000 }
-            if ($approximateMs -gt ($checkpointMs + 86400000)) {
-                $scanId = $scanParts[0].Substring(5)
-                $scanThumbnail = "https://i.ytimg.com/vi/$scanId/hqdefault.jpg"
-                [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs")
-            }
-            elseif ($scanParts[1] -ne '') {
-                [void]$candidateUrls.Add($scanParts[1])
-            }
-        }
-        Write-Host "@${channel}: $($rows.Count) clear match(es), resolving $($candidateUrls.Count) checkpoint-boundary candidate(s)..."
-        if ($candidateUrls.Count -gt 0) {
-            $resolveArguments = @(
-                '--ignore-config', '--verbose', '--cookies', './cookies.txt', '--ignore-errors',
-                '--socket-timeout', $ytDlpTimeoutSec, '--retries', $ytDlpAttempts,
-                '--extractor-retries', $ytDlpAttempts, '--skip-download',
-                '--match-filter', 'availability = public', '--print',
-                ("row:%(id)s`t%(webpage_url)s`t%(thumbnail)s`t%(title)s`t%(timestamp)s")) + @($candidateUrls)
-            $resolved = Invoke-YtDlpMetadata -What "candidate videos for @$channel" -DeadlineSec 0 `
-                -ProgressLabel "@$channel resolve" -Arguments $resolveArguments
-            foreach ($resolvedRow in @($resolved.Output)) { [void]$rows.Add($resolvedRow) }
-            if ($resolved.ExitCode -ne 0 -and $resolved.Output.Count -eq 0) {
-                [Console]::Error.WriteLine("Warning: could not resolve candidate videos for @$channel")
-                $failures++
-                continue
-            }
+            $scanId = $scanParts[0].Substring(5)
+            $scanThumbnail = "https://i.ytimg.com/vi/$scanId/hqdefault.jpg"
+            [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs")
         }
         $cards = New-Object System.Text.StringBuilder
         $newest = [long]0
@@ -899,7 +877,6 @@ function New-VideoHtml {
             if (-not [long]::TryParse($parts[4], [ref]$videoMs)) { continue }
             if ($videoMs -lt 100000000000) { $videoMs *= 1000 }
             if ($videoMs -gt $newest) { $newest = $videoMs }
-            if ($videoMs -le $checkpointMs) { continue }
             $id = $parts[0].Substring(4); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]; $age = Format-RelativeVideoTime $videoMs
             if ($id -eq '' -or $url -eq '') { continue }
             $eUrl = [System.Net.WebUtility]::HtmlEncode($url); $eThumb = [System.Net.WebUtility]::HtmlEncode($thumb); $eTitle = [System.Net.WebUtility]::HtmlEncode($title)
@@ -908,7 +885,7 @@ function New-VideoHtml {
             [void]$cards.AppendLine($card)
             $qualifiedCount++
         }
-        Write-Host "@${channel}: $qualifiedCount new public video(s)"
+        Write-Host "@${channel}: $qualifiedCount visible video(s) in the checkpoint overlap"
         Record-ChannelCheck $ChannelStatus $channel $newest $checkBatchMs
         if ($cards.Length -gt 0) {
             [void]$sb.AppendLine('<section class="channel"><div class="channel-title"><h2>' + [System.Net.WebUtility]::HtmlEncode($channel) + '</h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">')

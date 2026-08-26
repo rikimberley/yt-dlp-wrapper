@@ -659,14 +659,14 @@ html_escape() {
 # execute host commands, so the button downloads a script containing yy1/yy2
 # commands for the selected videos.
 generate_html() {
-  local line channel channel_url exe output rows_output id url thumb title timestamp availability approximate_ms video_ms checkpoint_ms checkpoint_sec scan_cutoff_sec status clear_count qualified_count failures=0 cards
-  local -a candidate_urls resolve_args
+  local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
   checkpoint_ms=$(read_checkpoint_ms) || return 1
   checkpoint_sec=$(( checkpoint_ms / 1000 ))
-  scan_cutoff_sec=$(( checkpoint_sec - 86400 ))
+  checkpoint_day_start_sec=$(( checkpoint_sec - checkpoint_sec % 86400 ))
+  scan_cutoff_sec=$(( checkpoint_day_start_sec - 86400 ))
   (( scan_cutoff_sec < 0 )) && scan_cutoff_sec=0
   printf 'Generating HTML from /videos tabs newer than checkpoint %s (%s)...\n' \
     "$checkpoint_ms" "$(format_relative_ms "$checkpoint_ms")"
@@ -677,14 +677,16 @@ generate_html() {
     channel=$(trim "$line"); [[ -n "$channel" && "$channel" != '#'* ]] || continue
     channel=${channel#@}; channel_url=$(channel_url_for "$channel")
     printf 'Checking @%s...\n' "$channel"
-    # Scan /videos flat first, then resolve only the conservative candidate set.
+    # Approximate tab dates can precede the exact publication time. Start at
+    # midnight UTC on the day before the checkpoint date and keep the overlap
+    # rather than resolving watch pages; this favors coverage over precision.
     status=0
     run_ytdlp_metadata --no-deadline --show-progress "@$channel scan" "$exe" --ignore-config --verbose \
       --cookies ./cookies.txt --flat-playlist --lazy-playlist \
       --extractor-args 'youtubetab:approximate_date' \
       --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
       --extractor-retries "$ytdlp_attempts" --skip-download \
-      --break-match-filters "timestamp > ${scan_cutoff_sec}" \
+      --break-match-filters "timestamp >= ${scan_cutoff_sec}" \
       --print 'scan:%(id)s\t%(webpage_url)s\t%(title)s\t%(timestamp)s\t%(availability)s' \
       "$channel_url" || status=$?
     if (( status != 0 && status != 101 )); then
@@ -692,56 +694,20 @@ generate_html() {
       failures=$(( failures + 1 )); continue
     fi
     output=$ytdlp_output
-    candidate_urls=()
-    rows_output=""
-    clear_count=0
+    cards=""
+    qualified_count=0
     while IFS=$'\t' read -r line; do
       [[ "$line" == scan:* ]] || continue
       line=${line#scan:}; IFS=$'\t' read -r id url title timestamp availability <<< "$line"
       [[ -n "$id" && -n "$url" && "$timestamp" =~ ^[0-9]+$ ]] || continue
       [[ "$availability" == subscriber_only || "$availability" == private || "$availability" == premium_only ]] && continue
-      approximate_ms=$(( timestamp * 1000 ))
-      if (( approximate_ms > checkpoint_ms + 86400000 )); then
-        rows_output+=$(printf 'row:%s\t%s\thttps://i.ytimg.com/vi/%s/hqdefault.jpg\t%s\t%s\n' \
-          "$id" "$url" "$id" "$title" "$approximate_ms")
-        rows_output+=$'\n'
-        (( ++clear_count ))
-      else
-        candidate_urls+=("$url")
-      fi
-    done <<< "$output"
-    printf '@%s: %s clear match(es), resolving %s checkpoint-boundary candidate(s)...\n' \
-      "$channel" "$clear_count" "${#candidate_urls}"
-    output=""
-    if (( ${#candidate_urls} > 0 )); then
-      status=0
-      resolve_args=(--ignore-config --verbose --cookies ./cookies.txt --ignore-errors \
-        --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
-        --extractor-retries "$ytdlp_attempts" --skip-download \
-        --match-filter 'availability = public' \
-        --print 'row:%(id)s\t%(webpage_url)s\t%(thumbnail)s\t%(title)s\t%(timestamp)s')
-      run_ytdlp_metadata --no-deadline --show-progress "@$channel resolve" "$exe" \
-        "${resolve_args[@]}" "${candidate_urls[@]}" || status=$?
-      output=$ytdlp_output
-      if (( status != 0 )) && [[ -z "$output" ]]; then
-        printf 'Warning: could not resolve candidate videos for @%s\n' "$channel" >&2
-        failures=$(( failures + 1 )); continue
-      fi
-    fi
-    output="${rows_output}${output}"
-    cards=""
-    qualified_count=0
-    while IFS=$'\t' read -r line; do
-      [[ "$line" == row:* ]] || continue
-      line=${line#row:}; IFS=$'\t' read -r id url thumb title timestamp <<< "$line"
-      [[ -n "$id" && -n "$url" && "$timestamp" =~ ^[0-9]+$ ]] || continue
       video_ms=$(( timestamp * 1000 ))
-      (( video_ms > checkpoint_ms )) || continue
+      thumb="https://i.ytimg.com/vi/${id}/hqdefault.jpg"
       cards+=$(printf '<article class=card><a class=video-link href="%s" target="_blank" rel="noopener noreferrer"><div class=preview><img src="%s" alt=""></div><div class=video-title>%s</div></a><div class=checks><label><input class=y1 data-url="%s" data-path="./%s" type=checkbox> y1</label><label><input class=y2 data-url="%s" data-path="./%s" type=checkbox> y2</label></div></article>\n' \
         "$(html_escape "$url")" "$(html_escape "$thumb")" "$(html_escape "$title")" "$(html_escape "$url")" "$(html_escape "$channel")" "$(html_escape "$url")" "$(html_escape "$channel")")
       (( ++qualified_count ))
     done <<< "$output"
-    printf '@%s: %s new public video(s)\n' "$channel" "$qualified_count"
+    printf '@%s: %s visible video(s) in the checkpoint overlap\n' "$channel" "$qualified_count"
     if [[ -n "$cards" ]]; then
       print -r -- "<section class=channel><div class=channel-title><h2>$(html_escape "$channel")</h2><div class=controls><button data-action=y1 type=button>y1</button><button data-action=y2 type=button>y2</button><button data-action=none type=button>none</button></div></div><div class=grid>" >> "$tmp"
       print -r -- "$cards" >> "$tmp"
