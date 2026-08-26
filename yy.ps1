@@ -81,6 +81,7 @@ $fetchAttempts = 3
 $ytDlpTimeoutSec = 30
 $ytDlpAttempts = 1
 $ytDlpDeadlineSec = 30
+$MAX_THREADS = 8
 $feedFailureLimit = 3
 $feedFetchFailures = 0
 $skipFeedFetches = $false
@@ -670,6 +671,68 @@ function Invoke-YtDlpMetadata {
     }
 }
 
+# Start one channel scan without waiting. The caller keeps at most MAX_THREADS
+# of these workers alive and assigns each worker exactly one channel.
+function Start-HtmlScanWorker {
+    param([string]$Executable, [string[]]$Arguments, [string]$Channel, [int]$Index)
+
+    $token = [guid]::NewGuid().ToString('N')
+    $stdout = Join-Path $PSScriptRoot "yt-dlp.$token.stdout"
+    $stderr = Join-Path $PSScriptRoot "yt-dlp.$token.stderr"
+    try {
+        $argumentLine = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' ')
+        $process = Start-Process -FilePath $Executable -ArgumentList $argumentLine -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+        [void]$process.Handle
+        return [pscustomobject]@{
+            Channel = $Channel; Index = $Index; Process = $process
+            Stdout = $stdout; Stderr = $stderr; StderrCount = 0
+            Started = [System.DateTime]::UtcNow; LastHeartbeat = [System.DateTime]::UtcNow
+            Output = @(); ExitCode = -1; Done = $false
+        }
+    }
+    catch {
+        Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Wait-HtmlScanWorkers {
+    param([System.Collections.ArrayList]$Workers)
+
+    $remaining = $Workers.Count
+    while ($remaining -gt 0) {
+        foreach ($worker in $Workers) {
+            if ($worker.Done) { continue }
+            if (Test-Path -LiteralPath $worker.Stderr) {
+                $lines = @(Get-Content -LiteralPath $worker.Stderr -ErrorAction SilentlyContinue)
+                for ($i = $worker.StderrCount; $i -lt $lines.Count; $i++) {
+                    if ($lines[$i] -match '^(\[[^]]+\]|ERROR:|WARNING:|Aborting )' -and
+                        $lines[$i] -notmatch '^\[debug\]') {
+                        Write-Host "[@$($worker.Channel) scan] $($lines[$i])"
+                    }
+                }
+                $worker.StderrCount = $lines.Count
+            }
+            if (-not $worker.Process.HasExited) {
+                if (([System.DateTime]::UtcNow - $worker.LastHeartbeat).TotalSeconds -ge 15) {
+                    $elapsed = [Math]::Floor(([System.DateTime]::UtcNow - $worker.Started).TotalSeconds)
+                    Write-Host "[@$($worker.Channel) scan] Still running yt-dlp... $elapsed seconds elapsed"
+                    $worker.LastHeartbeat = [System.DateTime]::UtcNow
+                }
+                continue
+            }
+            $worker.Process.Refresh()
+            $worker.Output = @(Get-Content -LiteralPath $worker.Stdout -ErrorAction SilentlyContinue)
+            $worker.ExitCode = $worker.Process.ExitCode
+            $worker.Done = $true
+            $remaining--
+            Remove-Item -LiteralPath $worker.Stdout,$worker.Stderr -Force -ErrorAction SilentlyContinue
+        }
+        if ($remaining -gt 0) { Start-Sleep -Milliseconds 200 }
+    }
+}
+
 # Fall back to the newest few entries in the channel's uploads playlist when
 # the legacy Atom feed is unavailable or unusable. Resolve the entries so
 # yt-dlp can provide exact timestamps and public availability. No cookies are
@@ -816,7 +879,7 @@ function Test-ShouldSkipCheckpoint {
     return $Failures -ge 3 -or ($ChannelCount -gt 0 -and $Failures -eq $ChannelCount)
 }
 
-# Build a local page from every qualifying public entry on each /videos tab.
+# Build a local page from qualifying account-visible entries on each /videos tab.
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
@@ -837,23 +900,43 @@ function New-VideoHtml {
     [void]$sb.AppendLine('<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>')
     [void]$sb.AppendLine('<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}#channel-add{width:27em}</style>')
     [void]$sb.AppendLine('<h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">Checkpoint: ' + $checkpointMs + '</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><main>')
+    $channels = New-Object System.Collections.ArrayList
+    $seenChannels = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
         $channel = ([string]$rawLine).TrimStart([char]0xFEFF).Trim()
         if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
-        $channelUrl = Get-ChannelUrl $channel
-        Write-Host "Checking @$channel..."
+        if (-not $seenChannels.Add($channel)) { continue }
+        [void]$channels.Add($channel)
+    }
+    $scanResults = New-Object object[] $channels.Count
+    for ($batchStart = 0; $batchStart -lt $channels.Count; $batchStart += $MAX_THREADS) {
+        $workers = New-Object System.Collections.ArrayList
+        $batchEnd = [Math]::Min($channels.Count - 1, $batchStart + $MAX_THREADS - 1)
+        for ($index = $batchStart; $index -le $batchEnd; $index++) {
+            $channel = [string]$channels[$index]
+            $channelUrl = Get-ChannelUrl $channel
+            Write-Host "Checking @$channel..."
+            $arguments = @(
+                '--ignore-config', '--verbose', '--cookies', './cookies.txt',
+                '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
+                '--socket-timeout', $ytDlpTimeoutSec,
+                '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
+                '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
+                ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
+            [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments -Channel $channel -Index $index))
+        }
+        Wait-HtmlScanWorkers -Workers $workers
+        foreach ($worker in $workers) {
+            $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
+        }
+    }
+    for ($index = 0; $index -lt $channels.Count; $index++) {
+        $channel = [string]$channels[$index]
         # Approximate tab dates can precede the exact publication time. Start at
         # midnight UTC on the day before the checkpoint date and keep the overlap
         # rather than resolving watch pages; this favors coverage over precision.
-        $scan = Invoke-YtDlpMetadata -What "videos tab scan for @$channel" -DeadlineSec 0 `
-            -ProgressLabel "@$channel scan" -Arguments @(
-            '--ignore-config', '--verbose', '--cookies', './cookies.txt',
-            '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
-            '--socket-timeout', $ytDlpTimeoutSec,
-            '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
-            '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
-            ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
+        $scan = $scanResults[$index]
         if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
         $rows = New-Object System.Collections.ArrayList
         foreach ($scanRow in @($scan.Output)) {

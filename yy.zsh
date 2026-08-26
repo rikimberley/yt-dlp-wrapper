@@ -48,6 +48,7 @@ fetch_attempts=3
 ytdlp_timeout_sec=30
 ytdlp_attempts=1
 ytdlp_deadline_sec=30
+MAX_THREADS=8
 feed_failure_limit=3
 feed_fetch_failures=0
 skip_feed_fetches=0
@@ -654,12 +655,31 @@ html_escape() {
   print -r -- "$s"
 }
 
-# Build a local page from every qualifying public entry on each /videos tab.
+# Scan one channel in an isolated subshell. Each worker owns one channel and
+# writes to index-specific files, so concurrent scans never share mutable state.
+html_scan_channel() {
+  local index=$1 channel=$2 channel_url=$3 exe=$4 scan_cutoff_sec=$5 result_dir=$6 status=0
+  run_ytdlp_metadata --no-deadline --show-progress "@$channel scan" "$exe" --ignore-config --verbose \
+    --cookies ./cookies.txt --flat-playlist --lazy-playlist \
+    --extractor-args 'youtubetab:approximate_date' \
+    --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
+    --extractor-retries "$ytdlp_attempts" --skip-download \
+    --break-match-filters "timestamp >= ${scan_cutoff_sec}" \
+    --print 'scan:%(id)s\t%(webpage_url)s\t%(title)s\t%(timestamp)s\t%(availability)s' \
+    "$channel_url" || status=$?
+  print -rn -- "$ytdlp_output" >| "$result_dir/$index.out"
+  print -r -- "$status" >| "$result_dir/$index.status"
+}
+
+# Build a local page from qualifying account-visible entries on each /videos tab.
 # A file:// page cannot
 # execute host commands, so the button downloads a script containing yy1/yy2
 # commands for the selected videos.
 generate_html() {
-  local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards
+  local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards result_dir
+  local index batch_start batch_end pid
+  local -a channels scan_pids
+  local -A seen_channels
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
@@ -673,27 +693,38 @@ generate_html() {
   print -r -- '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>yy video grid</title>' >| "$tmp"
   print -r -- '<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>' >> "$tmp"
   print -r -- "<h1>yy video grid</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED. The button downloads a command script; run it next to yy1/yy2. <span>Checkpoint: ${checkpoint_ms}</span></p><div class=\"controls\"><button id=\"download\" type=\"button\">DOWNLOAD SELECTED</button><button data-action=\"y1\" type=\"button\">y1</button><button data-action=\"y2\" type=\"button\">y2</button><button data-action=\"none\" type=\"button\">none</button></div><main>" >> "$tmp"
+  channels=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     channel=$(trim "$line"); [[ -n "$channel" && "$channel" != '#'* ]] || continue
-    channel=${channel#@}; channel_url=$(channel_url_for "$channel")
-    printf 'Checking @%s...\n' "$channel"
+    channel=${channel#@}
+    (( ${+seen_channels[$channel]} )) && continue
+    seen_channels[$channel]=1
+    channels+=("$channel")
+  done < "$channels_file"
+  result_dir=$(mktemp -d) || return 1
+  for (( batch_start = 1; batch_start <= ${#channels}; batch_start += MAX_THREADS )); do
+    batch_end=$(( batch_start + MAX_THREADS - 1 ))
+    (( batch_end > ${#channels} )) && batch_end=${#channels}
+    scan_pids=()
+    for (( index = batch_start; index <= batch_end; ++index )); do
+      channel=${channels[index]}; channel_url=$(channel_url_for "$channel")
+      printf 'Checking @%s...\n' "$channel"
+      html_scan_channel "$index" "$channel" "$channel_url" "$exe" "$scan_cutoff_sec" "$result_dir" &
+      scan_pids+=("$!")
+    done
+    for pid in "${scan_pids[@]}"; do wait "$pid" || true; done
+  done
+  for (( index = 1; index <= ${#channels}; ++index )); do
+    channel=${channels[index]}
     # Approximate tab dates can precede the exact publication time. Start at
     # midnight UTC on the day before the checkpoint date and keep the overlap
     # rather than resolving watch pages; this favors coverage over precision.
-    status=0
-    run_ytdlp_metadata --no-deadline --show-progress "@$channel scan" "$exe" --ignore-config --verbose \
-      --cookies ./cookies.txt --flat-playlist --lazy-playlist \
-      --extractor-args 'youtubetab:approximate_date' \
-      --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
-      --extractor-retries "$ytdlp_attempts" --skip-download \
-      --break-match-filters "timestamp >= ${scan_cutoff_sec}" \
-      --print 'scan:%(id)s\t%(webpage_url)s\t%(title)s\t%(timestamp)s\t%(availability)s' \
-      "$channel_url" || status=$?
+    status=$(<"$result_dir/$index.status")
     if (( status != 0 && status != 101 )); then
       printf 'Warning: could not scan the videos tab for @%s\n' "$channel" >&2
       failures=$(( failures + 1 )); continue
     fi
-    output=$ytdlp_output
+    output=$(<"$result_dir/$index.out")
     cards=""
     qualified_count=0
     while IFS=$'\t' read -r line; do
@@ -713,7 +744,8 @@ generate_html() {
       print -r -- "$cards" >> "$tmp"
       print -r -- '</div></section>' >> "$tmp"
     fi
-  done < "$channels_file"
+  done
+  rm -rf -- "$result_dir"
   print -r -- '<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:&quot;smooth&quot;})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true});document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=()=>{const q=[...document.querySelectorAll("input:checked")],lines=q.map(x=>(x.className==="y1"?"yy1":"yy2")+" -p "+JSON.stringify(x.dataset.path)+" -t "+JSON.stringify(x.dataset.url));if(!lines.length){alert("Select at least one video");return}const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["#!/bin/sh\nset -eu\n"+lines.join("\n")+"\n"],{type:"text/plain"}));a.download="yy-download.sh";a.click()};const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>' >> "$tmp"
   mv -f -- "$tmp" "$html_file"
   html_checkpoint_ms=$(( $(date +%s) * 1000 ))

@@ -85,7 +85,10 @@ that overlap before the checkpoint. The scan
 uses `cookies.txt`, allowing age-restricted and other videos visible to that account
 to be listed; entries explicitly marked members-only, private, or premium-only are
 excluded. Availability that the flat scan cannot classify is accepted without
-opening each watch page. Shorts that appear only on `/shorts` are excluded. The generated page
+opening each watch page. Up to eight channel IDs are scanned concurrently; each
+unique channel is handled by exactly one scan process, with duplicate input lines
+collapsed. Shorts that appear only on
+`/shorts` are excluded. The generated page
 displays the current checkpoint; in PowerShell it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints
 each channel as it starts, live yt-dlp extraction/network messages, a periodic
