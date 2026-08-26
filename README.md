@@ -77,12 +77,15 @@ listed channels fail to be checked. With `-o -c` and `--html -c`, the saved
 timestamp is captured after the check pass, before channels/pages are opened;
 it is written when that operation returns (after the HTML server stops).
 
-`--html` first scans each channel's `/videos` tab as a flat playlist using
-yt-dlp's approximate tab dates, accepts entries safely beyond a one-day margin,
-then resolves only non-members candidates near the checkpoint for exact
-timestamps and public availability. Both phases use
-`cookies.txt`, allowing age-restricted public videos to be checked; members-only
-entries remain excluded. Shorts that appear only on `/shorts` are excluded. The generated page
+`--html` scans each channel's `/videos` tab as a flat playlist using yt-dlp's
+approximate tab dates. It starts at midnight UTC on the calendar day before the
+checkpoint's UTC date, so the approximate-date window covers the entire checkpoint
+date plus a one-day margin; consequently, the page can also include videos from
+that overlap before the checkpoint. The scan
+uses `cookies.txt`, allowing age-restricted and other videos visible to that account
+to be listed; entries explicitly marked members-only, private, or premium-only are
+excluded. Availability that the flat scan cannot classify is accepted without
+opening each watch page. Shorts that appear only on `/shorts` are excluded. The generated page
 displays the current checkpoint; in PowerShell it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints
 each channel as it starts, live yt-dlp extraction/network messages, a periodic
