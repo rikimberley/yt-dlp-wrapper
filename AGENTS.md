@@ -177,10 +177,13 @@ The download invocation is exactly:
   YouTube can answer with a consent interstitial that carries no `channel_id`.
   These are anonymous consent cookies, unrelated to `cookies.txt` — the `-o`
   path must stay logged-out so the feed remains public-by-construction.
-- **Never read out, log, or copy `cookies.txt`.** It contains live `__Secure-*SID`,
-  `SAPISID`, and `LOGIN_INFO` values. If you must inspect it, report only
-  structure (cookie names, expiry), never values. Do not commit it anywhere,
-  do not paste it into a summary or issue.
+- **Never read out, log, or manually copy `cookies.txt`.** It contains live
+  `__Secure-*SID`, `SAPISID`, and `LOGIN_INFO` values. The sole exception is the
+  wrapper's `--html` scan pool: it creates one ephemeral `cookies<i>.txt` jar per
+  worker slot so concurrent yt-dlp processes never rewrite the same file, then
+  deletes those copies when scanning ends. If you must inspect a jar, report only
+  structure (cookie names, expiry), never values. Do not commit any jar anywhere,
+  and do not paste one into a summary or issue.
 - Cookies expire. A download failing with an auth/consent error usually means
   `cookies.txt` needs re-exporting from a browser — that is a user action, not
   something to work around by disabling `--cookies`.

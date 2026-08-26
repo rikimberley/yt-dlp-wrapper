@@ -658,9 +658,9 @@ html_escape() {
 # Scan one channel in an isolated subshell. Each worker owns one channel and
 # writes to index-specific files, so concurrent scans never share mutable state.
 html_scan_channel() {
-  local index=$1 channel=$2 channel_url=$3 exe=$4 scan_cutoff_sec=$5 result_dir=$6 status=0
+  local index=$1 channel=$2 channel_url=$3 exe=$4 scan_cutoff_sec=$5 result_dir=$6 cookie_file=$7 status=0
   run_ytdlp_metadata --no-deadline --show-progress "@$channel scan" "$exe" --ignore-config --verbose \
-    --cookies ./cookies.txt --flat-playlist --lazy-playlist \
+    --cookies "$cookie_file" --flat-playlist --lazy-playlist \
     --extractor-args 'youtubetab:approximate_date' \
     --socket-timeout "$ytdlp_timeout_sec" --retries "$ytdlp_attempts" \
     --extractor-retries "$ytdlp_attempts" --skip-download \
@@ -677,8 +677,8 @@ html_scan_channel() {
 # commands for the selected videos.
 generate_html() {
   local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards result_dir
-  local index next_index pid completed
-  local -a channels scan_pids remaining_pids
+  local index next_index pid completed slot position cookie_file
+  local -a channels scan_pids remaining_pids scan_slots remaining_slots free_slots scan_cookie_files
   local -A seen_channels
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
@@ -702,29 +702,56 @@ generate_html() {
     channels+=("$channel")
   done < "$channels_file"
   result_dir=$(mktemp -d) || return 1
-  scan_pids=()
-  next_index=1
-  while (( next_index <= ${#channels} || ${#scan_pids} > 0 )); do
-    while (( next_index <= ${#channels} && ${#scan_pids} < MAX_THREADS )); do
-      channel=${channels[next_index]}; channel_url=$(channel_url_for "$channel")
-      printf 'Checking @%s...\n' "$channel"
-      html_scan_channel "$next_index" "$channel" "$channel_url" "$exe" "$scan_cutoff_sec" "$result_dir" &
-      scan_pids+=("$!")
-      (( ++next_index ))
+  scan_cookie_files=()
+  {
+    free_slots=()
+    for (( slot = 0; slot < MAX_THREADS; ++slot )); do
+      cookie_file="./cookies${slot}.txt"
+      cp -- ./cookies.txt "$cookie_file" || return 1
+      scan_cookie_files+=("$cookie_file")
+      free_slots+=("$slot")
     done
-    completed=0
-    remaining_pids=()
+    scan_pids=()
+    scan_slots=()
+    next_index=1
+    while (( next_index <= ${#channels} || ${#scan_pids} > 0 )); do
+      while (( next_index <= ${#channels} && ${#free_slots} > 0 )); do
+        slot=${free_slots[1]}
+        free_slots[1]=()
+        channel=${channels[next_index]}; channel_url=$(channel_url_for "$channel")
+        printf 'Checking @%s...\n' "$channel"
+        cookie_file="./cookies${slot}.txt"
+        html_scan_channel "$next_index" "$channel" "$channel_url" "$exe" "$scan_cutoff_sec" "$result_dir" "$cookie_file" &
+        scan_pids+=("$!")
+        scan_slots+=("$slot")
+        (( ++next_index ))
+      done
+      completed=0
+      remaining_pids=()
+      remaining_slots=()
+      for (( position = 1; position <= ${#scan_pids}; ++position )); do
+        pid=${scan_pids[position]}
+        slot=${scan_slots[position]}
+        if kill -0 "$pid" 2>/dev/null; then
+          remaining_pids+=("$pid")
+          remaining_slots+=("$slot")
+        else
+          wait "$pid" || true
+          free_slots+=("$slot")
+          completed=1
+        fi
+      done
+      scan_pids=("${remaining_pids[@]}")
+      scan_slots=("${remaining_slots[@]}")
+      (( completed )) || sleep 0.2
+    done
+  } always {
     for pid in "${scan_pids[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then
-        remaining_pids+=("$pid")
-      else
-        wait "$pid" || true
-        completed=1
-      fi
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
     done
-    scan_pids=("${remaining_pids[@]}")
-    (( completed )) || sleep 0.2
-  done
+    (( ${#scan_cookie_files} > 0 )) && rm -f -- "${scan_cookie_files[@]}"
+  }
   for (( index = 1; index <= ${#channels}; ++index )); do
     channel=${channels[index]}
     # Approximate tab dates can precede the exact publication time. Start at
