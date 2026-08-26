@@ -85,9 +85,10 @@ that overlap before the checkpoint. The scan
 uses `cookies.txt`, allowing age-restricted and other videos visible to that account
 to be listed; entries explicitly marked members-only, private, or premium-only are
 excluded. Availability that the flat scan cannot classify is accepted without
-opening each watch page. Up to eight channel IDs are scanned concurrently; each
-unique channel is handled by exactly one scan process, with duplicate input lines
-collapsed. Shorts that appear only on
+opening each watch page. All unique channels are queued first and a work-conserving
+pool scans up to sixteen concurrently; as soon as one scan finishes, its slot starts
+the next queued channel. Each channel is handled by exactly one scan process, with
+duplicate input lines collapsed. Shorts that appear only on
 `/shorts` are excluded. The generated page
 displays the current checkpoint; in PowerShell it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints

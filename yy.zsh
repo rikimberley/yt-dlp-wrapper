@@ -48,7 +48,7 @@ fetch_attempts=3
 ytdlp_timeout_sec=30
 ytdlp_attempts=1
 ytdlp_deadline_sec=30
-MAX_THREADS=8
+MAX_THREADS=16
 feed_failure_limit=3
 feed_fetch_failures=0
 skip_feed_fetches=0
@@ -677,8 +677,8 @@ html_scan_channel() {
 # commands for the selected videos.
 generate_html() {
   local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards result_dir
-  local index batch_start batch_end pid
-  local -a channels scan_pids
+  local index next_index pid completed
+  local -a channels scan_pids remaining_pids
   local -A seen_channels
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
@@ -702,17 +702,28 @@ generate_html() {
     channels+=("$channel")
   done < "$channels_file"
   result_dir=$(mktemp -d) || return 1
-  for (( batch_start = 1; batch_start <= ${#channels}; batch_start += MAX_THREADS )); do
-    batch_end=$(( batch_start + MAX_THREADS - 1 ))
-    (( batch_end > ${#channels} )) && batch_end=${#channels}
-    scan_pids=()
-    for (( index = batch_start; index <= batch_end; ++index )); do
-      channel=${channels[index]}; channel_url=$(channel_url_for "$channel")
+  scan_pids=()
+  next_index=1
+  while (( next_index <= ${#channels} || ${#scan_pids} > 0 )); do
+    while (( next_index <= ${#channels} && ${#scan_pids} < MAX_THREADS )); do
+      channel=${channels[next_index]}; channel_url=$(channel_url_for "$channel")
       printf 'Checking @%s...\n' "$channel"
-      html_scan_channel "$index" "$channel" "$channel_url" "$exe" "$scan_cutoff_sec" "$result_dir" &
+      html_scan_channel "$next_index" "$channel" "$channel_url" "$exe" "$scan_cutoff_sec" "$result_dir" &
       scan_pids+=("$!")
+      (( ++next_index ))
     done
-    for pid in "${scan_pids[@]}"; do wait "$pid" || true; done
+    completed=0
+    remaining_pids=()
+    for pid in "${scan_pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        remaining_pids+=("$pid")
+      else
+        wait "$pid" || true
+        completed=1
+      fi
+    done
+    scan_pids=("${remaining_pids[@]}")
+    (( completed )) || sleep 0.2
   done
   for (( index = 1; index <= ${#channels}; ++index )); do
     channel=${channels[index]}
