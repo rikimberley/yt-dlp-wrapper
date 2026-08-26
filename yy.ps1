@@ -81,7 +81,7 @@ $fetchAttempts = 3
 $ytDlpTimeoutSec = 30
 $ytDlpAttempts = 1
 $ytDlpDeadlineSec = 30
-$MAX_THREADS = 8
+$MAX_THREADS = 16
 $feedFailureLimit = 3
 $feedFetchFailures = 0
 $skipFeedFetches = $false
@@ -697,11 +697,11 @@ function Start-HtmlScanWorker {
     }
 }
 
-function Wait-HtmlScanWorkers {
+function Wait-HtmlScanCompletion {
     param([System.Collections.ArrayList]$Workers)
 
-    $remaining = $Workers.Count
-    while ($remaining -gt 0) {
+    $completed = 0
+    while ($completed -eq 0) {
         foreach ($worker in $Workers) {
             if ($worker.Done) { continue }
             if (Test-Path -LiteralPath $worker.Stderr) {
@@ -726,10 +726,10 @@ function Wait-HtmlScanWorkers {
             $worker.Output = @(Get-Content -LiteralPath $worker.Stdout -ErrorAction SilentlyContinue)
             $worker.ExitCode = $worker.Process.ExitCode
             $worker.Done = $true
-            $remaining--
+            $completed++
             Remove-Item -LiteralPath $worker.Stdout,$worker.Stderr -Force -ErrorAction SilentlyContinue
         }
-        if ($remaining -gt 0) { Start-Sleep -Milliseconds 200 }
+        if ($completed -eq 0) { Start-Sleep -Milliseconds 200 }
     }
 }
 
@@ -910,11 +910,11 @@ function New-VideoHtml {
         [void]$channels.Add($channel)
     }
     $scanResults = New-Object object[] $channels.Count
-    for ($batchStart = 0; $batchStart -lt $channels.Count; $batchStart += $MAX_THREADS) {
-        $workers = New-Object System.Collections.ArrayList
-        $batchEnd = [Math]::Min($channels.Count - 1, $batchStart + $MAX_THREADS - 1)
-        for ($index = $batchStart; $index -le $batchEnd; $index++) {
-            $channel = [string]$channels[$index]
+    $workers = New-Object System.Collections.ArrayList
+    $nextIndex = 0
+    while ($nextIndex -lt $channels.Count -or $workers.Count -gt 0) {
+        while ($nextIndex -lt $channels.Count -and $workers.Count -lt $MAX_THREADS) {
+            $channel = [string]$channels[$nextIndex]
             $channelUrl = Get-ChannelUrl $channel
             Write-Host "Checking @$channel..."
             $arguments = @(
@@ -924,11 +924,17 @@ function New-VideoHtml {
                 '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
                 '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
                 ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
-            [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments -Channel $channel -Index $index))
+            [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments -Channel $channel -Index $nextIndex))
+            $nextIndex++
         }
-        Wait-HtmlScanWorkers -Workers $workers
-        foreach ($worker in $workers) {
-            $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
+        if ($workers.Count -gt 0) {
+            Wait-HtmlScanCompletion -Workers $workers
+            for ($workerIndex = $workers.Count - 1; $workerIndex -ge 0; $workerIndex--) {
+                $worker = $workers[$workerIndex]
+                if (-not $worker.Done) { continue }
+                $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
+                $workers.RemoveAt($workerIndex)
+            }
         }
     }
     for ($index = 0; $index -lt $channels.Count; $index++) {
