@@ -674,7 +674,7 @@ function Invoke-YtDlpMetadata {
 # Start one channel scan without waiting. The caller keeps at most MAX_THREADS
 # of these workers alive and assigns each worker exactly one channel.
 function Start-HtmlScanWorker {
-    param([string]$Executable, [string[]]$Arguments, [string]$Channel, [int]$Index)
+    param([string]$Executable, [string[]]$Arguments, [string]$Channel, [int]$Index, [int]$Slot)
 
     $token = [guid]::NewGuid().ToString('N')
     $stdout = Join-Path $PSScriptRoot "yt-dlp.$token.stdout"
@@ -685,7 +685,7 @@ function Start-HtmlScanWorker {
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
         [void]$process.Handle
         return [pscustomobject]@{
-            Channel = $Channel; Index = $Index; Process = $process
+            Channel = $Channel; Index = $Index; Slot = $Slot; Process = $process
             Stdout = $stdout; Stderr = $stderr; StderrCount = 0
             Started = [System.DateTime]::UtcNow; LastHeartbeat = [System.DateTime]::UtcNow
             Output = @(); ExitCode = -1; Done = $false
@@ -911,30 +911,54 @@ function New-VideoHtml {
     }
     $scanResults = New-Object object[] $channels.Count
     $workers = New-Object System.Collections.ArrayList
-    $nextIndex = 0
-    while ($nextIndex -lt $channels.Count -or $workers.Count -gt 0) {
-        while ($nextIndex -lt $channels.Count -and $workers.Count -lt $MAX_THREADS) {
-            $channel = [string]$channels[$nextIndex]
-            $channelUrl = Get-ChannelUrl $channel
-            Write-Host "Checking @$channel..."
-            $arguments = @(
-                '--ignore-config', '--verbose', '--cookies', './cookies.txt',
-                '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
-                '--socket-timeout', $ytDlpTimeoutSec,
-                '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
-                '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
-                ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
-            [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments -Channel $channel -Index $nextIndex))
-            $nextIndex++
+    $scanCookieFiles = New-Object System.Collections.ArrayList
+    $freeSlots = New-Object 'System.Collections.Generic.Queue[int]'
+    try {
+        for ($slot = 0; $slot -lt $MAX_THREADS; $slot++) {
+            $workerCookieFile = "./cookies$slot.txt"
+            Copy-Item -LiteralPath './cookies.txt' -Destination $workerCookieFile -Force
+            [void]$scanCookieFiles.Add($workerCookieFile)
+            $freeSlots.Enqueue($slot)
         }
-        if ($workers.Count -gt 0) {
-            Wait-HtmlScanCompletion -Workers $workers
-            for ($workerIndex = $workers.Count - 1; $workerIndex -ge 0; $workerIndex--) {
-                $worker = $workers[$workerIndex]
-                if (-not $worker.Done) { continue }
-                $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
-                $workers.RemoveAt($workerIndex)
+        $nextIndex = 0
+        while ($nextIndex -lt $channels.Count -or $workers.Count -gt 0) {
+            while ($nextIndex -lt $channels.Count -and $freeSlots.Count -gt 0) {
+                $slot = $freeSlots.Dequeue()
+                $channel = [string]$channels[$nextIndex]
+                $channelUrl = Get-ChannelUrl $channel
+                Write-Host "Checking @$channel..."
+                $arguments = @(
+                    '--ignore-config', '--verbose', '--cookies', ([string]$scanCookieFiles[$slot]),
+                    '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
+                    '--socket-timeout', $ytDlpTimeoutSec,
+                    '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
+                    '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
+                    ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
+                [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments `
+                    -Channel $channel -Index $nextIndex -Slot $slot))
+                $nextIndex++
             }
+            if ($workers.Count -gt 0) {
+                Wait-HtmlScanCompletion -Workers $workers
+                for ($workerIndex = $workers.Count - 1; $workerIndex -ge 0; $workerIndex--) {
+                    $worker = $workers[$workerIndex]
+                    if (-not $worker.Done) { continue }
+                    $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
+                    $freeSlots.Enqueue($worker.Slot)
+                    $workers.RemoveAt($workerIndex)
+                }
+            }
+        }
+    }
+    finally {
+        foreach ($worker in $workers) {
+            if (-not $worker.Process.HasExited) {
+                Stop-ProcessTree -ProcessId $worker.Process.Id
+                [void]$worker.Process.WaitForExit(5000)
+            }
+        }
+        if ($scanCookieFiles.Count -gt 0) {
+            Remove-Item -LiteralPath @($scanCookieFiles) -Force -ErrorAction SilentlyContinue
         }
     }
     for ($index = 0; $index -lt $channels.Count; $index++) {

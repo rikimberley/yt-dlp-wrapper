@@ -88,7 +88,11 @@ excluded. Availability that the flat scan cannot classify is accepted without
 opening each watch page. All unique channels are queued first and a work-conserving
 pool scans up to sixteen concurrently; as soon as one scan finishes, its slot starts
 the next queued channel. Each channel is handled by exactly one scan process, with
-duplicate input lines collapsed. Shorts that appear only on
+duplicate input lines collapsed. Before both the initial scan and each `REFRESH`,
+the wrapper copies `cookies.txt` to one private `cookies0.txt` through
+`cookies15.txt` jar per worker slot. A slot always uses only its own jar, preventing
+yt-dlp's exit-time cookie rewrite from racing another scan; the private jars are
+deleted as soon as the scan phase ends. Shorts that appear only on
 `/shorts` are excluded. The generated page
 displays the current checkpoint; in PowerShell it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints
