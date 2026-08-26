@@ -65,7 +65,7 @@ $urlFile = './current_url.txt'
 $channelsFile = './channel-ids.txt'
 $channelIdCacheFile = './channel-id-cache.txt'
 $checkpointFile = './checkpoint.txt'
-$channelStatusFile = './channel-check-status.json'
+$channelStatusFile = Join-Path $PSScriptRoot 'channel-check-status.json'
 $userAgent = 'Mozilla/5.0'
 $acceptLanguage = 'en-US,en;q=0.9'
 # Pre-accepted consent cookies: without them YouTube can answer a channel page
