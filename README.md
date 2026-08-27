@@ -98,6 +98,9 @@ displays the current checkpoint; in PowerShell it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints
 each channel as it starts, live yt-dlp extraction/network messages, a periodic
 elapsed-time heartbeat, and the number of qualifying videos it found.
+In PowerShell, a successful HTML scan updates each channel's last-checked time.
+Its stored latest-video time is updated only when the scan returns at least one
+accepted video; an empty or wholly unparseable result preserves the prior value.
 In PowerShell, `--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
