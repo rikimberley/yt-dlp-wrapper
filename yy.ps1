@@ -859,9 +859,18 @@ function Save-ChannelCheckStatus {
 }
 
 function Record-ChannelCheck {
-    param([hashtable]$Status, [string]$Channel, [long]$LatestVideoMs, [long]$CheckedMs)
+    param(
+        [hashtable]$Status,
+        [string]$Channel,
+        [long]$LatestVideoMs,
+        [long]$CheckedMs,
+        [switch]$PreserveLatestWhenUnknown
+    )
     $prior = $Status[$Channel]
     $thumbnail = if ($null -ne $prior -and $null -ne $prior.PSObject.Properties['thumbnail']) { [string]$prior.thumbnail } else { '' }
+    if ($PreserveLatestWhenUnknown -and $LatestVideoMs -eq 0 -and $null -ne $prior) {
+        $LatestVideoMs = [long]$prior.latest_video_ms
+    }
     $Status[$Channel] = [pscustomobject]@{ checked_ms = $CheckedMs; latest_video_ms = $LatestVideoMs; thumbnail = $thumbnail }
 }
 
@@ -999,7 +1008,7 @@ function New-VideoHtml {
             $qualifiedCount++
         }
         Write-Host "@${channel}: $qualifiedCount visible video(s) in the checkpoint overlap"
-        Record-ChannelCheck $ChannelStatus $channel $newest $checkBatchMs
+        Record-ChannelCheck $ChannelStatus $channel $newest $checkBatchMs -PreserveLatestWhenUnknown
         if ($cards.Length -gt 0) {
             [void]$sb.AppendLine('<section class="channel"><div class="channel-title"><h2>' + [System.Net.WebUtility]::HtmlEncode($channel) + '</h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">')
             [void]$sb.Append($cards.ToString())
