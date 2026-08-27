@@ -845,7 +845,10 @@ function Set-CheckpointAt {
 function Read-ChannelCheckStatus {
     if (-not (Test-Path -LiteralPath $channelStatusFile)) { return @{} }
     try {
-        $value = Get-Content -Raw -LiteralPath $channelStatusFile | ConvertFrom-Json
+        # Windows PowerShell 5.1 defaults text reads to ANSI. This file uses
+        # channel handles as JSON keys, so decoding it as UTF-8 is required for
+        # non-ASCII keys to match channel-ids.txt entries.
+        $value = Get-Content -Raw -LiteralPath $channelStatusFile -Encoding UTF8 | ConvertFrom-Json
         $result = @{}
         foreach ($property in $value.PSObject.Properties) { $result[$property.Name] = $property.Value }
         return $result
@@ -1274,6 +1277,11 @@ function Invoke-HtmlCallbackServer {
                 # immediately queues a reload, which this single-threaded server
                 # answers after yy.html has been regenerated.
                 Send-CallbackResponse $context 202 'Refreshing page.'
+                # A long-running server can outlive an external status repair or
+                # backfill. Merge the file again so a refresh cannot overwrite
+                # newer on-disk values with stale in-memory channel records.
+                $diskStatus = Read-ChannelCheckStatus
+                foreach ($key in $diskStatus.Keys) { $ChannelStatus[$key] = $diskStatus[$key] }
                 if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus)) {
                     [Console]::Error.WriteLine('Warning: could not refresh the page; keeping the previous page.')
                 }
