@@ -82,6 +82,7 @@ $ytDlpTimeoutSec = 30
 $ytDlpAttempts = 1
 $ytDlpDeadlineSec = 30
 $MAX_THREADS = 16
+$htmlHeartbeatTimeoutSec = 300
 $feedFailureLimit = 3
 $feedFetchFailures = 0
 $skipFeedFetches = $false
@@ -1222,7 +1223,7 @@ function Invoke-HtmlCallbackServer {
             try {
                 while (-not $pending.AsyncWaitHandle.WaitOne(1000)) {
                     if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
-                    if (([System.DateTime]::UtcNow - $lastHeartbeat).TotalSeconds -ge 30) {
+                    if (([System.DateTime]::UtcNow - $lastHeartbeat).TotalSeconds -ge $htmlHeartbeatTimeoutSec) {
                         Write-Host 'HTML page closed or disconnected; stopping server.'
                         $script:htmlStopRequested = $true
                         $listener.Stop()
@@ -1231,6 +1232,10 @@ function Invoke-HtmlCallbackServer {
                 }
                 if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
                 $context = $listener.EndGetContext($pending)
+                # Any request proves the page is alive. In particular, count
+                # status polling because browsers may throttle the dedicated
+                # heartbeat timer when this tab is in the background.
+                $lastHeartbeat = [System.DateTime]::UtcNow
             }
             catch {
                 if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
