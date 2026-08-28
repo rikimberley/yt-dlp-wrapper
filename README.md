@@ -116,10 +116,12 @@ console. Jobs run sequentially: all y2 selections first, then y1 selections.
 Use `STOP SERVER` in the page, or Ctrl+C in the wrapper console, to end the
 loopback server; the button attempts to close its page (and falls back to a
 blank page when the browser disallows programmatic closing). Closing the page
-also stops the server after its 30-second heartbeat timeout. Time spent
-regenerating the page during a refresh does not count toward that timeout.
-Temporary status-request failures do not close the page. Port 8080 must be
-available. The callback never accepts arbitrary command text.
+also stops the server after five minutes without any page request. Every page
+request counts as activity, not just the dedicated heartbeat, so browser
+background-tab timer throttling does not stop the server while status polling is
+still arriving. Time spent regenerating the page during a refresh does not count
+toward that timeout. Temporary status-request failures do not close the page.
+Port 8080 must be available. The callback never accepts arbitrary command text.
 
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
