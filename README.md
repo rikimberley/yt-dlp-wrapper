@@ -101,10 +101,14 @@ elapsed-time heartbeat, and the number of qualifying videos it found.
 In PowerShell, a successful HTML scan updates each channel's last-checked time.
 Its stored latest-video time is updated only when the scan returns at least one
 accepted video; an empty or wholly unparseable result preserves the prior value.
-Each `REFRESH` reloads the status file first, so an external repair or backfill
-made while the server is running is not replaced by stale in-memory values. The
-status file is decoded as UTF-8, preserving non-ASCII channel handles on Windows
-PowerShell 5.1.
+The initial PowerShell scan and each `REFRESH` skip channels whose stored latest
+video is unknown or at least 1.5 displayed months (45 days) old; those channels
+remain in the Channel IDs table but no video cards are generated for them. `REFRESH ALL`,
+next to `REFRESH`, applies the original scan logic to every channel regardless
+of its stored latest-video time. Both refresh actions reload the status file
+first, so an external repair or backfill made while the server is running is not
+replaced by stale in-memory values. The status file is decoded as UTF-8,
+preserving non-ASCII channel handles on Windows PowerShell 5.1.
 In PowerShell, `--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the

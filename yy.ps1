@@ -892,11 +892,25 @@ function Test-ShouldSkipCheckpoint {
     return $Failures -ge 3 -or ($ChannelCount -gt 0 -and $Failures -eq $ChannelCount)
 }
 
+# Routine HTML scans avoid spending time on channels whose stored newest video
+# is unknown or already at least 1.5 displayed months (45 days) old. REFRESH
+# ALL bypasses this filter so those records can be repaired or reconsidered.
+function Test-ShouldScanHtmlChannel {
+    param([object]$Record, [switch]$RefreshAll)
+
+    if ($RefreshAll) { return $true }
+    if ($null -eq $Record -or $null -eq $Record.PSObject.Properties['latest_video_ms']) { return $false }
+    [long]$latestVideoMs = 0
+    if (-not [long]::TryParse([string]$Record.latest_video_ms, [ref]$latestVideoMs) -or $latestVideoMs -le 0) { return $false }
+    $staleVideoCutoffMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - (45L * 86400L * 1000L)
+    return $latestVideoMs -gt $staleVideoCutoffMs
+}
+
 # Build a local page from qualifying account-visible entries on each /videos tab.
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
-    param([string]$CallbackUrl, [hashtable]$ChannelStatus)
+    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll)
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
@@ -912,7 +926,7 @@ function New-VideoHtml {
     [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title>')
     [void]$sb.AppendLine('<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>')
     [void]$sb.AppendLine('<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}#channel-add{width:27em}</style>')
-    [void]$sb.AppendLine('<h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">Checkpoint: ' + $checkpointMs + '</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><main>')
+    [void]$sb.AppendLine('<h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">Checkpoint: ' + $checkpointMs + '</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><main>')
     $channels = New-Object System.Collections.ArrayList
     $seenChannels = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
@@ -920,6 +934,10 @@ function New-VideoHtml {
         if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
         if (-not $seenChannels.Add($channel)) { continue }
+        if (-not (Test-ShouldScanHtmlChannel -Record $ChannelStatus[$channel] -RefreshAll:$RefreshAll)) {
+            Write-Host "Skipping @$channel (latest video is 1.5 months old or older, or unknown)"
+            continue
+        }
         [void]$channels.Add($channel)
     }
     $scanResults = New-Object object[] $channels.Count
@@ -1059,8 +1077,8 @@ function New-VideoHtml {
     $heartbeatUrl = $CallbackUrl -replace '/download/', '/heartbeat/'
     $pageText = $pageText.Replace('showJobs();const backToTop', 'setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop')
     $pageText = $pageText.Replace('setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop', 'setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop')
-    $channelUrl = $CallbackUrl -replace '/download/', '/channel/'; $checkpointUrl = $CallbackUrl -replace '/download/', '/checkpoint/'; $refreshUrl = $CallbackUrl -replace '/download/', '/refresh/'
-    $pageText = $pageText.Replace('</script></main>', '</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async()=>{status.textContent="Refreshing channels...";try{const b=await (await fetch("' + $refreshUrl + '",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("' + $checkpointUrl + '",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=refreshPage;document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("' + $channelUrl + '",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("' + $channelUrl + '",{action:"delete",channel:b.dataset.channel});refreshPage()});</script></main>')
+    $channelUrl = $CallbackUrl -replace '/download/', '/channel/'; $checkpointUrl = $CallbackUrl -replace '/download/', '/checkpoint/'; $refreshUrl = $CallbackUrl -replace '/download/', '/refresh/'; $refreshAllUrl = $CallbackUrl -replace '/download/', '/refresh-all/'
+    $pageText = $pageText.Replace('</script></main>', '</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async(all=false)=>{status.textContent=all?"Refreshing all channels...":"Refreshing channels...";try{const b=await (await fetch(all?"' + $refreshAllUrl + '":"' + $refreshUrl + '",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("' + $checkpointUrl + '",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=()=>refreshPage(false);document.querySelector("#refresh-all").onclick=()=>refreshPage(true);document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("' + $channelUrl + '",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("' + $channelUrl + '",{action:"delete",channel:b.dataset.channel});refreshPage()});</script></main>')
     $sb.Clear() | Out-Null
     [void]$sb.Append($pageText)
     $path = Join-Path $PSScriptRoot 'yy.html'
@@ -1276,8 +1294,9 @@ function Invoke-HtmlCallbackServer {
                 Send-CallbackJson $context 200 @{ message = 'Checkpoint updated.'; checkpoint_ms = $checkpointMs }
                 continue
             }
-            if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -eq "/refresh/$Token") {
-                Write-Host 'Refreshing HTML page from channel-ids.txt...'
+            if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -in @("/refresh/$Token", "/refresh-all/$Token")) {
+                $refreshAll = $context.Request.Url.AbsolutePath -eq "/refresh-all/$Token"
+                Write-Host $(if ($refreshAll) { 'Refreshing HTML page from all channels in channel-ids.txt...' } else { 'Refreshing HTML page from recent channels in channel-ids.txt...' })
                 # Reply before the potentially long channel scan. The browser
                 # immediately queues a reload, which this single-threaded server
                 # answers after yy.html has been regenerated.
@@ -1287,7 +1306,7 @@ function Invoke-HtmlCallbackServer {
                 # newer on-disk values with stale in-memory channel records.
                 $diskStatus = Read-ChannelCheckStatus
                 foreach ($key in $diskStatus.Keys) { $ChannelStatus[$key] = $diskStatus[$key] }
-                if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus)) {
+                if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus -RefreshAll:$refreshAll)) {
                     [Console]::Error.WriteLine('Warning: could not refresh the page; keeping the previous page.')
                 }
                 # Heartbeats cannot be accepted while the single-threaded server
