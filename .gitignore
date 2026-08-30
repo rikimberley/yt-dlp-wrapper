@@ -33,6 +33,7 @@ ffprobe.exe
 current_url.txt
 checkpoint.txt
 channel-check-status.json
+downloaded-videos.json
 channel-id-cache.txt
 channel-ids.txt
 

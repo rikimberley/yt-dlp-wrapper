@@ -127,6 +127,12 @@ still arriving. Time spent regenerating the page during a refresh does not count
 toward that timeout. Temporary status-request failures do not close the page.
 Port 8080 must be available. The callback never accepts arbitrary command text.
 
+After a local hook completes successfully, PowerShell records its channel ID,
+video ID, y1/y2 target, and completion time in `downloaded-videos.json`. Existing
+channel/video/target tuples keep their original time. Entries older than 45 days
+(1.5 months) are pruned whenever the file is read, and initial or refreshed HTML
+checks the matching target boxes for the remaining completed downloads.
+
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
 boxes; none clears both destinations' boxes in its scope.
@@ -148,6 +154,7 @@ large channels can require many continuation pages.
 | `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored *(gitignored)* |
 | `checkpoint.txt` | Epoch timestamp `-o` compares against *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
+| `downloaded-videos.json` | Successful PowerShell HTML downloads retained for 45 days *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
 | `yy.html` | Generated `--html` video grid *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |

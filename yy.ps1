@@ -66,6 +66,7 @@ $channelsFile = './channel-ids.txt'
 $channelIdCacheFile = './channel-id-cache.txt'
 $checkpointFile = './checkpoint.txt'
 $channelStatusFile = Join-Path $PSScriptRoot 'channel-check-status.json'
+$downloadedVideosFile = Join-Path $PSScriptRoot 'downloaded-videos.json'
 $userAgent = 'Mozilla/5.0'
 $acceptLanguage = 'en-US,en;q=0.9'
 # Pre-accepted consent cookies: without them YouTube can answer a channel page
@@ -862,6 +863,66 @@ function Save-ChannelCheckStatus {
     [System.IO.File]::WriteAllText($channelStatusFile, ($Status | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# Completed HTML downloads are remembered for 45 days (1.5 displayed months).
+# The timestamp is epoch seconds; an existing tuple is deliberately not touched.
+function Read-DownloadedVideos {
+    $items = New-Object System.Collections.ArrayList
+    $changed = $false
+    $cutoff = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - (45L * 86400L)
+    if (Test-Path -LiteralPath $downloadedVideosFile) {
+        try {
+            $value = Get-Content -Raw -LiteralPath $downloadedVideosFile -Encoding UTF8 | ConvertFrom-Json
+            foreach ($item in @($value)) {
+                [long]$epoch = 0
+                if ($null -eq $item -or
+                    [string]$item.channel_id -notmatch '^UC[A-Za-z0-9_-]+$' -or
+                    [string]$item.video_id -notmatch '^[A-Za-z0-9_-]+$' -or
+                    [string]$item.target -notin @('y1', 'y2') -or
+                    -not [long]::TryParse([string]$item.download_epoch, [ref]$epoch)) {
+                    $changed = $true; continue
+                }
+                if ($epoch -lt $cutoff) { $changed = $true; continue }
+                [void]$items.Add([pscustomobject]@{
+                    channel_id = [string]$item.channel_id
+                    video_id = [string]$item.video_id
+                    target = [string]$item.target
+                    download_epoch = $epoch
+                })
+            }
+        }
+        catch { [Console]::Error.WriteLine("Warning: could not read $downloadedVideosFile"); return $items }
+    }
+    if ($changed) { Save-DownloadedVideos $items }
+    return $items
+}
+
+function Save-DownloadedVideos {
+    param($Items)
+    $tmp = $downloadedVideosFile + '.new.' + [guid]::NewGuid().ToString('N')
+    try {
+        $values = @($Items)
+        $json = if ($values.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $values -Depth 3 }
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $downloadedVideosFile -Force
+    }
+    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+function Add-DownloadedVideo {
+    param([string]$ChannelId, [string]$VideoId, [string]$Target)
+    $items = @(Read-DownloadedVideos)
+    foreach ($item in $items) {
+        if ($item.channel_id -ceq $ChannelId -and $item.video_id -ceq $VideoId -and $item.target -ceq $Target) { return }
+    }
+    $items += [pscustomobject]@{
+        channel_id = $ChannelId
+        video_id = $VideoId
+        target = $Target
+        download_epoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    }
+    Save-DownloadedVideos $items
+}
+
 function Record-ChannelCheck {
     param(
         [hashtable]$Status,
@@ -921,6 +982,10 @@ function New-VideoHtml {
     $checkpointAge = Format-RelativeVideoTime $checkpointMs
     $failures = 0
     $checkBatchMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $downloaded = @{}
+    foreach ($item in @(Read-DownloadedVideos)) {
+        $downloaded[([string]$item.channel_id + "`t" + [string]$item.video_id + "`t" + [string]$item.target)] = $true
+    }
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title>')
@@ -964,7 +1029,7 @@ function New-VideoHtml {
                     '--socket-timeout', $ytDlpTimeoutSec,
                     '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
                     '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
-                    ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
+                    ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s`t%(channel_id)s"), $channelUrl)
                 [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments `
                     -Channel $channel -Index $nextIndex -Slot $slot))
                 $nextIndex++
@@ -1001,31 +1066,33 @@ function New-VideoHtml {
         if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
         $rows = New-Object System.Collections.ArrayList
         foreach ($scanRow in @($scan.Output)) {
-            $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
-            if ($scanParts.Count -lt 5 -or -not $scanParts[0].StartsWith('scan:')) { continue }
+            $scanParts = [regex]::Split([string]$scanRow, "`t", 6)
+            if ($scanParts.Count -lt 6 -or -not $scanParts[0].StartsWith('scan:')) { continue }
             if ($scanParts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
             [long]$approximateMs = 0
             if (-not [long]::TryParse($scanParts[3], [ref]$approximateMs)) { continue }
             if ($approximateMs -lt 100000000000) { $approximateMs *= 1000 }
             $scanId = $scanParts[0].Substring(5)
             $scanThumbnail = "https://i.ytimg.com/vi/$scanId/hqdefault.jpg"
-            [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs")
+            [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs`t$($scanParts[5])")
         }
         $cards = New-Object System.Text.StringBuilder
         $newest = [long]0
         $qualifiedCount = 0
         foreach ($row in @($rows)) {
-            $parts = [regex]::Split([string]$row, "`t", 5)
-            if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('row:')) { continue }
+            $parts = [regex]::Split([string]$row, "`t", 6)
+            if ($parts.Count -lt 6 -or -not $parts[0].StartsWith('row:')) { continue }
             [long]$videoMs = 0
             if (-not [long]::TryParse($parts[4], [ref]$videoMs)) { continue }
             if ($videoMs -lt 100000000000) { $videoMs *= 1000 }
             if ($videoMs -gt $newest) { $newest = $videoMs }
-            $id = $parts[0].Substring(4); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]; $age = Format-RelativeVideoTime $videoMs
-            if ($id -eq '' -or $url -eq '') { continue }
+            $id = $parts[0].Substring(4); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]; $channelId = $parts[5]; $age = Format-RelativeVideoTime $videoMs
+            if ($id -eq '' -or $url -eq '' -or $channelId -notmatch '^UC[A-Za-z0-9_-]+$') { continue }
             $eUrl = [System.Net.WebUtility]::HtmlEncode($url); $eThumb = [System.Net.WebUtility]::HtmlEncode($thumb); $eTitle = [System.Net.WebUtility]::HtmlEncode($title)
             $downloadPath = [System.Net.WebUtility]::HtmlEncode('./' + $channel)
-            $card = '<article class="card"><a class="video-link" href="{2}" target="_blank" rel="noopener noreferrer"><div class="preview"><img src="{0}" alt=""></div><div class="video-title">{1}</div></a><div class="video-age">{3}</div><div class="checks"><label><input class="y1" data-url="{2}" data-path="{4}" type="checkbox"> y1</label><label><input class="y2" data-url="{2}" data-path="{4}" type="checkbox"> y2</label></div></article>' -f $eThumb, $eTitle, $eUrl, ([System.Net.WebUtility]::HtmlEncode($age)), $downloadPath
+            $checkedY1 = if ($downloaded.ContainsKey("$channelId`t$id`ty1")) { ' checked' } else { '' }
+            $checkedY2 = if ($downloaded.ContainsKey("$channelId`t$id`ty2")) { ' checked' } else { '' }
+            $card = '<article class="card"><a class="video-link" href="{2}" target="_blank" rel="noopener noreferrer"><div class="preview"><img src="{0}" alt=""></div><div class="video-title">{1}</div></a><div class="video-age">{3}</div><div class="checks"><label><input class="y1" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{7}> y1</label><label><input class="y2" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{8}> y2</label></div></article>' -f $eThumb, $eTitle, $eUrl, ([System.Net.WebUtility]::HtmlEncode($age)), $downloadPath, ([System.Net.WebUtility]::HtmlEncode($channelId)), ([System.Net.WebUtility]::HtmlEncode($id)), $checkedY1, $checkedY2
             [void]$cards.AppendLine($card)
             $qualifiedCount++
         }
@@ -1071,7 +1138,7 @@ function New-VideoHtml {
     }
     Save-ChannelCheckStatus $ChannelStatus
     [void]$sb.AppendLine('</tbody></table></section>')
-    [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
+    [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
     $pageText = $sb.ToString().Replace('if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}', 'setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}')
     $pageText = $pageText.Replace('jobLog.textContent=(b.logs||[]).join("\n");', 'jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;')
     $heartbeatUrl = $CallbackUrl -replace '/download/', '/heartbeat/'
@@ -1096,6 +1163,7 @@ function Test-VideoSelection {
     param($Item)
 
     if ($null -eq $Item -or $Item.target -notin @('y1', 'y2')) { return $false }
+    if ([string]$Item.channel_id -notmatch '^UC[A-Za-z0-9_-]+$' -or [string]$Item.video_id -notmatch '^[A-Za-z0-9_-]+$') { return $false }
     if ([string]$Item.path -notmatch '^\./[^\\/:*?"<>|]+$' -or [string]$Item.path -match '^\./\.{1,2}$') { return $false }
     try { $uri = [uri]$Item.url } catch { return $false }
     if ($uri.Scheme -notin @('http', 'https')) { return $false }
@@ -1116,7 +1184,7 @@ function Start-SelectedVideoHooks {
         $hook = Get-Command $hookName -CommandType ExternalScript -ErrorAction SilentlyContinue
         if ($null -eq $hook) { throw "Local $hookName hook was not found" }
         $Jobs[[guid]::NewGuid().ToString('N')] = [pscustomobject]@{
-            Target = [string]$item.target; Url = [string]$item.url; DownloadPath = [string]$item.path; Hook = [string]$hook.Source; Order = $started; Process = $null; State = 'queued'; ExitCode = $null; OutputPath = ''; ErrorPath = ''; OutputLines = 0; ErrorLines = 0; Logs = @(); Succeeded = $false
+            Target = [string]$item.target; Url = [string]$item.url; DownloadPath = [string]$item.path; ChannelId = [string]$item.channel_id; VideoId = [string]$item.video_id; Hook = [string]$hook.Source; Order = $started; Process = $null; State = 'queued'; ExitCode = $null; OutputPath = ''; ErrorPath = ''; OutputLines = 0; ErrorLines = 0; Logs = @(); Succeeded = $false; Persisted = $false
         }
         Write-Host "Queued: $($hook.Source) -p $($item.path) -t $($item.url)"
         $started++
@@ -1166,6 +1234,10 @@ function Get-DownloadJobStatus {
                 if ($job.Process.HasExited) {
                     $job.ExitCode = $job.Process.ExitCode
                     $job.State = if ($job.ExitCode -eq 0 -or $job.Succeeded) { 'completed' } else { 'failed' }
+                    if ($job.State -eq 'completed' -and -not $job.Persisted) {
+                        Add-DownloadedVideo $job.ChannelId $job.VideoId $job.Target
+                        $job.Persisted = $true
+                    }
                 }
             }
             catch { $job.State = 'failed' }

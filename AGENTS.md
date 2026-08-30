@@ -22,6 +22,7 @@ apply — the parent tree itself remains untracked).
 | `channel-ids.txt` | Input for `-o`/`-O`. One YouTube channel handle per line (a leading `@` is optional, non-ASCII handles are fine). A raw `UC…` channel id is also accepted and skips handle resolution entirely. Blank lines and `#` comments are skipped. *(gitignored — it is a subscription list, and the repo is public)* |
 | `checkpoint.txt`  | Input for `-o`, rewritten by `-c`. Single epoch timestamp; 12+ digits is read as milliseconds, shorter as seconds. *(gitignored)* |
 | `channel-id-cache.txt` | Generated cache mapping each handle to its `UC…` channel id, TAB separated, one per line. Pure cache — safe to delete, costs one page fetch per channel to rebuild. *(gitignored)* |
+| `downloaded-videos.json` | PowerShell HTML-server completion history: `channel_id`, `video_id`, `target`, and epoch-second `download_epoch`. Entries expire after 45 days. *(gitignored)* |
 | `cookies.txt`            | **SECRET.** Netscape-format YouTube cookie jar with live session tokens. *(gitignored)* |
 | `t/`               | Default download output directory (`--paths ./t`). Treat as disposable scratch. *(gitignored)* |
 
