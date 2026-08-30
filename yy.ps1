@@ -986,6 +986,8 @@ function New-VideoHtml {
     foreach ($item in @(Read-DownloadedVideos)) {
         $downloaded[([string]$item.channel_id + "`t" + [string]$item.video_id + "`t" + [string]$item.target)] = $true
     }
+    $channelIdCache = Read-ChannelIdCache
+    $htmlChannelIds = @{}
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title>')
@@ -1002,6 +1004,12 @@ function New-VideoHtml {
         if (-not (Test-ShouldScanHtmlChannel -Record $ChannelStatus[$channel] -RefreshAll:$RefreshAll)) {
             Write-Host "Skipping @$channel (latest video is 1.5 months old or older, or unknown)"
             continue
+        }
+        if ($channel -match '^UC[A-Za-z0-9_-]+$') { $htmlChannelIds[$channel] = $channel }
+        else {
+            $resolved = Resolve-ChannelId -Handle $channel -ChannelUrl (Get-ChannelUrl $channel) -Cache $channelIdCache
+            if ($resolved.Id -eq '') { $failures++; continue }
+            $htmlChannelIds[$channel] = $resolved.Id
         }
         [void]$channels.Add($channel)
     }
@@ -1029,7 +1037,7 @@ function New-VideoHtml {
                     '--socket-timeout', $ytDlpTimeoutSec,
                     '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
                     '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
-                    ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s`t%(channel_id)s"), $channelUrl)
+                    ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
                 [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments `
                     -Channel $channel -Index $nextIndex -Slot $slot))
                 $nextIndex++
@@ -1066,28 +1074,28 @@ function New-VideoHtml {
         if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
         $rows = New-Object System.Collections.ArrayList
         foreach ($scanRow in @($scan.Output)) {
-            $scanParts = [regex]::Split([string]$scanRow, "`t", 6)
-            if ($scanParts.Count -lt 6 -or -not $scanParts[0].StartsWith('scan:')) { continue }
+            $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
+            if ($scanParts.Count -lt 5 -or -not $scanParts[0].StartsWith('scan:')) { continue }
             if ($scanParts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
             [long]$approximateMs = 0
             if (-not [long]::TryParse($scanParts[3], [ref]$approximateMs)) { continue }
             if ($approximateMs -lt 100000000000) { $approximateMs *= 1000 }
             $scanId = $scanParts[0].Substring(5)
             $scanThumbnail = "https://i.ytimg.com/vi/$scanId/hqdefault.jpg"
-            [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs`t$($scanParts[5])")
+            [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs")
         }
         $cards = New-Object System.Text.StringBuilder
         $newest = [long]0
         $qualifiedCount = 0
         foreach ($row in @($rows)) {
-            $parts = [regex]::Split([string]$row, "`t", 6)
-            if ($parts.Count -lt 6 -or -not $parts[0].StartsWith('row:')) { continue }
+            $parts = [regex]::Split([string]$row, "`t", 5)
+            if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('row:')) { continue }
             [long]$videoMs = 0
             if (-not [long]::TryParse($parts[4], [ref]$videoMs)) { continue }
             if ($videoMs -lt 100000000000) { $videoMs *= 1000 }
             if ($videoMs -gt $newest) { $newest = $videoMs }
-            $id = $parts[0].Substring(4); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]; $channelId = $parts[5]; $age = Format-RelativeVideoTime $videoMs
-            if ($id -eq '' -or $url -eq '' -or $channelId -notmatch '^UC[A-Za-z0-9_-]+$') { continue }
+            $id = $parts[0].Substring(4); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]; $channelId = [string]$htmlChannelIds[$channel]; $age = Format-RelativeVideoTime $videoMs
+            if ($id -eq '' -or $url -eq '') { continue }
             $eUrl = [System.Net.WebUtility]::HtmlEncode($url); $eThumb = [System.Net.WebUtility]::HtmlEncode($thumb); $eTitle = [System.Net.WebUtility]::HtmlEncode($title)
             $downloadPath = [System.Net.WebUtility]::HtmlEncode('./' + $channel)
             $checkedY1 = if ($downloaded.ContainsKey("$channelId`t$id`ty1")) { ' checked' } else { '' }
