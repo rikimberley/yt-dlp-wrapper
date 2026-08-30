@@ -132,6 +132,8 @@ video ID, y1/y2 target, and completion time in `downloaded-videos.json`. Existin
 channel/video/target tuples keep their original time. Entries older than 45 days
 (1.5 months) are pruned whenever the file is read, and initial or refreshed HTML
 checks the matching target boxes for the remaining completed downloads.
+The wrapper logs history loads, pruning and saves, new or duplicate completion
+records, and the number of target selections restored into each generated page.
 
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's

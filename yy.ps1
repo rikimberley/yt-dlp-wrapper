@@ -868,8 +868,14 @@ function Save-ChannelCheckStatus {
 function Read-DownloadedVideos {
     $items = New-Object System.Collections.ArrayList
     $changed = $false
+    $expired = 0
+    $invalid = 0
     $cutoff = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - (45L * 86400L)
-    if (Test-Path -LiteralPath $downloadedVideosFile) {
+    if (-not (Test-Path -LiteralPath $downloadedVideosFile)) {
+        Write-Host 'Downloaded-video history not found; starting empty.'
+        return $items
+    }
+    else {
         try {
             $value = Get-Content -Raw -LiteralPath $downloadedVideosFile -Encoding UTF8 | ConvertFrom-Json
             foreach ($item in @($value)) {
@@ -879,9 +885,9 @@ function Read-DownloadedVideos {
                     [string]$item.video_id -notmatch '^[A-Za-z0-9_-]+$' -or
                     [string]$item.target -notin @('y1', 'y2') -or
                     -not [long]::TryParse([string]$item.download_epoch, [ref]$epoch)) {
-                    $changed = $true; continue
+                    $changed = $true; $invalid++; continue
                 }
-                if ($epoch -lt $cutoff) { $changed = $true; continue }
+                if ($epoch -lt $cutoff) { $changed = $true; $expired++; continue }
                 [void]$items.Add([pscustomobject]@{
                     channel_id = [string]$item.channel_id
                     video_id = [string]$item.video_id
@@ -892,6 +898,9 @@ function Read-DownloadedVideos {
         }
         catch { [Console]::Error.WriteLine("Warning: could not read $downloadedVideosFile"); return $items }
     }
+    Write-Host "Loaded $($items.Count) downloaded-video record(s)."
+    if ($expired -gt 0) { Write-Host "Pruned $expired downloaded-video record(s) older than 45 days." }
+    if ($invalid -gt 0) { Write-Host "Pruned $invalid invalid downloaded-video record(s)." }
     if ($changed) { Save-DownloadedVideos $items }
     return $items
 }
@@ -904,6 +913,7 @@ function Save-DownloadedVideos {
         $json = if ($values.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $values -Depth 3 }
         [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmp -Destination $downloadedVideosFile -Force
+        Write-Host "Saved $($values.Count) downloaded-video record(s)."
     }
     finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
@@ -912,8 +922,12 @@ function Add-DownloadedVideo {
     param([string]$ChannelId, [string]$VideoId, [string]$Target)
     $items = @(Read-DownloadedVideos)
     foreach ($item in $items) {
-        if ($item.channel_id -ceq $ChannelId -and $item.video_id -ceq $VideoId -and $item.target -ceq $Target) { return }
+        if ($item.channel_id -ceq $ChannelId -and $item.video_id -ceq $VideoId -and $item.target -ceq $Target) {
+            Write-Host "Downloaded-video record already exists; keeping original timestamp: $ChannelId / $VideoId / $Target"
+            return
+        }
     }
+    Write-Host "Recording completed download: $ChannelId / $VideoId / $Target"
     $items += [pscustomobject]@{
         channel_id = $ChannelId
         video_id = $VideoId
@@ -988,6 +1002,7 @@ function New-VideoHtml {
     }
     $channelIdCache = Read-ChannelIdCache
     $htmlChannelIds = @{}
+    $restoredSelections = 0
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title>')
@@ -1100,6 +1115,8 @@ function New-VideoHtml {
             $downloadPath = [System.Net.WebUtility]::HtmlEncode('./' + $channel)
             $checkedY1 = if ($downloaded.ContainsKey("$channelId`t$id`ty1")) { ' checked' } else { '' }
             $checkedY2 = if ($downloaded.ContainsKey("$channelId`t$id`ty2")) { ' checked' } else { '' }
+            if ($checkedY1 -ne '') { $restoredSelections++ }
+            if ($checkedY2 -ne '') { $restoredSelections++ }
             $card = '<article class="card"><a class="video-link" href="{2}" target="_blank" rel="noopener noreferrer"><div class="preview"><img src="{0}" alt=""></div><div class="video-title">{1}</div></a><div class="video-age">{3}</div><div class="checks"><label><input class="y1" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{7}> y1</label><label><input class="y2" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{8}> y2</label></div></article>' -f $eThumb, $eTitle, $eUrl, ([System.Net.WebUtility]::HtmlEncode($age)), $downloadPath, ([System.Net.WebUtility]::HtmlEncode($channelId)), ([System.Net.WebUtility]::HtmlEncode($id)), $checkedY1, $checkedY2
             [void]$cards.AppendLine($card)
             $qualifiedCount++
@@ -1160,6 +1177,7 @@ function New-VideoHtml {
     [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     Save-ChannelCheckStatus $ChannelStatus
     $script:htmlFailureCount = $failures
+    Write-Host "Restored $restoredSelections downloaded target selection(s) in HTML."
     Write-Host "Generated ./yy.html"
     return $true
 }
