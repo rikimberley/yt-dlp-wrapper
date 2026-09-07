@@ -131,7 +131,9 @@ After a local hook completes successfully, PowerShell records its channel ID,
 video ID, y1/y2 target, and completion time in `downloaded-videos.json`. Existing
 channel/video/target tuples keep their original time. Entries older than 45 days
 (1.5 months) are pruned whenever the file is read, and initial or refreshed HTML
-checks the matching target boxes for the remaining completed downloads.
+checks the matching target boxes for the remaining completed downloads. When
+`DOWNLOAD SELECTED` is clicked, selections with a remaining matching completion
+record are skipped instead of being queued again.
 The wrapper logs history loads, pruning and saves, new or duplicate completion
 records, and the number of target selections restored into each generated page.
 

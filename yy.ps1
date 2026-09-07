@@ -1201,11 +1201,20 @@ function Start-SelectedVideoHooks {
 
     $selected = @($Items)
     if ($selected.Count -eq 0) { throw 'No video selections received' }
+    $downloaded = @{}
+    foreach ($item in @(Read-DownloadedVideos)) {
+        $downloaded[([string]$item.channel_id + "`t" + [string]$item.video_id + "`t" + [string]$item.target)] = $true
+    }
     $started = 0
     # yy2 must drain before yy1, while preserving the page's order within each
     # destination. Only the scheduler below starts processes.
     foreach ($item in @($selected | Sort-Object @{ Expression = { if ($_.target -eq 'y2') { 0 } else { 1 } }; Ascending = $true })) {
         if (-not (Test-VideoSelection $item)) { throw 'Invalid video selection received' }
+        $downloadKey = [string]$item.channel_id + "`t" + [string]$item.video_id + "`t" + [string]$item.target
+        if ($downloaded.ContainsKey($downloadKey)) {
+            Write-Host "Skipped previously downloaded selection: $($item.channel_id) / $($item.video_id) / $($item.target)"
+            continue
+        }
         $hookName = 'y' + $item.target + '.ps1'
         $hook = Get-Command $hookName -CommandType ExternalScript -ErrorAction SilentlyContinue
         if ($null -eq $hook) { throw "Local $hookName hook was not found" }
