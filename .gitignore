@@ -34,6 +34,8 @@ current_url.txt
 checkpoint.txt
 channel-check-status.json
 downloaded-videos.json
+html-video-cache.json
+html-video-cache.tsv
 channel-id-cache.txt
 channel-ids.txt
 

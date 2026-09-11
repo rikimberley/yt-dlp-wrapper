@@ -52,7 +52,7 @@ re-exporting.
 ## Usage
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2] [-c]
 ```
 
 | Flag | Effect |
@@ -65,10 +65,11 @@ re-exporting.
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
-| `-c` | With `-o` or `--html`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
+| `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
+| `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 
-Precedence: `-U`, then `-o`/`-O`, then `-c`, then download. `-o` and `-O` are
-mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
+Precedence: `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
+`-O`, `--html`, and `--html2` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
 Without `-p`, a download URL containing a YouTube handle path such as
@@ -77,7 +78,7 @@ Other URLs continue to use `./t`. An explicit `-p` always takes precedence.
 
 `./yy.zsh -o -c` means "open whatever is new, then mark everything as seen".
 The checkpoint is not updated if at least three channel checks fail, or if all
-listed channels fail to be checked. With `-o -c` and `--html -c`, the saved
+listed channels fail to be checked. With `-o -c`, `--html -c`, and `--html2 -c`, the saved
 timestamp is captured after the check pass, before channels/pages are opened;
 it is written when that operation returns (after the HTML server stops).
 
@@ -141,6 +142,14 @@ record are skipped instead of being queued again.
 The wrapper logs history loads, pruning and saves, new or duplicate completion
 records, and the number of target selections restored into each generated page.
 
+`--html2` leaves `--html` unchanged. It stores recent per-channel video metadata
+in `html-video-cache.json` on PowerShell and `html-video-cache.tsv` on zsh.
+Missing or unreadable caches are rebuilt. Successful scans merge new metadata
+with cached cards; failed scans retain cached cards. `REFRESH` retains the
+45-day active-channel filter, while `REFRESH ALL` checks every channel using
+the same incremental boundary. Missing channel avatars are fetched concurrently
+and retained in `channel-check-status.json`.
+
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
 boxes; none clears both destinations' boxes in its scope.
@@ -163,6 +172,7 @@ large channels can require many continuation pages.
 | `checkpoint.txt` | Epoch timestamp `-o` compares against *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
 | `downloaded-videos.json` | Successful PowerShell HTML downloads retained for 45 days *(gitignored)* |
+| `html-video-cache.json` / `html-video-cache.tsv` | PowerShell/zsh `--html2` incremental video metadata *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
 | `yy.html` | Generated `--html` video grid *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |

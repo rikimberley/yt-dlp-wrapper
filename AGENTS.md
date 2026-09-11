@@ -23,6 +23,7 @@ apply — the parent tree itself remains untracked).
 | `checkpoint.txt`  | Input for `-o`, rewritten by `-c`. Single epoch timestamp; 12+ digits is read as milliseconds, shorter as seconds. *(gitignored)* |
 | `channel-id-cache.txt` | Generated cache mapping each handle to its `UC…` channel id, TAB separated, one per line. Pure cache — safe to delete, costs one page fetch per channel to rebuild. *(gitignored)* |
 | `downloaded-videos.json` | PowerShell HTML-server completion history: `channel_id`, `video_id`, `target`, and epoch-second `download_epoch`. Entries expire after 45 days. *(gitignored)* |
+| `html-video-cache.json` / `html-video-cache.tsv` | PowerShell/zsh `--html2` incremental metadata caches. Pure runtime state; safe to delete. *(gitignored)* |
 | `cookies.txt`            | **SECRET.** Netscape-format YouTube cookie jar with live session tokens. *(gitignored)* |
 | `t/`               | Default download output directory (`--paths ./t`). Treat as disposable scratch. *(gitignored)* |
 
@@ -31,7 +32,7 @@ apply — the parent tree itself remains untracked).
 Both `yy.zsh` and `yy.ps1` implement the same interface:
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2] [-c]
 ```
 
 - positional `<url>` — persisted to `current_url.txt`, then downloaded
@@ -50,11 +51,15 @@ Both `yy.zsh` and `yy.ps1` implement the same interface:
   non-zero if any channel could not be checked.
 - `-O` — opens every channel URL unconditionally, with no check. Exits without
   downloading.
+- `--html2` — opt-in incremental form of `--html`. It preserves recent video
+  metadata in a gitignored cache, scans a one-day overlap from each channel's
+  last successful check, and merges new results with cached cards. `--html`
+  retains its existing full checkpoint scan.
 - `-c` — overwrites `checkpoint.txt` with the current epoch-ms timestamp. Runs
   **after** `-o`/`-O`, so `./yy.zsh -o -c` means "open whatever is new, then
   mark everything as seen". If at least three `-o` checks fail, or every listed
   channel check fails, the checkpoint is not updated. Exits without downloading.
-- `-o` and `-O` are mutually exclusive; `-U` takes precedence over both
+- `-o`, `-O`, `--html`, and `--html2` are mutually exclusive; `-U` takes precedence over them
 - error + non-zero exit when no URL is available from any source
 
 Flag precedence when several are passed: `-U`, then `-o`/`-O`, then `-c`, then
