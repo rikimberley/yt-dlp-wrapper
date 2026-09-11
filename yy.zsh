@@ -69,6 +69,7 @@ html_checkpoint_ms=0
 html_file="./yy.html"
 html_video_cache_file="./html-video-cache.tsv"
 html_incremental=0
+html_full_scan_interval_ms=$(( 24 * 60 * 60 * 1000 ))
 
 run_cmd() {
   local -a cmd
@@ -392,6 +393,11 @@ feed_newest_ms() {
     print -r -- '-1 fetch'
     return 0
   fi
+  if [[ "$feed" != *'<feed'* || "$feed" != *'</feed>'* ]]; then
+    printf 'Warning: malformed video feed for %s\n' "$channel_id" >&2
+    print -r -- '-1 ok'
+    return 0
+  fi
   # Entries are not guaranteed to be date-sorted, so scan them all.
   for ts in ${(f)"$(printf '%s' "$feed" | grep -o '<published>[^<]*</published>' | sed 's/<[^>]*>//g')"}; do
     [[ -n "$ts" ]] || continue
@@ -685,8 +691,9 @@ generate_html() {
   local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards result_dir
   local index next_index pid completed slot position cookie_file cache_kind cache_channel cache_id cache_url cache_title cache_timestamp cache_availability
   local channel_scan_cutoff checked_sec cached_cutoff cache_tmp merged_output entry_id entry_timestamp _entry_id _entry_url _entry_title _entry_availability
-  local -a channels scan_pids remaining_pids scan_slots remaining_slots free_slots scan_cookie_files
-  local -A seen_channels cached_checked cached_rows seen_video_ids
+  local now_ms last_full_ms feed_newest_ms_value feed_state known_newest_ms cached_entry_line html_feed_failures=0 html_skip_feeds=0 feed_index _feed_value
+  local -a channels scan_pids remaining_pids scan_slots remaining_slots free_slots scan_cookie_files feed_pids feed_indices
+  local -A seen_channels cached_checked cached_last_full cached_feed_newest cached_channel_id cached_rows seen_video_ids skip_ytdlp observed_feed_newest
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
@@ -702,11 +709,17 @@ generate_html() {
   print -r -- "<h1>yy video grid</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED. The button downloads a command script; run it next to yy1/yy2. <span>Checkpoint: ${checkpoint_ms}</span></p><div class=\"controls\"><button id=\"download\" type=\"button\">DOWNLOAD SELECTED</button><button data-action=\"y1\" type=\"button\">y1</button><button data-action=\"y2\" type=\"button\">y2</button><button data-action=\"none\" type=\"button\">none</button></div><main>" >> "$tmp"
   channels=()
   cached_checked=()
+  cached_last_full=()
+  cached_feed_newest=()
+  cached_channel_id=()
   cached_rows=()
   if (( html_incremental )) && [[ -f "$html_video_cache_file" ]]; then
     while IFS=$'\t' read -r cache_kind cache_channel cache_id cache_url cache_title cache_timestamp cache_availability; do
       if [[ "$cache_kind" == M ]]; then
         cached_checked[$cache_channel]=$cache_id
+        cached_last_full[$cache_channel]=${cache_url:-$cache_id}
+        cached_feed_newest[$cache_channel]=${cache_title:-0}
+        cached_channel_id[$cache_channel]=${cache_timestamp:-}
       elif [[ "$cache_kind" == V ]]; then
         cached_rows[$cache_channel]+="scan:${cache_id}"$'\t'"${cache_url}"$'\t'"${cache_title}"$'\t'"${cache_timestamp}"$'\t'"${cache_availability}"$'\n'
       fi
@@ -720,6 +733,69 @@ generate_html() {
     channels+=("$channel")
   done < "$channels_file"
   result_dir=$(mktemp -d) || return 1
+  skip_ytdlp=()
+  observed_feed_newest=()
+  now_ms=$(( $(date +%s) * 1000 ))
+  if (( html_incremental )); then
+    feed_pids=()
+    feed_indices=()
+    for (( index = 1; index <= ${#channels}; ++index )); do
+      (( html_skip_feeds )) && break
+      channel=${channels[index]}
+      last_full_ms=${cached_last_full[$channel]:-${cached_checked[$channel]:-0}}
+      [[ "$last_full_ms" =~ ^[0-9]+$ ]] || last_full_ms=0
+      (( last_full_ms > 0 && now_ms - last_full_ms < html_full_scan_interval_ms )) || continue
+      if [[ -z ${cached_channel_id[$channel]:-} ]]; then
+        channel_url=$(channel_url_for "$channel")
+        if resolve_channel_id "$channel" "$channel_url"; then
+          cached_channel_id[$channel]=$resolved_channel_id
+        else
+          continue
+        fi
+      fi
+      feed_newest_ms "${cached_channel_id[$channel]}" >| "$result_dir/feed.$index" &
+      feed_pids+=("$!")
+      feed_indices+=("$index")
+      if (( ${#feed_pids} >= MAX_THREADS )); then
+        for pid in "${feed_pids[@]}"; do wait "$pid" || true; done
+        for feed_index in "${feed_indices[@]}"; do
+          read -r _feed_value feed_state < "$result_dir/feed.$feed_index" || true
+          [[ "$feed_state" == fetch ]] && (( ++html_feed_failures ))
+        done
+        if (( html_feed_failures >= feed_failure_limit )); then
+          html_skip_feeds=1
+          printf 'Warning: %s video feeds exhausted retries; skipping feed preflight for remaining channels and using yt-dlp\n' "$html_feed_failures" >&2
+        fi
+        feed_pids=()
+        feed_indices=()
+      fi
+    done
+    for pid in "${feed_pids[@]}"; do wait "$pid" || true; done
+    for (( index = 1; index <= ${#channels}; ++index )); do
+      [[ -f "$result_dir/feed.$index" ]] || continue
+      channel=${channels[index]}
+      read -r feed_newest_ms_value feed_state < "$result_dir/feed.$index" || true
+      if [[ "$feed_state" != ok || ! "$feed_newest_ms_value" =~ ^[0-9]+$ ]] || (( feed_newest_ms_value <= 0 )); then
+        printf 'Warning: unusable video feed for @%s; using yt-dlp\n' "$channel" >&2
+        continue
+      fi
+      observed_feed_newest[$channel]=$feed_newest_ms_value
+      known_newest_ms=$(( scan_cutoff_sec * 1000 ))
+      if [[ ${cached_feed_newest[$channel]:-0} =~ ^[0-9]+$ ]] && (( cached_feed_newest[$channel] > known_newest_ms )); then
+        known_newest_ms=${cached_feed_newest[$channel]}
+      fi
+      for cached_entry_line in ${(f)${cached_rows[$channel]:-}}; do
+        IFS=$'\t' read -r _entry_id _entry_url _entry_title entry_timestamp _entry_availability <<< "${cached_entry_line#scan:}"
+        [[ "$entry_timestamp" =~ ^[0-9]+$ ]] || continue
+        (( entry_timestamp *= 1000 ))
+        (( entry_timestamp > known_newest_ms )) && known_newest_ms=$entry_timestamp
+      done
+      if (( feed_newest_ms_value <= known_newest_ms )); then
+        skip_ytdlp[$channel]=1
+        printf '@%s: public feed unchanged; reusing cached cards\n' "$channel"
+      fi
+    done
+  fi
   scan_cookie_files=()
   {
     free_slots=()
@@ -737,11 +813,19 @@ generate_html() {
         slot=${free_slots[1]}
         free_slots[1]=()
         channel=${channels[next_index]}; channel_url=$(channel_url_for "$channel")
+        if (( ${+skip_ytdlp[$channel]} )); then
+          : >| "$result_dir/$next_index.out"
+          print -r -- 0 >| "$result_dir/$next_index.status"
+          print -r -- 1 >| "$result_dir/$next_index.feed-only"
+          free_slots+=("$slot")
+          (( ++next_index ))
+          continue
+        fi
         printf 'Checking @%s...\n' "$channel"
         cookie_file="./cookies${slot}.txt"
         channel_scan_cutoff=$scan_cutoff_sec
-        if (( html_incremental )) && [[ ${cached_checked[$channel]:-0} =~ ^[0-9]+$ ]] && (( cached_checked[$channel] > 0 )); then
-          checked_sec=$(( cached_checked[$channel] / 1000 ))
+        if (( html_incremental )) && [[ ${cached_last_full[$channel]:-${cached_checked[$channel]:-0}} =~ ^[0-9]+$ ]] && (( ${cached_last_full[$channel]:-${cached_checked[$channel]:-0}} > 0 )); then
+          checked_sec=$(( ${cached_last_full[$channel]:-${cached_checked[$channel]:-0}} / 1000 ))
           cached_cutoff=$(( checked_sec - (checked_sec % 86400) - 86400 ))
           (( cached_cutoff > channel_scan_cutoff )) && channel_scan_cutoff=$cached_cutoff
         fi
@@ -793,6 +877,7 @@ generate_html() {
       if (( html_incremental )); then
         output+=$'\n'${cached_rows[$channel]:-}
         cached_checked[$channel]=$(( $(date +%s) * 1000 ))
+        [[ -f "$result_dir/$index.feed-only" ]] || cached_last_full[$channel]=${cached_checked[$channel]}
       fi
     fi
     if (( html_incremental )); then
@@ -810,7 +895,10 @@ generate_html() {
         merged_output+="$line"$'\n'
       done <<< "$output"
       output=$merged_output
-      printf 'M\t%s\t%s\n' "$channel" "${cached_checked[$channel]:-0}" >> "$cache_tmp"
+      if (( status == 0 || status == 101 )) && (( ${+observed_feed_newest[$channel]} )); then
+        cached_feed_newest[$channel]=${observed_feed_newest[$channel]}
+      fi
+      printf 'M\t%s\t%s\t%s\t%s\t%s\n' "$channel" "${cached_checked[$channel]:-0}" "${cached_last_full[$channel]:-${cached_checked[$channel]:-0}}" "${cached_feed_newest[$channel]:-0}" "${cached_channel_id[$channel]:-}" >> "$cache_tmp"
       while IFS=$'\t' read -r line; do
         [[ "$line" == scan:* ]] || continue
         printf 'V\t%s\t%s\n' "$channel" "${line#scan:}" >> "$cache_tmp"

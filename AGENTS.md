@@ -54,7 +54,10 @@ Both `yy.zsh` and `yy.ps1` implement the same interface:
 - `--html2` — opt-in incremental form of `--html`. It preserves recent video
   metadata in a gitignored cache, scans a one-day overlap from each channel's
   last successful check, and merges new results with cached cards. `--html`
-  retains its existing full checkpoint scan.
+  retains its existing full checkpoint scan. Recent cached channels use
+  concurrent public-feed checks as a gate: unchanged feeds reuse
+  cached cards, while newer, empty, malformed, or failed feeds fall back to the
+  cookie-backed yt-dlp scan. A yt-dlp scan is forced at least once per 24 hours.
 - `-c` — overwrites `checkpoint.txt` with the current epoch-ms timestamp. Runs
   **after** `-o`/`-O`, so `./yy.zsh -o -c` means "open whatever is new, then
   mark everything as seen". If at least three `-o` checks fail, or every listed
