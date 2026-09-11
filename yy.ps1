@@ -15,6 +15,7 @@
 # - uses -O to open every channel in ./channel-ids.txt unconditionally, and
 #   skip any download
 # - uses --html to generate a local 6-column video grid with y1/y2 selections
+# - uses --html2 for the same page with persistent incremental scan caching
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -28,6 +29,7 @@
 #   ./yy.ps1 -o
 #   ./yy.ps1 -O
 #   ./yy.ps1 --html
+#   ./yy.ps1 --html2
 #   ./yy.ps1 -c
 #   ./yy.ps1 -o -c
 #
@@ -52,6 +54,7 @@ try {
         $tls = $tls -bor [Net.SecurityProtocolType]::Tls13
     }
     [Net.ServicePointManager]::SecurityProtocol = $tls
+    [Net.ServicePointManager]::DefaultConnectionLimit = 16
 }
 catch { }
 
@@ -68,6 +71,7 @@ $channelIdCacheFile = './channel-id-cache.txt'
 $checkpointFile = './checkpoint.txt'
 $channelStatusFile = Join-Path $PSScriptRoot 'channel-check-status.json'
 $downloadedVideosFile = Join-Path $PSScriptRoot 'downloaded-videos.json'
+$htmlVideoCacheFile = Join-Path $PSScriptRoot 'html-video-cache.json'
 $userAgent = 'Mozilla/5.0'
 $acceptLanguage = 'en-US,en;q=0.9'
 # Pre-accepted consent cookies: without them YouTube can answer a channel page
@@ -127,17 +131,17 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
         if ($OpenMode -ne '' -or $HtmlMode) {
-            [Console]::Error.WriteLine('Error: -o and -O cannot be combined')
+            [Console]::Error.WriteLine('Error: -o, -O, --html, and --html2 cannot be combined')
             exit 1
         }
         $OpenMode = if ($a -ceq '-o') { 'check' } else { 'open' }
     }
-    elseif ($a -ceq '--html') {
+    elseif ($a -ceq '--html' -or $a -ceq '--html2') {
         if ($OpenMode -ne '') {
-            [Console]::Error.WriteLine('Error: --html cannot be combined with -o or -O')
+            [Console]::Error.WriteLine('Error: -o, -O, --html, and --html2 cannot be combined')
             exit 1
         }
-        $OpenMode = 'html'
+        $OpenMode = if ($a -ceq '--html2') { 'html2' } else { 'html' }
         $HtmlMode = $true
     }
     elseif ($a -ceq '-c') {
@@ -866,6 +870,27 @@ function Save-ChannelCheckStatus {
     [System.IO.File]::WriteAllText($channelStatusFile, ($Status | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Read-HtmlVideoCache {
+    if (-not (Test-Path -LiteralPath $htmlVideoCacheFile)) { return @{} }
+    try {
+        $value = Get-Content -Raw -LiteralPath $htmlVideoCacheFile -Encoding UTF8 | ConvertFrom-Json
+        $result = @{}
+        foreach ($property in $value.PSObject.Properties) { $result[$property.Name] = $property.Value }
+        return $result
+    }
+    catch { [Console]::Error.WriteLine("Warning: could not read $htmlVideoCacheFile; rebuilding it"); return @{} }
+}
+
+function Save-HtmlVideoCache {
+    param([hashtable]$Cache)
+    $temp = "$htmlVideoCacheFile.new.$PID"
+    try {
+        [System.IO.File]::WriteAllText($temp, ($Cache | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temp -Destination $htmlVideoCacheFile -Force
+    }
+    finally { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+}
+
 # Completed HTML downloads are remembered for 45 days (1.5 displayed months).
 # The timestamp is epoch seconds; an existing tuple is deliberately not touched.
 function Read-DownloadedVideos {
@@ -963,6 +988,52 @@ function Get-ChannelThumbnail {
     return [System.Net.WebUtility]::HtmlDecode([regex]::Match($page, '<meta property="og:image" content="([^"]+)"').Groups[1].Value)
 }
 
+function Get-ChannelThumbnailsConcurrent {
+    param([object[]]$Entries)
+    $result = @{}
+    $pending = @{}
+    foreach ($entry in @($Entries)) { $pending[[string]$entry.Key] = Get-ChannelUrl ([string]$entry.Key) }
+    if ($pending.Count -eq 0) { return $result }
+    Add-Type -AssemblyName System.Net.Http
+    for ($attempt = 1; $attempt -le $fetchAttempts -and $pending.Count -gt 0; $attempt++) {
+        if ($attempt -gt 1) { Start-Sleep -Seconds ($attempt - 1) }
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AutomaticDecompression = ([System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate)
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds($fetchTimeoutSec)
+        $requests = @{}
+        try {
+            foreach ($key in @($pending.Keys)) {
+                $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $pending[$key])
+                [void]$request.Headers.TryAddWithoutValidation('User-Agent', $userAgent)
+                [void]$request.Headers.TryAddWithoutValidation('Accept-Language', $acceptLanguage)
+                [void]$request.Headers.TryAddWithoutValidation('Cookie', $consentCookie)
+                $requests[$key] = [pscustomobject]@{ Request=$request; Task=$client.SendAsync($request) }
+            }
+            try { [System.Threading.Tasks.Task]::WaitAll(@($requests.Values | ForEach-Object { $_.Task })) } catch { }
+            foreach ($key in @($requests.Keys)) {
+                try {
+                    $response = $requests[$key].Task.GetAwaiter().GetResult()
+                    try {
+                        $response.EnsureSuccessStatusCode() | Out-Null
+                        $page = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                        $thumbnail = [System.Net.WebUtility]::HtmlDecode([regex]::Match($page, '<meta property="og:image" content="([^"]+)"').Groups[1].Value)
+                        if ($thumbnail -ne '') { $result[$key] = $thumbnail; [void]$pending.Remove($key) }
+                    }
+                    finally { $response.Dispose() }
+                }
+                catch {
+                    [Console]::Error.WriteLine("Warning: avatar fetch for @$key failed (attempt $attempt/$fetchAttempts): $($_.Exception.Message)")
+                }
+                finally { $requests[$key].Request.Dispose() }
+            }
+        }
+        finally { $client.Dispose(); $handler.Dispose() }
+    }
+    foreach ($key in $pending.Keys) { [Console]::Error.WriteLine("Warning: giving up on avatar for @$key ($($pending[$key]))") }
+    return $result
+}
+
 # Protect a checkpoint from advancing past too many channels that were not
 # successfully checked. "All" only applies when at least one channel was listed.
 function Test-ShouldSkipCheckpoint {
@@ -988,7 +1059,7 @@ function Test-ShouldScanHtmlChannel {
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
-    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll)
+    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll, [switch]$Incremental)
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
@@ -1004,7 +1075,9 @@ function New-VideoHtml {
         $downloaded[([string]$item.channel_id + "`t" + [string]$item.video_id + "`t" + [string]$item.target)] = $true
     }
     $channelIdCache = Read-ChannelIdCache
+    $videoCache = if ($Incremental) { Read-HtmlVideoCache } else { @{} }
     $htmlChannelIds = @{}
+    $scanCutoffs = @{}
     $restoredSelections = 0
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
@@ -1019,7 +1092,8 @@ function New-VideoHtml {
         if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
         if (-not $seenChannels.Add($channel)) { continue }
-        if (-not (Test-ShouldScanHtmlChannel -Record $ChannelStatus[$channel] -RefreshAll:$RefreshAll)) {
+        if (-not ($Incremental -and $null -eq $videoCache[$channel]) -and
+            -not (Test-ShouldScanHtmlChannel -Record $ChannelStatus[$channel] -RefreshAll:$RefreshAll)) {
             Write-Host "Skipping @$channel (latest video is 1.5 months old or older, or unknown)"
             continue
         }
@@ -1029,6 +1103,15 @@ function New-VideoHtml {
             if ($resolved.Id -eq '') { $failures++; continue }
             $htmlChannelIds[$channel] = $resolved.Id
         }
+        $channelCutoff = [long]$scanCutoffSec
+        if ($Incremental -and $null -ne $videoCache[$channel]) {
+            [long]$cachedCheckedMs = 0
+            if ([long]::TryParse([string]$videoCache[$channel].checked_ms, [ref]$cachedCheckedMs) -and $cachedCheckedMs -gt 0) {
+                $cachedCheckedSec = [Math]::Floor($cachedCheckedMs / 1000)
+                $channelCutoff = [Math]::Max($channelCutoff, $cachedCheckedSec - ($cachedCheckedSec % 86400) - 86400)
+            }
+        }
+        $scanCutoffs[$channel] = $channelCutoff
         [void]$channels.Add($channel)
     }
     $scanResults = New-Object object[] $channels.Count
@@ -1048,13 +1131,14 @@ function New-VideoHtml {
                 $slot = $freeSlots.Dequeue()
                 $channel = [string]$channels[$nextIndex]
                 $channelUrl = Get-ChannelUrl $channel
+                $channelScanCutoff = [long]$scanCutoffs[$channel]
                 Write-Host "Checking @$channel..."
                 $arguments = @(
                     '--ignore-config', '--verbose', '--cookies', ([string]$scanCookieFiles[$slot]),
                     '--flat-playlist', '--lazy-playlist', '--extractor-args', 'youtubetab:approximate_date',
                     '--socket-timeout', $ytDlpTimeoutSec,
                     '--retries', $ytDlpAttempts, '--extractor-retries', $ytDlpAttempts,
-                    '--skip-download', '--break-match-filters', "timestamp >= $scanCutoffSec", '--print',
+                    '--skip-download', '--break-match-filters', "timestamp >= $channelScanCutoff", '--print',
                     ("scan:%(id)s`t%(webpage_url)s`t%(title)s`t%(timestamp)s`t%(availability)s"), $channelUrl)
                 [void]$workers.Add((Start-HtmlScanWorker -Executable $exe -Arguments $arguments `
                     -Channel $channel -Index $nextIndex -Slot $slot))
@@ -1089,6 +1173,43 @@ function New-VideoHtml {
         # midnight UTC on the day before the checkpoint date and keep the overlap
         # rather than resolving watch pages; this favors coverage over precision.
         $scan = $scanResults[$index]
+        $scanSucceeded = $scan.ExitCode -in @(0, 101)
+        if ($Incremental) {
+            $merged = @{}
+            $priorRecord = $videoCache[$channel]
+            if ($null -ne $priorRecord) {
+                foreach ($entry in @($priorRecord.entries)) {
+                    if ($null -ne $entry -and [string]$entry.id -ne '') { $merged[[string]$entry.id] = $entry }
+                }
+            }
+            if ($scanSucceeded) {
+                foreach ($scanRow in @($scan.Output)) {
+                    $parts = [regex]::Split([string]$scanRow, "`t", 5)
+                    if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:')) { continue }
+                    [long]$entryMs = 0
+                    if (-not [long]::TryParse($parts[3], [ref]$entryMs)) { continue }
+                    if ($entryMs -lt 100000000000) { $entryMs *= 1000 }
+                    $entryId = $parts[0].Substring(5)
+                    $merged[$entryId] = [pscustomobject]@{ id=$entryId; url=$parts[1]; title=$parts[2]; timestamp_ms=$entryMs; availability=$parts[4] }
+                }
+            }
+            else {
+                [Console]::Error.WriteLine("Warning: could not incrementally scan the videos tab for @$channel; using cached entries")
+                $failures++
+            }
+            $cacheCheckedMs = if ($scanSucceeded) { $checkBatchMs } elseif ($null -ne $priorRecord) { [long]$priorRecord.checked_ms } else { [long]0 }
+            $keptEntries = @($merged.Values | Where-Object { [long]$_.timestamp_ms -ge ($scanCutoffSec * 1000L) } | Sort-Object {[long]$_.timestamp_ms} -Descending)
+            $videoCache[$channel] = [pscustomobject]@{
+                channel_id = [string]$htmlChannelIds[$channel]
+                checked_ms = $cacheCheckedMs
+                entries = $keptEntries
+            }
+            $cachedRows = @()
+            foreach ($entry in $keptEntries) {
+                $cachedRows += "scan:$([string]$entry.id)`t$([string]$entry.url)`t$([string]$entry.title)`t$([long]$entry.timestamp_ms)`t$([string]$entry.availability)"
+            }
+            $scan = @{ Output = $cachedRows; ExitCode = 0 }
+        }
         if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
         $rows = New-Object System.Collections.ArrayList
         foreach ($scanRow in @($scan.Output)) {
@@ -1125,13 +1246,16 @@ function New-VideoHtml {
             $qualifiedCount++
         }
         Write-Host "@${channel}: $qualifiedCount visible video(s) in the checkpoint overlap"
-        Record-ChannelCheck $ChannelStatus $channel $newest $checkBatchMs -PreserveLatestWhenUnknown
+        if (-not $Incremental -or $scanSucceeded) {
+            Record-ChannelCheck $ChannelStatus $channel $newest $checkBatchMs -PreserveLatestWhenUnknown
+        }
         if ($cards.Length -gt 0) {
             [void]$sb.AppendLine('<section class="channel"><div class="channel-title"><h2>' + [System.Net.WebUtility]::HtmlEncode($channel) + '</h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">')
             [void]$sb.Append($cards.ToString())
             [void]$sb.AppendLine('</div></section>')
         }
     }
+    if ($Incremental) { Save-HtmlVideoCache $videoCache }
     [void]$sb.AppendLine('<section class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><div class="controls"><input id="channel-add" placeholder="@channel or UC channel id"><button id="channel-add-button" type="button">add</button></div><table class="channel-table"><thead><tr><th>Profile</th><th>Channel</th><th>Last checked</th><th>Latest video</th><th></th></tr></thead><tbody>')
     $managedChannels = @()
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
@@ -1139,12 +1263,13 @@ function New-VideoHtml {
         if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
         $key = $channel.TrimStart('@'); $record = $ChannelStatus[$key]; $managedChannels += [pscustomobject]@{ Channel=$channel; Key=$key; Checked=if($null -ne $record){[long]$record.checked_ms}else{0}; Latest=if($null -ne $record){[long]$record.latest_video_ms}else{0}; Thumbnail=if($null -ne $record -and $null -ne $record.PSObject.Properties['thumbnail']){[string]$record.thumbnail}else{''} }
     }
+    $fetchedAvatars = Get-ChannelThumbnailsConcurrent @($managedChannels | Where-Object { $_.Thumbnail -eq '' })
     foreach ($entry in @($managedChannels | Sort-Object @{Expression={[long]$_.Checked};Descending=$true}, @{Expression={[long]$_.Latest};Descending=$true})) {
         $checkedText = if ($entry.Checked) { Format-RelativeVideoTime $entry.Checked } else { 'never' }
         $latestText = if ($entry.Latest) { Format-RelativeVideoTime $entry.Latest } else { 'unknown' }
         $channelUrl = Get-ChannelUrl $entry.Key
         if ($entry.Thumbnail -eq '') {
-            $entry.Thumbnail = Get-ChannelThumbnail $channelUrl
+            if ($fetchedAvatars.ContainsKey($entry.Key)) { $entry.Thumbnail = $fetchedAvatars[$entry.Key] }
             if ($entry.Thumbnail -ne '') {
                 if ($null -eq $ChannelStatus[$entry.Key]) {
                     $ChannelStatus[$entry.Key] = [pscustomobject]@{
@@ -1322,7 +1447,7 @@ function Send-CallbackResponse {
 }
 
 function Invoke-HtmlCallbackServer {
-    param([string]$Token, [string]$CallbackUrl, [hashtable]$ChannelStatus)
+    param([string]$Token, [string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$Incremental)
 
     $listener = New-Object System.Net.HttpListener
     $listener.Prefixes.Add('http://127.0.0.1:8080/')
@@ -1416,7 +1541,7 @@ function Invoke-HtmlCallbackServer {
                 # newer on-disk values with stale in-memory channel records.
                 $diskStatus = Read-ChannelCheckStatus
                 foreach ($key in $diskStatus.Keys) { $ChannelStatus[$key] = $diskStatus[$key] }
-                if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus -RefreshAll:$refreshAll)) {
+                if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus -RefreshAll:$refreshAll -Incremental:$Incremental)) {
                     [Console]::Error.WriteLine('Warning: could not refresh the page; keeping the previous page.')
                 }
                 # Heartbeats cannot be accepted while the single-threaded server
@@ -1561,12 +1686,13 @@ $openChannelCount = 0
 $checkpointAfterChecksMs = [long]0
 $channelCheckStatus = Read-ChannelCheckStatus
 if ($OpenMode -ne '') {
-    if ($OpenMode -eq 'html') {
+    if ($OpenMode -in @('html', 'html2')) {
+        $incrementalHtml = $OpenMode -eq 'html2'
         $token = [guid]::NewGuid().ToString('N')
         $callbackUrl = 'http://127.0.0.1:8080/download/' + $token
-        if (-not (New-VideoHtml -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus)) { $openFailures = 1 }
+        if (-not (New-VideoHtml -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
         if ($openFailures -eq 0) { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
-        if ($openFailures -eq 0 -and -not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus)) { $openFailures = 1 }
+        if ($openFailures -eq 0 -and -not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
         if ($htmlFailureCount -gt 0) { $openFailures = 1 }
     }
     else {
