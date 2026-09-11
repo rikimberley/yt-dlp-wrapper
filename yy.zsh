@@ -5,7 +5,8 @@
 # Description:
 # - stores a positional URL into ./current_url.txt and downloads it
 # - uses -t <temp_url> to download a one-off URL without persisting it
-# - uses -p <path> to override the default ./t download directory
+# - uses -p <path> to override the default download directory; without -p, a
+#   youtube.com/@<channel-id> URL downloads to ./<channel-id>, otherwise ./t
 # - uses -U to update ./yt-dlp and refresh this script from the head of master
 #   on GitHub, then skip any download
 # - uses -o to open the channels in ./channel-ids.txt that published a public
@@ -58,6 +59,7 @@ script_raw_base="https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/ma
 current_url=""
 temp_url=""
 output_path="./t"
+output_path_passed=0
 do_update=0
 open_mode=""
 set_checkpoint=0
@@ -809,6 +811,7 @@ while (( $# > 0 )); do
         exit 1
       fi
       output_path=$1
+      output_path_passed=1
       ;;
     -U)
       do_update=1
@@ -861,6 +864,11 @@ fi
 run_url=$current_url
 if [[ -n "$temp_url" ]]; then
   run_url=$temp_url
+fi
+
+if (( ! output_path_passed )) &&
+    [[ "$run_url" =~ ^https?://([^/]+\.)?youtube\.com/@([^/?#]+) ]]; then
+  output_path="./${match[2]}"
 fi
 
 if (( do_update )); then
