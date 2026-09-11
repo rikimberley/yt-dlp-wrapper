@@ -61,7 +61,7 @@ re-exporting.
 | *(no args)* | Re-download the URL in `current_url.txt` |
 | `-t <url>` | Download this URL once, without persisting it |
 | `-U` | Self-update the binary *and* this wrapper from `master`, then exit |
-| `-p <path>` | Download into `<path>` instead of the default `./t` |
+| `-p <path>` | Download into `<path>` instead of the automatic/default path |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
@@ -70,6 +70,10 @@ re-exporting.
 Precedence: `-U`, then `-o`/`-O`, then `-c`, then download. `-o` and `-O` are
 mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
+
+Without `-p`, a download URL containing a YouTube handle path such as
+`https://www.youtube.com/@channel-id/videos` downloads into `./channel-id`.
+Other URLs continue to use `./t`. An explicit `-p` always takes precedence.
 
 `./yy.zsh -o -c` means "open whatever is new, then mark everything as seen".
 The checkpoint is not updated if at least three channel checks fail, or if all

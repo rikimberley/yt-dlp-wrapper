@@ -5,7 +5,8 @@
 # Description:
 # - stores a positional URL into ./current_url.txt and downloads it
 # - uses -t <temp_url> to download a one-off URL without persisting it
-# - uses -p <path> to override the default ./t download directory
+# - uses -p <path> to override the default download directory; without -p, a
+#   youtube.com/@<channel-id> URL downloads to ./<channel-id>, otherwise ./t
 # - uses -U to update ./yt-dlp and refresh this script from the head of master
 #   on GitHub, then skip any download
 # - uses -o to open the channels in ./channel-ids.txt that published a public
@@ -95,6 +96,7 @@ $scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/m
 $Url = ''
 $TempUrl = ''
 $OutputPath = './t'
+$OutputPathPassed = $false
 $Update = $false
 $OpenMode = ''
 $HtmlMode = $false
@@ -118,6 +120,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
             exit 1
         }
         $OutputPath = [string]$args[$i]
+        $OutputPathPassed = $true
     }
     elseif ($a -ceq '-U') {
         $Update = $true
@@ -1535,6 +1538,11 @@ elseif (Test-Path -LiteralPath $urlFile) {
 $runUrl = $currentUrl
 if (-not [string]::IsNullOrEmpty($TempUrl)) {
     $runUrl = $TempUrl
+}
+
+if (-not $OutputPathPassed -and
+    $runUrl -match '^https?://(?:[^/]+\.)?youtube\.com/@([^/?#]+)') {
+    $OutputPath = './' + $Matches[1]
 }
 
 if ($Update) {
