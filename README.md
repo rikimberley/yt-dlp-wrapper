@@ -122,6 +122,10 @@ matching local `yy1.ps1 -p "./<channel-entry>" -t "<url>"` / `yy2.ps1 -p "./<cha
 the page wait for downloads to finish; it reports queued, running, completed,
 and failed job counts plus recent yy/yt-dlp output in the page and the wrapper
 console. Jobs run sequentially: all y2 selections first, then y1 selections.
+Download output keeps lifecycle messages, warnings, errors, and completion
+lines, while repetitive yt-dlp percentage updates are reduced to one snapshot
+per 10 percentage points for each transferred format. The browser displays the
+last 80 retained log entries and refreshes that view once per second.
 Use `STOP SERVER` in the page, or Ctrl+C in the wrapper console, to end the
 loopback server; the button attempts to close its page (and falls back to a
 blank page when the browser disallows programmatic closing). Closing the page
@@ -160,7 +164,8 @@ account-visible videos omitted by the public feed are eventually recovered.
 
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
-boxes; none clears both destinations' boxes in its scope.
+boxes; none clears both destinations' boxes in its scope. Each underlined
+channel heading links to that channel's YouTube `/videos` page.
 
 Each displayed video must itself be newer than `checkpoint.txt`. HTML download
 jobs use the normalized entry from `channel-ids.txt` as their relative output
