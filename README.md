@@ -150,6 +150,14 @@ with cached cards; failed scans retain cached cards. `REFRESH` retains the
 the same incremental boundary. Missing channel avatars are fetched concurrently
 and retained in `channel-check-status.json`.
 
+Cached `--html2` channels that completed a yt-dlp scan within the last 24 hours
+are first checked through their public Atom feeds concurrently.
+An unchanged feed reuses the cached cards without starting yt-dlp. A newer feed,
+an empty or malformed response, or any exhausted fetch failure falls back to the
+normal cookie-backed yt-dlp scan. At least once every 24 hours each eligible
+channel receives a full yt-dlp scan even when its feed appears unchanged, so
+account-visible videos omitted by the public feed are eventually recovered.
+
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
 boxes; none clears both destinations' boxes in its scope.

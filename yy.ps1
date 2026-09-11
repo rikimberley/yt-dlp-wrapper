@@ -90,6 +90,7 @@ $ytDlpDeadlineSec = 30
 $MAX_THREADS = 16
 $htmlHeartbeatTimeoutSec = 300
 $feedFailureLimit = 3
+$htmlFullScanIntervalMs = 24L * 60L * 60L * 1000L
 $feedFetchFailures = 0
 $skipFeedFetches = $false
 $feedFetchFailed = $false
@@ -1034,6 +1035,81 @@ function Get-ChannelThumbnailsConcurrent {
     return $result
 }
 
+# Fetch the Atom feeds for cached --html2 channels concurrently. A result is
+# returned only for a usable feed with at least one parseable <published> value.
+# Anything else is deliberately absent from the result so the caller falls back
+# to yt-dlp. Once three feeds exhaust their retries, pending feeds are abandoned
+# as a likely service-wide failure; yt-dlp remains the safe path.
+function Get-HtmlFeedNewestConcurrent {
+    param([hashtable]$ChannelIds)
+    $result = @{}
+    $pending = @{}
+    foreach ($key in $ChannelIds.Keys) {
+        $pending[[string]$key] = 'https://www.youtube.com/feeds/videos.xml?channel_id=' + [string]$ChannelIds[$key]
+    }
+    if ($pending.Count -eq 0) { return $result }
+    Add-Type -AssemblyName System.Net.Http
+    for ($attempt = 1; $attempt -le $fetchAttempts -and $pending.Count -gt 0; $attempt++) {
+        if ($attempt -gt 1) { Start-Sleep -Seconds ($attempt - 1) }
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AutomaticDecompression = ([System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate)
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds($fetchTimeoutSec)
+        $requests = @{}
+        try {
+            foreach ($key in @($pending.Keys)) {
+                $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $pending[$key])
+                [void]$request.Headers.TryAddWithoutValidation('User-Agent', $userAgent)
+                [void]$request.Headers.TryAddWithoutValidation('Accept-Language', $acceptLanguage)
+                $requests[$key] = [pscustomobject]@{ Request=$request; Task=$client.SendAsync($request) }
+            }
+            try { [System.Threading.Tasks.Task]::WaitAll(@($requests.Values | ForEach-Object { $_.Task })) } catch { }
+            foreach ($key in @($requests.Keys)) {
+                try {
+                    $response = $requests[$key].Task.GetAwaiter().GetResult()
+                    try {
+                        if (-not $response.IsSuccessStatusCode) {
+                            $statusCode = [int]$response.StatusCode
+                            if ($statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -notin @(408, 429)) {
+                                [Console]::Error.WriteLine("Warning: video feed for @$key returned HTTP $statusCode; using yt-dlp")
+                                [void]$pending.Remove($key)
+                            }
+                            else { throw "HTTP $statusCode" }
+                            continue
+                        }
+                        $feed = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                        $document = New-Object System.Xml.XmlDocument
+                        $document.PreserveWhitespace = $false
+                        $document.LoadXml($feed)
+                        $publishedNodes = @($document.SelectNodes("/*[local-name()='feed']/*[local-name()='entry']/*[local-name()='published']"))
+                        $newest = [long]0
+                        foreach ($node in $publishedNodes) {
+                            $epochMs = ConvertTo-EpochMs $node.InnerText
+                            if ($null -ne $epochMs -and $epochMs -gt $newest) { $newest = $epochMs }
+                        }
+                        if ($publishedNodes.Count -gt 0 -and $newest -gt 0) { $result[$key] = $newest }
+                        else { [Console]::Error.WriteLine("Warning: unusable video feed for @$key; using yt-dlp") }
+                        [void]$pending.Remove($key)
+                    }
+                    finally { $response.Dispose() }
+                }
+                catch {
+                    [Console]::Error.WriteLine("Warning: feed preflight for @$key failed (attempt $attempt/$fetchAttempts): $($_.Exception.Message)")
+                }
+                finally { $requests[$key].Request.Dispose() }
+            }
+        }
+        finally { $client.Dispose(); $handler.Dispose() }
+    }
+    if ($pending.Count -ge $feedFailureLimit) {
+        [Console]::Error.WriteLine("Warning: $($pending.Count) video feeds exhausted retries; treating the feed service as unreliable and using yt-dlp")
+    }
+    foreach ($key in $pending.Keys) {
+        [Console]::Error.WriteLine("Warning: giving up on video feed for @$key; using yt-dlp")
+    }
+    return $result
+}
+
 # Protect a checkpoint from advancing past too many channels that were not
 # successfully checked. "All" only applies when at least one channel was listed.
 function Test-ShouldSkipCheckpoint {
@@ -1078,6 +1154,7 @@ function New-VideoHtml {
     $videoCache = if ($Incremental) { Read-HtmlVideoCache } else { @{} }
     $htmlChannelIds = @{}
     $scanCutoffs = @{}
+    $lastFullScans = @{}
     $restoredSelections = 0
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
@@ -1105,14 +1182,53 @@ function New-VideoHtml {
         }
         $channelCutoff = [long]$scanCutoffSec
         if ($Incremental -and $null -ne $videoCache[$channel]) {
-            [long]$cachedCheckedMs = 0
-            if ([long]::TryParse([string]$videoCache[$channel].checked_ms, [ref]$cachedCheckedMs) -and $cachedCheckedMs -gt 0) {
-                $cachedCheckedSec = [Math]::Floor($cachedCheckedMs / 1000)
-                $channelCutoff = [Math]::Max($channelCutoff, $cachedCheckedSec - ($cachedCheckedSec % 86400) - 86400)
+            [long]$lastFullScanMs = 0
+            if ($null -ne $videoCache[$channel].PSObject.Properties['last_full_scan_ms']) {
+                [void][long]::TryParse([string]$videoCache[$channel].last_full_scan_ms, [ref]$lastFullScanMs)
+            }
+            if ($lastFullScanMs -le 0) {
+                [void][long]::TryParse([string]$videoCache[$channel].checked_ms, [ref]$lastFullScanMs)
+            }
+            $lastFullScans[$channel] = $lastFullScanMs
+            if ($lastFullScanMs -gt 0) {
+                $lastFullScanSec = [Math]::Floor($lastFullScanMs / 1000)
+                $channelCutoff = [Math]::Max($channelCutoff, $lastFullScanSec - ($lastFullScanSec % 86400) - 86400)
             }
         }
         $scanCutoffs[$channel] = $channelCutoff
         [void]$channels.Add($channel)
+    }
+    $skipYtDlp = @{}
+    $observedFeedNewest = @{}
+    if ($Incremental) {
+        $feedCandidates = @{}
+        foreach ($channel in $channels) {
+            $priorRecord = $videoCache[[string]$channel]
+            [long]$lastFullScanMs = if ($lastFullScans.ContainsKey([string]$channel)) { $lastFullScans[[string]$channel] } else { 0 }
+            if ($null -ne $priorRecord -and $lastFullScanMs -gt 0 -and ($checkBatchMs - $lastFullScanMs) -lt $htmlFullScanIntervalMs) {
+                $feedCandidates[[string]$channel] = [string]$htmlChannelIds[[string]$channel]
+            }
+        }
+        $feedNewest = Get-HtmlFeedNewestConcurrent $feedCandidates
+        foreach ($channel in $feedCandidates.Keys) {
+            if (-not $feedNewest.ContainsKey($channel)) { continue }
+            [long]$newestFeedMs = $feedNewest[$channel]
+            $observedFeedNewest[$channel] = $newestFeedMs
+            [long]$knownNewestMs = [long]$scanCutoffSec * 1000L
+            $priorRecord = $videoCache[$channel]
+            if ($null -ne $priorRecord.PSObject.Properties['feed_newest_ms']) {
+                [long]$priorFeedMs = 0
+                if ([long]::TryParse([string]$priorRecord.feed_newest_ms, [ref]$priorFeedMs) -and $priorFeedMs -gt $knownNewestMs) { $knownNewestMs = $priorFeedMs }
+            }
+            foreach ($entry in @($priorRecord.entries)) {
+                [long]$entryMs = 0
+                if ([long]::TryParse([string]$entry.timestamp_ms, [ref]$entryMs) -and $entryMs -gt $knownNewestMs) { $knownNewestMs = $entryMs }
+            }
+            if ($newestFeedMs -le $knownNewestMs) {
+                $skipYtDlp[$channel] = $true
+                Write-Host "@${channel}: public feed unchanged; reusing cached cards"
+            }
+        }
     }
     $scanResults = New-Object object[] $channels.Count
     $workers = New-Object System.Collections.ArrayList
@@ -1130,6 +1246,12 @@ function New-VideoHtml {
             while ($nextIndex -lt $channels.Count -and $freeSlots.Count -gt 0) {
                 $slot = $freeSlots.Dequeue()
                 $channel = [string]$channels[$nextIndex]
+                if ($skipYtDlp.ContainsKey($channel)) {
+                    $scanResults[$nextIndex] = @{ Output=@(); ExitCode=0; FeedOnly=$true }
+                    $freeSlots.Enqueue($slot)
+                    $nextIndex++
+                    continue
+                }
                 $channelUrl = Get-ChannelUrl $channel
                 $channelScanCutoff = [long]$scanCutoffs[$channel]
                 Write-Host "Checking @$channel..."
@@ -1174,6 +1296,8 @@ function New-VideoHtml {
         # rather than resolving watch pages; this favors coverage over precision.
         $scan = $scanResults[$index]
         $scanSucceeded = $scan.ExitCode -in @(0, 101)
+        $feedOnly = $Incremental -and $scan.ContainsKey('FeedOnly') -and [bool]$scan.FeedOnly
+        $fullScanSucceeded = $scanSucceeded -and -not $feedOnly
         if ($Incremental) {
             $merged = @{}
             $priorRecord = $videoCache[$channel]
@@ -1198,10 +1322,16 @@ function New-VideoHtml {
                 $failures++
             }
             $cacheCheckedMs = if ($scanSucceeded) { $checkBatchMs } elseif ($null -ne $priorRecord) { [long]$priorRecord.checked_ms } else { [long]0 }
+            $lastFullScanMs = if ($fullScanSucceeded) { $checkBatchMs } elseif ($lastFullScans.ContainsKey($channel)) { [long]$lastFullScans[$channel] } else { [long]0 }
+            [long]$cacheFeedNewestMs = 0
+            if ($scanSucceeded -and $observedFeedNewest.ContainsKey($channel)) { $cacheFeedNewestMs = [long]$observedFeedNewest[$channel] }
+            elseif ($null -ne $priorRecord -and $null -ne $priorRecord.PSObject.Properties['feed_newest_ms']) { [void][long]::TryParse([string]$priorRecord.feed_newest_ms, [ref]$cacheFeedNewestMs) }
             $keptEntries = @($merged.Values | Where-Object { [long]$_.timestamp_ms -ge ($scanCutoffSec * 1000L) } | Sort-Object {[long]$_.timestamp_ms} -Descending)
             $videoCache[$channel] = [pscustomobject]@{
                 channel_id = [string]$htmlChannelIds[$channel]
                 checked_ms = $cacheCheckedMs
+                last_full_scan_ms = $lastFullScanMs
+                feed_newest_ms = $cacheFeedNewestMs
                 entries = $keptEntries
             }
             $cachedRows = @()
