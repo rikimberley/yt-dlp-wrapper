@@ -46,6 +46,7 @@ channel-ids.txt
 *.new.*
 *.bak
 yy.html
+yy-html3-*.json
 yt-dlp.*.stdout
 yt-dlp.*.stderr
 

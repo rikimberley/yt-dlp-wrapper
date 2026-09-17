@@ -53,6 +53,9 @@ re-exporting.
 
 ```
 ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2] [-c]
+
+# PowerShell also supports --html3.
+./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [-c]
 ```
 
 | Flag | Effect |
@@ -66,10 +69,11 @@ re-exporting.
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
 | `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
+| `--html3` | **PowerShell only.** Open a loading page immediately, then replace it with the complete `--html2` page when its background scan finishes; REFRESH and REFRESH ALL use the same non-blocking loading transition |
 | `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 
 Precedence: `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
-`-O`, `--html`, and `--html2` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
+`-O`, `--html`, `--html2`, and `--html3` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
 Without `-p`, a download URL containing a YouTube handle path such as
@@ -161,6 +165,15 @@ an empty or malformed response, or any exhausted fetch failure falls back to the
 normal cookie-backed yt-dlp scan. At least once every 24 hours each eligible
 channel receives a full yt-dlp scan even when its feed appears unchanged, so
 account-visible videos omitted by the public feed are eventually recovered.
+
+PowerShell `--html3` leaves `--html` and `--html2` unchanged. It uses the same
+incremental cache, generated controls, callback token, completion history, and
+download-job server as `--html2`; only the page lifecycle differs. The browser
+first receives a lightweight loading page, which polls the loopback server and
+shows completed/total channel scans while a child PowerShell process builds the
+normal `--html2` page. Once complete, the
+loading page reloads into that full page. REFRESH and REFRESH ALL first replace
+the current page with the same loading page, then start a new background build.
 
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's

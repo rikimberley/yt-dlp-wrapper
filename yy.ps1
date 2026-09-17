@@ -16,6 +16,7 @@
 #   skip any download
 # - uses --html to generate a local 6-column video grid with y1/y2 selections
 # - uses --html2 for the same page with persistent incremental scan caching
+# - uses --html3 to open a loading page immediately, then build --html2 content in a worker
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -30,6 +31,7 @@
 #   ./yy.ps1 -O
 #   ./yy.ps1 --html
 #   ./yy.ps1 --html2
+#   ./yy.ps1 --html3
 #   ./yy.ps1 -c
 #   ./yy.ps1 -o -c
 #
@@ -108,6 +110,8 @@ $OpenMode = ''
 $HtmlMode = $false
 $SetCheckpoint = $false
 $htmlFailureCount = 0
+$Html3WorkerToken = ''
+$Html3WorkerRefreshAll = $false
 
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
@@ -133,18 +137,28 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
         if ($OpenMode -ne '' -or $HtmlMode) {
-            [Console]::Error.WriteLine('Error: -o, -O, --html, and --html2 cannot be combined')
+            [Console]::Error.WriteLine('Error: -o, -O, --html, --html2, and --html3 cannot be combined')
             exit 1
         }
         $OpenMode = if ($a -ceq '-o') { 'check' } else { 'open' }
     }
-    elseif ($a -ceq '--html' -or $a -ceq '--html2') {
+    elseif ($a -ceq '--html' -or $a -ceq '--html2' -or $a -ceq '--html3') {
         if ($OpenMode -ne '') {
-            [Console]::Error.WriteLine('Error: -o, -O, --html, and --html2 cannot be combined')
+            [Console]::Error.WriteLine('Error: -o, -O, --html, --html2, and --html3 cannot be combined')
             exit 1
         }
-        $OpenMode = if ($a -ceq '--html2') { 'html2' } else { 'html' }
+        $OpenMode = if ($a -ceq '--html3') { 'html3' } elseif ($a -ceq '--html2') { 'html2' } else { 'html' }
         $HtmlMode = $true
+    }
+    elseif ($a -ceq '--html3-worker') {
+        $i++
+        if ($i -ge $args.Count -or [string]::IsNullOrWhiteSpace([string]$args[$i])) {
+            [Console]::Error.WriteLine('Error: internal html3 worker requires a token')
+            exit 1
+        }
+        $OpenMode = 'html3-worker'
+        $Html3WorkerToken = [string]$args[$i]
+        if (($i + 1) -lt $args.Count -and [string]$args[$i + 1] -ceq '--refresh-all') { $Html3WorkerRefreshAll = $true; $i++ }
     }
     elseif ($a -ceq '-c') {
         $SetCheckpoint = $true
@@ -1136,7 +1150,7 @@ function Test-ShouldScanHtmlChannel {
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
-    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll, [switch]$Incremental)
+    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll, [switch]$Incremental, [string]$ProgressPath)
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
@@ -1232,6 +1246,8 @@ function New-VideoHtml {
         }
     }
     $scanResults = New-Object object[] $channels.Count
+    if ($ProgressPath -ne '') { Write-Html3Progress -Path $ProgressPath -Completed 0 -Total $channels.Count }
+    $completedScans = 0
     $workers = New-Object System.Collections.ArrayList
     $scanCookieFiles = New-Object System.Collections.ArrayList
     $freeSlots = New-Object 'System.Collections.Generic.Queue[int]'
@@ -1275,6 +1291,8 @@ function New-VideoHtml {
                     $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
                     $freeSlots.Enqueue($worker.Slot)
                     $workers.RemoveAt($workerIndex)
+                    $completedScans++
+                    if ($ProgressPath -ne '') { Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count }
                 }
             }
         }
@@ -1595,8 +1613,39 @@ function Send-CallbackResponse {
     Send-CallbackJson $Context $StatusCode @{ message = $Message }
 }
 
+# --html3 deliberately keeps --html2's renderer intact.  It first writes this
+# short shell, then a separate PowerShell process replaces it atomically enough
+# for the browser to reload only after the full renderer has completed.
+function Write-Html3LoadingPage {
+    param([string]$Token, [string]$Message)
+
+    $stateUrl = '/html3/' + $Token
+    $safeMessage = [System.Net.WebUtility]::HtmlEncode($Message)
+    $page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>body{margin:0;padding:16px 60px;background:#0d1117;color:#e6edf3;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif}h1{font-size:32px;border-bottom:3px solid #58a6ff;padding-bottom:8px}.progress{max-width:560px;margin:36px auto;padding:24px;border:1px solid #30363d;border-radius:10px;background:#161b22}.bar{height:8px;background:#58a6ff;animation:pulse 1.2s ease-in-out infinite alternate}@keyframes pulse{from{opacity:.35}to{opacity:1}}#status{color:#8b949e}</style></head><body><h1>YouTube Video Download</h1><div class="progress"><div class="bar"></div><p id="status">' + $safeMessage + '</p></div><script>const state="' + $stateUrl + '";const poll=async()=>{try{const s=await(await fetch(state)).json();document.querySelector("#status").textContent=s.message||"Loading channels...";if(s.done){location.reload();return}}catch{}setTimeout(poll,500)};poll()</script></body></html>'
+    [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'yy.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-Html3Progress {
+    param([string]$Path, [int]$Completed, [int]$Total)
+
+    $temporary = $Path + '.new.' + $PID
+    try {
+        [System.IO.File]::WriteAllText($temporary, (@{completed=$Completed;total=$Total} | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temporary -Destination $Path -Force
+    }
+    finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
+
+function Start-Html3Worker {
+    param([string]$Token, [switch]$RefreshAll)
+
+    $arguments = @('-NoProfile', '-File', $PSCommandPath, '--html3-worker', $Token)
+    if ($RefreshAll) { $arguments += '--refresh-all' }
+    return Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList $arguments -PassThru
+}
+
 function Invoke-HtmlCallbackServer {
-    param([string]$Token, [string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$Incremental)
+    param([string]$Token, [string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$Incremental, [switch]$Html3)
 
     $listener = New-Object System.Net.HttpListener
     $listener.Prefixes.Add('http://127.0.0.1:8080/')
@@ -1605,6 +1654,7 @@ function Invoke-HtmlCallbackServer {
     $lastHeartbeat = [System.DateTime]::UtcNow
     $script:htmlStopRequested = $false
     $script:htmlListener = $listener
+    $html3Worker = $null
     $cancelHandler = [ConsoleCancelEventHandler]{
         param($sender, $event)
         $event.Cancel = $true
@@ -1618,6 +1668,7 @@ function Invoke-HtmlCallbackServer {
     }
     try {
         [Console]::add_CancelKeyPress($cancelHandler)
+        if ($Html3) { $html3Worker = Start-Html3Worker -Token $Token }
         Open-Url 'http://127.0.0.1:8080/'
         Write-Host 'Waiting for DOWNLOAD SELECTED on http://127.0.0.1:8080/ (Ctrl+C or STOP SERVER exits)'
         while ($listener.IsListening -and -not $script:htmlStopRequested) {
@@ -1655,6 +1706,13 @@ function Invoke-HtmlCallbackServer {
                 Send-CallbackJson $context 200 (Get-DownloadJobStatus $jobs $serverLogs)
                 continue
             }
+            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token") {
+                $done = $null -ne $html3Worker -and $html3Worker.HasExited
+                $progressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')
+                $message = if ($done) { 'Page ready.' } elseif (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json; "Loading channels: $($progress.completed) / $($progress.total)" } catch { 'Loading channels...' } } else { 'Preparing channels...' }
+                Send-CallbackJson $context 200 @{ done=$done; message=$message }
+                continue
+            }
             if ($context.Request.HttpMethod -eq 'OPTIONS' -and $context.Request.Url.AbsolutePath -in @("/download/$Token", "/stop/$Token")) {
                 $context.Response.StatusCode = 204
                 $context.Response.Headers['Access-Control-Allow-Origin'] = '*'
@@ -1680,6 +1738,13 @@ function Invoke-HtmlCallbackServer {
             }
             if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -in @("/refresh/$Token", "/refresh-all/$Token")) {
                 $refreshAll = $context.Request.Url.AbsolutePath -eq "/refresh-all/$Token"
+                if ($Html3) {
+                    if ($null -ne $html3Worker -and -not $html3Worker.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
+                    Write-Html3LoadingPage -Token $Token -Message $(if ($refreshAll) { 'Refreshing all channels...' } else { 'Refreshing channels...' })
+                    $html3Worker = Start-Html3Worker -Token $Token -RefreshAll:$refreshAll
+                    Send-CallbackResponse $context 202 'Refreshing page.'
+                    continue
+                }
                 Write-Host $(if ($refreshAll) { 'Refreshing HTML page from all channels in channel-ids.txt...' } else { 'Refreshing HTML page from recent channels in channel-ids.txt...' })
                 # Reply before the potentially long channel scan. The browser
                 # immediately queues a reload, which this single-threaded server
@@ -1834,14 +1899,28 @@ $openFailures = 0
 $openChannelCount = 0
 $checkpointAfterChecksMs = [long]0
 $channelCheckStatus = Read-ChannelCheckStatus
+if ($OpenMode -eq 'html3-worker') {
+    $workerCallbackUrl = 'http://127.0.0.1:8080/download/' + $Html3WorkerToken
+    $workerStatus = Read-ChannelCheckStatus
+    $workerProgressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Html3WorkerToken + '.json')
+    if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath)) { exit 1 }
+    if ($htmlFailureCount -gt 0) { exit 1 }
+    exit 0
+}
 if ($OpenMode -ne '') {
-    if ($OpenMode -in @('html', 'html2')) {
-        $incrementalHtml = $OpenMode -eq 'html2'
+    if ($OpenMode -in @('html', 'html2', 'html3')) {
+        $incrementalHtml = $OpenMode -in @('html2', 'html3')
         $token = [guid]::NewGuid().ToString('N')
         $callbackUrl = 'http://127.0.0.1:8080/download/' + $token
-        if (-not (New-VideoHtml -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
+        if ($OpenMode -eq 'html3') {
+            Write-Html3LoadingPage -Token $token -Message 'Loading channels...'
+            if (-not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental -Html3)) { $openFailures = 1 }
+        }
+        else {
+            if (-not (New-VideoHtml -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
+            if ($openFailures -eq 0 -and -not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
+        }
         if ($openFailures -eq 0) { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
-        if ($openFailures -eq 0 -and -not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
         if ($htmlFailureCount -gt 0) { $openFailures = 1 }
     }
     else {
