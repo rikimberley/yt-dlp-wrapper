@@ -57,6 +57,15 @@ t/
 UC*/
 
 # ---------------------------------------------------------------------------
+# Agent instructions — local to this machine, not part of the public repo.
+# AGENTS.md describes the maintainer's corporate-managed setup (SSH key names,
+# account names, internal go-links), which does not belong in a public repo.
+# It was tracked previously, so untracking it only removes it from the tip;
+# the old blobs stay reachable by SHA until GitHub GCs them.
+# ---------------------------------------------------------------------------
+AGENTS.md
+
+# ---------------------------------------------------------------------------
 # OS / editor noise
 # ---------------------------------------------------------------------------
 .DS_Store
