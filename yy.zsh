@@ -40,6 +40,7 @@ url_file="./current_url.txt"
 channels_file="./channel-ids.txt"
 channel_id_cache_file="./channel-id-cache.txt"
 checkpoint_file="./checkpoint.txt"
+cookies_file="./cookies.txt"
 user_agent="Mozilla/5.0"
 # Pre-accepted consent cookies: without them YouTube can answer a channel page
 # with a consent interstitial that carries no channel_id, which looked exactly
@@ -113,15 +114,24 @@ iso_to_epoch_ms() {
 }
 
 # Read ./checkpoint.txt and normalise it to epoch milliseconds.
+# A missing or empty checkpoint file is not an error: it means "nothing has
+# been seen yet", so it reads as 0 and every video counts as new. Only a file
+# that exists and holds something unusable is treated as corruption.
 read_checkpoint_ms() {
   local raw digits
   if [[ ! -f "$checkpoint_file" ]]; then
-    printf 'Error: %s does not exist\n' "$checkpoint_file" >&2
-    return 1
+    printf 'Warning: %s does not exist; continuing with no checkpoint (0)\n' "$checkpoint_file" >&2
+    print -r -- 0
+    return 0
   fi
   IFS= read -r raw < "$checkpoint_file" || raw=""
   digits=${raw//[^0-9]/}
   if [[ -z "$digits" ]]; then
+    if [[ -z "${raw//[[:space:]]/}" ]]; then
+      printf 'Warning: %s is empty; continuing with no checkpoint (0)\n' "$checkpoint_file" >&2
+      print -r -- 0
+      return 0
+    fi
     printf 'Error: %s does not contain an epoch timestamp\n' "$checkpoint_file" >&2
     return 1
   fi
@@ -442,7 +452,7 @@ format_relative_ms() {
 # socket timeout does not cover every extractor subprocess on every platform.
 ytdlp_output=""
 run_ytdlp_metadata() {
-  local tmp pid waited=0 status=0 deadline=$ytdlp_deadline_sec show_progress=0 progress_label="yt-dlp"
+  local tmp pid waited=0 rc=0 deadline=$ytdlp_deadline_sec show_progress=0 progress_label="yt-dlp"
   while [[ "${1:-}" == --* ]]; do
     case "$1" in
       --no-deadline) deadline=0; shift ;;
@@ -478,10 +488,10 @@ run_ytdlp_metadata() {
       printf '[%s] Still running yt-dlp... %s seconds elapsed\n' "$progress_label" "$waited"
     fi
   done
-  wait "$pid" || status=$?
+  wait "$pid" || rc=$?
   ytdlp_output=$(<"$tmp")
   rm -f -- "$tmp"
-  return "$status"
+  return "$rc"
 }
 
 # Fall back to the newest few entries in the channel's uploads playlist when
@@ -489,7 +499,7 @@ run_ytdlp_metadata() {
 # yt-dlp can provide exact timestamps and public availability. No cookies are
 # sent. Prints -1 when the fallback failed and 0 when no public entry was seen.
 ytdlp_newest_public_ms() {
-  local channel_id=$1 exe uploads_id uploads_url out status=0 line timestamp newest=0
+  local channel_id=$1 exe uploads_id uploads_url out rc=0 line timestamp newest=0
   exe=$(ytdlp_path) || {
     printf 'Warning: yt-dlp binary not found for uploads fallback for %s\n' "$channel_id" >&2
     print -r -- -1
@@ -500,7 +510,7 @@ ytdlp_newest_public_ms() {
   run_ytdlp_metadata "$exe" --ignore-config --no-warnings --socket-timeout "$ytdlp_timeout_sec" \
     --retries "$ytdlp_attempts" --extractor-retries "$ytdlp_attempts" --skip-download \
     --playlist-items '1:5' --print 'fallback:%(timestamp)s:%(availability)s' \
-    "$uploads_url" || status=$?
+    "$uploads_url" || rc=$?
   out=$ytdlp_output
   for line in ${(f)out}; do
     if [[ "$line" =~ ^fallback:([0-9]+):public$ ]]; then
@@ -511,7 +521,7 @@ ytdlp_newest_public_ms() {
   done
   if (( newest > 0 )); then
     print -r -- "$newest"
-  elif (( status != 0 )); then
+  elif (( rc != 0 )); then
     printf 'Warning: yt-dlp uploads fallback failed for %s (%s)\n' \
       "$channel_id" "$uploads_url" >&2
     print -r -- -1
@@ -670,7 +680,7 @@ html_escape() {
 # Scan one channel in an isolated subshell. Each worker owns one channel and
 # writes to index-specific files, so concurrent scans never share mutable state.
 html_scan_channel() {
-  local index=$1 channel=$2 channel_url=$3 exe=$4 scan_cutoff_sec=$5 result_dir=$6 cookie_file=$7 status=0
+  local index=$1 channel=$2 channel_url=$3 exe=$4 scan_cutoff_sec=$5 result_dir=$6 cookie_file=$7 rc=0
   run_ytdlp_metadata --no-deadline --show-progress "@$channel scan" "$exe" --ignore-config --verbose \
     --cookies "$cookie_file" --flat-playlist --lazy-playlist \
     --extractor-args 'youtubetab:approximate_date' \
@@ -678,9 +688,9 @@ html_scan_channel() {
     --extractor-retries "$ytdlp_attempts" --skip-download \
     --break-match-filters "timestamp >= ${scan_cutoff_sec}" \
     --print 'scan:%(id)s\t%(webpage_url)s\t%(title)s\t%(timestamp)s\t%(availability)s' \
-    "$channel_url" || status=$?
+    "$channel_url" || rc=$?
   print -rn -- "$ytdlp_output" >| "$result_dir/$index.out"
-  print -r -- "$status" >| "$result_dir/$index.status"
+  print -r -- "$rc" >| "$result_dir/$index.status"
 }
 
 # Build a local page from qualifying account-visible entries on each /videos tab.
@@ -688,7 +698,7 @@ html_scan_channel() {
 # execute host commands, so the button downloads a script containing yy1/yy2
 # commands for the selected videos.
 generate_html() {
-  local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec status qualified_count failures=0 cards result_dir
+  local line channel channel_url exe output id url thumb title timestamp availability video_ms checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec scan_status qualified_count failures=0 cards result_dir
   local index next_index pid completed slot position cookie_file cache_kind cache_channel cache_id cache_url cache_title cache_timestamp cache_availability
   local channel_scan_cutoff checked_sec cached_cutoff cache_tmp merged_output entry_id entry_timestamp _entry_id _entry_url _entry_title _entry_availability
   local now_ms last_full_ms feed_newest_ms_value feed_state known_newest_ms cached_entry_line html_feed_failures=0 html_skip_feeds=0 feed_index _feed_value
@@ -697,6 +707,10 @@ generate_html() {
   local tmp="${html_file}.new.$$"
   exe=$(ytdlp_path) || { printf 'Error: yt-dlp binary not found next to this script\n' >&2; return 1; }
   [[ -f "$channels_file" ]] || { printf 'Error: %s does not exist\n' "$channels_file" >&2; return 1; }
+  [[ -f "$cookies_file" ]] || {
+    printf 'Error: %s does not exist; export YouTube cookies from a browser first\n' "$cookies_file" >&2
+    return 1
+  }
   checkpoint_ms=$(read_checkpoint_ms) || return 1
   checkpoint_sec=$(( checkpoint_ms / 1000 ))
   checkpoint_day_start_sec=$(( checkpoint_sec - checkpoint_sec % 86400 ))
@@ -801,7 +815,7 @@ generate_html() {
     free_slots=()
     for (( slot = 0; slot < MAX_THREADS; ++slot )); do
       cookie_file="./cookies${slot}.txt"
-      cp -- ./cookies.txt "$cookie_file" || return 1
+      cp -- "$cookies_file" "$cookie_file" || return 1
       scan_cookie_files+=("$cookie_file")
       free_slots+=("$slot")
     done
@@ -867,8 +881,8 @@ generate_html() {
     # Approximate tab dates can precede the exact publication time. Start at
     # midnight UTC on the day before the checkpoint date and keep the overlap
     # rather than resolving watch pages; this favors coverage over precision.
-    status=$(<"$result_dir/$index.status")
-    if (( status != 0 && status != 101 )); then
+    scan_status=$(<"$result_dir/$index.status")
+    if (( scan_status != 0 && scan_status != 101 )); then
       printf 'Warning: could not scan the videos tab for @%s\n' "$channel" >&2
       failures=$(( failures + 1 ))
       output=${cached_rows[$channel]:-}
@@ -895,7 +909,7 @@ generate_html() {
         merged_output+="$line"$'\n'
       done <<< "$output"
       output=$merged_output
-      if (( status == 0 || status == 101 )) && (( ${+observed_feed_newest[$channel]} )); then
+      if (( scan_status == 0 || scan_status == 101 )) && (( ${+observed_feed_newest[$channel]} )); then
         cached_feed_newest[$channel]=${observed_feed_newest[$channel]}
       fi
       printf 'M\t%s\t%s\t%s\t%s\t%s\n' "$channel" "${cached_checked[$channel]:-0}" "${cached_last_full[$channel]:-${cached_checked[$channel]:-0}}" "${cached_feed_newest[$channel]:-0}" "${cached_channel_id[$channel]:-}" >> "$cache_tmp"
@@ -1066,7 +1080,11 @@ if [[ -n "$run_url" ]]; then
     printf 'Error: yt-dlp binary not found next to this script\n' >&2
     exit 1
   }
-  run_cmd "$ytdlp_exe" --cookies ./cookies.txt --paths "$output_path" "$run_url"
+  if [[ ! -f "$cookies_file" ]]; then
+    printf 'Error: %s does not exist; export YouTube cookies from a browser first\n' "$cookies_file" >&2
+    exit 1
+  fi
+  run_cmd "$ytdlp_exe" --cookies "$cookies_file" --paths "$output_path" "$run_url"
 else
   printf 'Error: no URL provided, and %s does not exist or is empty\n' "$url_file" >&2
   exit 1

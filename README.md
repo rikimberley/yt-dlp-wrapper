@@ -80,6 +80,10 @@ Without `-p`, a download URL containing a YouTube handle path such as
 `https://www.youtube.com/@channel-id/videos` downloads into `./channel-id`.
 Other URLs continue to use `./t`. An explicit `-p` always takes precedence.
 
+A missing or empty `checkpoint.txt` is not an error: it is read as checkpoint `0`
+("nothing seen yet"), a warning is printed, and every video qualifies as new.
+Run `-c` once to write a real checkpoint and narrow later runs.
+
 `./yy.zsh -o -c` means "open whatever is new, then mark everything as seen".
 The checkpoint is not updated if at least three channel checks fail, or if all
 listed channels fail to be checked. With `-o -c`, `--html -c`, and `--html2 -c`, the saved
@@ -195,7 +199,7 @@ large channels can require many continuation pages.
 |---|---|
 | `yy.zsh` / `yy.ps1` | The wrappers. Behaviourally identical; keep them in sync. |
 | `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored *(gitignored)* |
-| `checkpoint.txt` | Epoch timestamp `-o` compares against *(gitignored)* |
+| `checkpoint.txt` | Epoch timestamp `-o` compares against; missing or empty means "no checkpoint" (0), so every video counts as new *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
 | `downloaded-videos.json` | Successful PowerShell HTML downloads retained for 45 days *(gitignored)* |
 | `html-video-cache.json` / `html-video-cache.tsv` | PowerShell/zsh `--html2` incremental video metadata *(gitignored)* |

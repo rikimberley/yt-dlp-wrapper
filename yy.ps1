@@ -71,6 +71,7 @@ $urlFile = './current_url.txt'
 $channelsFile = './channel-ids.txt'
 $channelIdCacheFile = './channel-id-cache.txt'
 $checkpointFile = './checkpoint.txt'
+$cookiesFile = './cookies.txt'
 $channelStatusFile = Join-Path $PSScriptRoot 'channel-check-status.json'
 $downloadedVideosFile = Join-Path $PSScriptRoot 'downloaded-videos.json'
 $htmlVideoCacheFile = Join-Path $PSScriptRoot 'html-video-cache.json'
@@ -297,15 +298,22 @@ function ConvertTo-EpochMs {
 }
 
 # Read ./checkpoint.txt and normalise it to epoch milliseconds.
+# A missing or empty checkpoint file is not an error: it means "nothing has
+# been seen yet", so it reads as 0 and every video counts as new. Only a file
+# that exists and holds something unusable is treated as corruption.
 function Read-CheckpointMs {
-    if (-not (Test-Path -LiteralPath $checkpointFile)) {
-        [Console]::Error.WriteLine("Error: $checkpointFile does not exist")
-        exit 1
+    if (-not (Test-Path -LiteralPath $checkpointFile -PathType Leaf)) {
+        [Console]::Error.WriteLine("Warning: $checkpointFile does not exist; continuing with no checkpoint (0)")
+        return [long]0
     }
     $raw = Get-Content -LiteralPath $checkpointFile -TotalCount 1
     if ($null -eq $raw) { $raw = '' }
     $digits = ($raw -replace '[^0-9]', '')
     if ($digits -eq '') {
+        if ($raw.Trim() -eq '') {
+            [Console]::Error.WriteLine("Warning: $checkpointFile is empty; continuing with no checkpoint (0)")
+            return [long]0
+        }
         [Console]::Error.WriteLine("Error: $checkpointFile does not contain an epoch timestamp")
         exit 1
     }
@@ -1154,6 +1162,10 @@ function New-VideoHtml {
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
+    if (-not (Test-Path -LiteralPath $cookiesFile -PathType Leaf)) {
+        [Console]::Error.WriteLine("Error: $cookiesFile does not exist; export YouTube cookies from a browser first")
+        return $false
+    }
     $checkpointMs = Read-CheckpointMs
     $checkpointSec = [Math]::Floor($checkpointMs / 1000)
     $checkpointDayStartSec = $checkpointSec - ($checkpointSec % 86400)
@@ -1254,7 +1266,7 @@ function New-VideoHtml {
     try {
         for ($slot = 0; $slot -lt $MAX_THREADS; $slot++) {
             $workerCookieFile = "./cookies$slot.txt"
-            Copy-Item -LiteralPath './cookies.txt' -Destination $workerCookieFile -Force
+            Copy-Item -LiteralPath $cookiesFile -Destination $workerCookieFile -Force
             [void]$scanCookieFiles.Add($workerCookieFile)
             $freeSlots.Enqueue($slot)
         }
@@ -1955,7 +1967,11 @@ if (-not [string]::IsNullOrEmpty($runUrl)) {
         [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script')
         exit 1
     }
-    Invoke-YCommand $exe --cookies ./cookies.txt --paths $OutputPath $runUrl
+    if (-not (Test-Path -LiteralPath $cookiesFile -PathType Leaf)) {
+        [Console]::Error.WriteLine("Error: $cookiesFile does not exist; export YouTube cookies from a browser first")
+        exit 1
+    }
+    Invoke-YCommand $exe --cookies $cookiesFile --paths $OutputPath $runUrl
 }
 else {
     [Console]::Error.WriteLine("Error: no URL provided, and $urlFile does not exist or is empty")
