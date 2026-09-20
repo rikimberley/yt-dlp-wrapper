@@ -1406,6 +1406,9 @@ generate_html() {
   local exe checkpoint_ms checkpoint_sec checkpoint_day_start_sec scan_cutoff_sec checkpoint_age
   local failures=0 check_batch_ms restored=0 line channel channel_url resolved
   local index slot next_index completed row cards newest qualified
+  # Loop scratch, declared once: a repeated bare `local name` prints the
+  # variable instead of resetting it.
+  local channel_cutoff last_full_ms last_full_sec candidate
   local result_dir tmp_page rc scan_out scan_rc
   local -a channels scan_cutoffs
   local -A seen_channels html_channel_ids skip_ytdlp observed_feed_newest last_full_scans downloaded_set
@@ -1468,14 +1471,16 @@ generate_html() {
       fi
       html_channel_ids[$channel]=$resolved_channel_id
     fi
-    local channel_cutoff=$scan_cutoff_sec last_full_ms last_full_sec
+    channel_cutoff=$scan_cutoff_sec
+    last_full_ms=0
+    last_full_sec=0
     if (( incremental )) && (( ${+cache_checked_ms[$channel]} )); then
       last_full_ms=${cache_last_full_ms[$channel]:-0}
       (( last_full_ms <= 0 )) && last_full_ms=${cache_checked_ms[$channel]:-0}
       last_full_scans[$channel]=$last_full_ms
       if (( last_full_ms > 0 )); then
         last_full_sec=$(( last_full_ms / 1000 ))
-        local candidate=$(( last_full_sec - last_full_sec % 86400 - 86400 ))
+        candidate=$(( last_full_sec - last_full_sec % 86400 - 86400 ))
         (( candidate > channel_cutoff )) && channel_cutoff=$candidate
       fi
     fi
