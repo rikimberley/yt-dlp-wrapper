@@ -1586,7 +1586,15 @@ generate_html() {
   # keeps the overlap rather than resolving watch pages: coverage over
   # precision.
   local -a page_sections
+  # Per-channel scratch, declared once: repeating `local -A merged_row` inside
+  # the loop does NOT reset it in zsh, so every channel inherited the previous
+  # channels' rows and kept_rows re-appended them, duplicating cards.
+  local -A merged_row
+  local -a merged_ids fields kept_rows
   for index in {1..${#channels}}; do
+    merged_row=()
+    merged_ids=()
+    kept_rows=()
     channel=${channels[$index]}
     scan_out=""
     [[ -f "$result_dir/$index.out" ]] && scan_out=$(<"$result_dir/$index.out")
@@ -1599,8 +1607,6 @@ generate_html() {
     local full_scan_ok=$(( scan_ok && ! feed_only ))
 
     if (( incremental )); then
-      local -A merged_row
-      local -a merged_ids fields
       for row in ${(f)"${cache_entries[$channel]:-}"}; do
         [[ -n "$row" ]] || continue
         fields=("${(@s:	:)row}")
@@ -1636,7 +1642,6 @@ generate_html() {
         cache_feed=${cache_feed_newest_ms[$channel]:-0}
       fi
       local kept="" keep_cutoff_ms=$(( scan_cutoff_sec * 1000 ))
-      local -a kept_rows
       for key in "${merged_ids[@]}"; do
         row=${merged_row[$key]}
         fields=("${(@s:	:)row}")
