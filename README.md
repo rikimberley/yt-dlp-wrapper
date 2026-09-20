@@ -107,14 +107,14 @@ the wrapper copies `cookies.txt` to one private `cookies0.txt` through
 yt-dlp's exit-time cookie rewrite from racing another scan; the private jars are
 deleted as soon as the scan phase ends. Shorts that appear only on
 `/shorts` are excluded. The generated page
-displays the current checkpoint; in PowerShell it updates immediately when the
+displays the current checkpoint, and it updates immediately when the
 `CHECKPOINT` button is clicked. While generating the page, the wrapper prints
 each channel as it starts, live yt-dlp extraction/network messages, a periodic
 elapsed-time heartbeat, and the number of qualifying videos it found.
-In PowerShell, a successful HTML scan updates each channel's last-checked time.
+A successful HTML scan updates each channel's last-checked time.
 Its stored latest-video time is updated only when the scan returns at least one
 accepted video; an empty or wholly unparseable result preserves the prior value.
-The initial PowerShell scan and each `REFRESH` skip channels whose stored latest
+The initial scan and each `REFRESH` skip channels whose stored latest
 video is unknown or at least 1.5 displayed months (45 days) old; those channels
 remain in the Channel IDs table but no video cards are generated for them. `REFRESH ALL`,
 next to `REFRESH`, applies the original scan logic to every channel regardless
@@ -122,11 +122,11 @@ of its stored latest-video time. Both refresh actions reload the status file
 first, so an external repair or backfill made while the server is running is not
 replaced by stale in-memory values. The status file is decoded as UTF-8,
 preserving non-ASCII channel handles on Windows PowerShell 5.1.
-In PowerShell, `--html` serves the page at `http://127.0.0.1:8080/` and keeps
+`--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
-loopback listener; `yy.ps1` validates the structured selections and starts the
-matching local `yy1.ps1 -p "./<channel-entry>" -t "<url>"` / `yy2.ps1 -p "./<channel-entry>" -t "<url>"` hook without making
+loopback listener; the wrapper validates the structured selections and starts the
+matching local `y1 -p "./<channel-entry>" -t "<url>"` / `y2 -p "./<channel-entry>" -t "<url>"` hook (`yy1.ps1` / `yy2.ps1` on PowerShell) without making
 the page wait for downloads to finish; it reports queued, running, completed,
 and failed job counts plus recent yy/yt-dlp output in the page and the wrapper
 console. Jobs run sequentially: all y2 selections first, then y1 selections.
@@ -144,7 +144,7 @@ still arriving. Time spent regenerating the page during a refresh does not count
 toward that timeout. Temporary status-request failures do not close the page.
 Port 8080 must be available. The callback never accepts arbitrary command text.
 
-After a local hook completes successfully, PowerShell records its channel ID,
+After a local hook completes successfully, the wrapper records its channel ID,
 video ID, y1/y2 target, and completion time in `downloaded-videos.json`. Existing
 channel/video/target tuples keep their original time. Entries older than 45 days
 (1.5 months) are pruned whenever the file is read, and initial or refreshed HTML
@@ -155,7 +155,7 @@ The wrapper logs history loads, pruning and saves, new or duplicate completion
 records, and the number of target selections restored into each generated page.
 
 `--html2` leaves `--html` unchanged. It stores recent per-channel video metadata
-in `html-video-cache.json` on PowerShell and `html-video-cache.tsv` on zsh.
+in `html-video-cache.json`.
 Missing or unreadable caches are rebuilt. Successful scans merge new metadata
 with cached cards; failed scans retain cached cards. `REFRESH` retains the
 45-day active-channel filter, while `REFRESH ALL` checks every channel using
@@ -201,8 +201,9 @@ large channels can require many continuation pages.
 | `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored *(gitignored)* |
 | `checkpoint.txt` | Epoch timestamp `-o` compares against; missing or empty means "no checkpoint" (0), so every video counts as new *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
-| `downloaded-videos.json` | Successful PowerShell HTML downloads retained for 45 days *(gitignored)* |
-| `html-video-cache.json` / `html-video-cache.tsv` | PowerShell/zsh `--html2` incremental video metadata *(gitignored)* |
+| `downloaded-videos.json` | Successful HTML downloads retained for 45 days *(gitignored)* |
+| `channel-check-status.json` | Per-channel last-checked time, latest video time and avatar *(gitignored)* |
+| `html-video-cache.json` | `--html2` incremental video metadata *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
 | `yy.html` | Generated `--html` video grid *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |
