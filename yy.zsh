@@ -54,6 +54,7 @@ zmodload zsh/datetime 2>/dev/null || true
 cd -- "${0:A:h}" || exit 1
 
 script_dir=${0:A:h}
+script_self=${0:A}
 url_file="./current_url.txt"
 channels_file="./channel-ids.txt"
 channel_id_cache_file="./channel-id-cache.txt"
@@ -1945,10 +1946,12 @@ start_selected_video_hooks() {
           "${sel_channel[$idx]}" "${sel_video[$idx]}" "${sel_target[$idx]}"
         continue
       fi
-      hook=${commands[y${sel_target[$idx]#y}]:-}
-      [[ -n "$hook" ]] || hook=${commands[${sel_target[$idx]}]:-}
-      if [[ -z "$hook" ]]; then
-        hook_error="Local y${sel_target[$idx]#y} hook was not found"
+      # y1 and y2 both run this wrapper's own download path. The labels are
+      # kept because the page, the completion history and the y2-before-y1
+      # ordering are all keyed on them.
+      hook=$script_self
+      if [[ ! -x "$hook" ]]; then
+        hook_error="This wrapper (${hook}) is not executable"
         return 1
       fi
       (( ++job_counter ))

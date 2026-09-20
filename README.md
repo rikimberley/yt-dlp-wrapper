@@ -125,11 +125,14 @@ preserving non-ASCII channel handles on Windows PowerShell 5.1.
 `--html` serves the page at `http://127.0.0.1:8080/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
-loopback listener; the wrapper validates the structured selections and starts the
-matching local `y1 -p "./<channel-entry>" -t "<url>"` / `y2 -p "./<channel-entry>" -t "<url>"` hook (`yy1.ps1` / `yy2.ps1` on PowerShell) without making
+loopback listener; the wrapper validates the structured selections and starts a
+download job without making
 the page wait for downloads to finish; it reports queued, running, completed,
 and failed job counts plus recent yy/yt-dlp output in the page and the wrapper
-console. Jobs run sequentially: all y2 selections first, then y1 selections.
+console. `yy.zsh` runs its own download path for both targets —
+`./yy.zsh -p "./<channel-entry>" -t "<url>"` in the wrapper's own directory —
+while `yy.ps1` calls the separate local `yy1.ps1` / `yy2.ps1` hooks found on
+`PATH` with the same `-p` / `-t` arguments. Jobs run sequentially: all y2 selections first, then y1 selections.
 Download output keeps lifecycle messages, warnings, errors, and completion
 lines, while repetitive yt-dlp percentage updates are reduced to one snapshot
 per 10 percentage points for each transferred format. The browser displays the
