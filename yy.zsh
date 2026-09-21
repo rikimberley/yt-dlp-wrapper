@@ -470,6 +470,13 @@ json_flatten_string() {
 }
 
 # Escape a zsh string for use as a JSON string body (without the quotes).
+typeset -gA json_ctrl_escapes=(
+  1 '\u0001' 2 '\u0002' 3 '\u0003' 4 '\u0004' 5 '\u0005' 6 '\u0006' 7 '\u0007'
+  11 '\u000b' 14 '\u000e' 15 '\u000f' 16 '\u0010' 17 '\u0011' 18 '\u0012'
+  19 '\u0013' 20 '\u0014' 21 '\u0015' 22 '\u0016' 23 '\u0017' 24 '\u0018'
+  25 '\u0019' 26 '\u001a' 27 '\u001b' 28 '\u001c' 29 '\u001d' 30 '\u001e' 31 '\u001f'
+)
+
 json_escape() {
   local s=$1
   s=${s//\\/\\\\}
@@ -477,6 +484,30 @@ json_escape() {
   s=${s//$'\n'/\\n}
   s=${s//$'\r'/\\r}
   s=${s//$'\t'/\\t}
+  s=${s//$'\b'/\\b}
+  s=${s//$'\f'/\\f}
+  # Every other C0 control is illegal raw inside a JSON string and makes the
+  # page's JSON.parse throw, which used to kill status polling for good.
+  if [[ $s == *[$'\x01'-$'\x1f']* ]]; then
+    local code
+    for code in ${(k)json_ctrl_escapes}; do
+      [[ $s == *${(#)code}* ]] || continue
+      s=${s//${(#)code}/${json_ctrl_escapes[$code]}}
+    done
+  fi
+  print -r -- "$s"
+}
+
+# yt-dlp emits ANSI colour and cursor sequences even when its output is a file.
+# They are pure noise in the page's job log, so drop them (and any stray C0
+# control) before the line is ever shown or serialised.
+strip_control_chars() {
+  setopt localoptions extendedglob
+  local s=$1
+  s=${s//$'\e'\[[0-9;?]#[a-zA-Z]/}
+  s=${s//$'\e'\][^$'\a']#$'\a'/}
+  s=${s//$'\e'[\(\)][A-Za-z0-9]/}
+  s=${s//[$'\x01'-$'\x08'$'\x0b'$'\x0c'$'\x0e'-$'\x1f'$'\x7f']/}
   print -r -- "$s"
 }
 
@@ -1384,7 +1415,7 @@ html_page_css='<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf
 html_page_script() {
   local base=$1 js
   js=$(cat <<'HTMLJS'
-<script>const callback="@@DOWNLOAD@@",statusUrl="@@STATUS@@",stopUrl="@@STOP@@";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};setInterval(()=>fetch("@@HEARTBEAT@@",{method:"POST",keepalive:true}),2000);showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async(all=false)=>{status.textContent=all?"Refreshing all channels...":"Refreshing channels...";try{const b=await (await fetch(all?"@@REFRESHALL@@":"@@REFRESH@@",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("@@CHECKPOINT@@",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=()=>refreshPage(false);document.querySelector("#refresh-all").onclick=()=>refreshPage(true);document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("@@CHANNEL@@",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("@@CHANNEL@@",{action:"delete",channel:b.dataset.channel});refreshPage()});</script>
+<script>const callback="@@DOWNLOAD@@",statusUrl="@@STATUS@@",stopUrl="@@STOP@@";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight}catch(e){status.textContent="Status unavailable: "+e.message}finally{setTimeout(showJobs,1000)}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};setInterval(()=>fetch("@@HEARTBEAT@@",{method:"POST",keepalive:true}),2000);showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async(all=false)=>{status.textContent=all?"Refreshing all channels...":"Refreshing channels...";try{const b=await (await fetch(all?"@@REFRESHALL@@":"@@REFRESH@@",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("@@CHECKPOINT@@",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=()=>refreshPage(false);document.querySelector("#refresh-all").onclick=()=>refreshPage(true);document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("@@CHANNEL@@",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("@@CHANNEL@@",{action:"delete",channel:b.dataset.channel});refreshPage()});</script>
 HTMLJS
   )
   js=${js//@@DOWNLOAD@@/${base}/download/${html_token}}
@@ -1894,6 +1925,7 @@ typeset -gA job_state job_pid job_log job_rcfile job_lines job_succeeded
 typeset -gA job_persisted job_last_pct job_last_bucket
 typeset -ga job_ids server_logs
 typeset -g job_status_json=""
+typeset -gi job_active_count=0
 job_counter=0
 
 # Queue the selections from a /download payload. y2 drains before y1, keeping
@@ -2037,6 +2069,8 @@ get_download_job_status() {
       if (( ${#new_lines} )); then
         (( job_lines[$id] += ${#new_lines} ))
         for line in "${new_lines[@]}"; do
+          line=$(strip_control_chars "$line")
+          [[ -n "$line" ]] || continue
           [[ "$line" == '[download]'*'has already been downloaded'* || "$line" == '[download]'*'100%'* ]] \
             && job_succeeded[$id]=1
           should_emit_download_log "$id" "$line" || continue
@@ -2093,6 +2127,7 @@ get_download_job_status() {
     logs_json+="\"$(json_escape "$line")\""
   done
   job_status_json="{\"running\": $running, \"queued\": $queued, \"completed\": $completed, \"failed\": $failed, \"logs\": [${logs_json}]}"
+  job_active_count=$(( running + queued ))
 }
 
 # Apply an add/delete from the Channel IDs table.
@@ -2161,13 +2196,16 @@ invoke_html_callback_server() {
     "$html_listen_host" "$html_listen_port"
   while (( ! html_server_stop && ! stop )); do
     if ! zselect -t 100 -r "$listen_fd" 2>/dev/null; then
+      # Keep queued jobs moving even while the page is idle. This also
+      # refreshes $job_active_count for the timeout test below.
+      get_download_job_status
       now=$(now_sec)
-      if (( now - last_heartbeat >= html_heartbeat_timeout_sec )); then
+      # Never abandon a download that is still running or queued just because
+      # the browser throttled its timers while the tab was in the background.
+      if (( now - last_heartbeat >= html_heartbeat_timeout_sec && job_active_count == 0 )); then
         printf 'HTML page closed or disconnected; stopping server.\n'
         break
       fi
-      # Keep queued jobs moving even while the page is idle.
-      get_download_job_status
       continue
     fi
     ztcp -a "$listen_fd" 2>/dev/null || continue

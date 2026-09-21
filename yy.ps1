@@ -1453,8 +1453,8 @@ function New-VideoHtml {
     }
     Save-ChannelCheckStatus $ChannelStatus
     [void]$sb.AppendLine('</tbody></table></section>')
-    [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
-    $pageText = $sb.ToString().Replace('if(b.running||b.queued)setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}', 'setTimeout(showJobs,1000)}catch(e){status.textContent="Status unavailable: "+e.message}')
+    [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{let again=false;try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
+    $pageText = $sb.ToString().Replace('if(b.running||b.queued)again=true}catch', 'again=true}catch')
     $pageText = $pageText.Replace('jobLog.textContent=(b.logs||[]).join("\n");', 'jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;')
     $heartbeatUrl = $CallbackUrl -replace '/download/', '/heartbeat/'
     $pageText = $pageText.Replace('showJobs();const backToTop', 'setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop')
@@ -1593,6 +1593,7 @@ function Get-DownloadJobStatus {
         [void](Start-NextDownloadJob $Jobs)
         $running = 1; $queued--
     }
+    $script:htmlActiveJobs = $running + $queued
     return @{ running = $running; queued = $queued; completed = $completed; failed = $failed; logs = @($ServerLogs | Select-Object -Last 80) }
 }
 
@@ -1665,6 +1666,7 @@ function Invoke-HtmlCallbackServer {
     $serverLogs = New-Object System.Collections.ArrayList
     $lastHeartbeat = [System.DateTime]::UtcNow
     $script:htmlStopRequested = $false
+    $script:htmlActiveJobs = 0
     $script:htmlListener = $listener
     $html3Worker = $null
     $cancelHandler = [ConsoleCancelEventHandler]{
@@ -1688,7 +1690,10 @@ function Invoke-HtmlCallbackServer {
             try {
                 while (-not $pending.AsyncWaitHandle.WaitOne(1000)) {
                     if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
-                    if (([System.DateTime]::UtcNow - $lastHeartbeat).TotalSeconds -ge $htmlHeartbeatTimeoutSec) {
+                    # Never abandon a download that is still running or queued
+                    # just because the browser throttled its timers while the
+                    # tab was in the background.
+                    if (([System.DateTime]::UtcNow - $lastHeartbeat).TotalSeconds -ge $htmlHeartbeatTimeoutSec -and $script:htmlActiveJobs -eq 0) {
                         Write-Host 'HTML page closed or disconnected; stopping server.'
                         $script:htmlStopRequested = $true
                         $listener.Stop()
