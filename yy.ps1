@@ -16,7 +16,7 @@
 #   skip any download
 # - uses --html to generate a local 6-column video grid with y1/y2 selections
 # - uses --html2 for the same page with persistent incremental scan caching
-# - uses --html3 to open a loading page immediately, then build --html2 content in a worker
+# - uses --html3 to open an independent loading shell and stream channel fragments from a worker
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -1154,9 +1154,8 @@ function Test-ShouldScanHtmlChannel {
     return $latestVideoMs -gt $staleVideoCutoffMs
 }
 
-# Render one HTML3 channel update from its just-finished scan plus any prior
-# incremental cache.  The normal full-page renderer still owns the final page;
-# this is an additive preview artifact for the HTML3 browser only.
+# Render one standalone HTML3 channel fragment from its just-finished scan plus
+# any prior incremental cache.  The HTML3 shell inserts these as they arrive.
 function Get-Html3ChannelFragment {
     param([string]$Channel, [string]$ChannelId, $ScanOutput, $PriorRecord, [hashtable]$Downloaded, [long]$CutoffMs)
 
@@ -1188,7 +1187,7 @@ function Get-Html3ChannelFragment {
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
-    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll, [switch]$Incremental, [string]$ProgressPath)
+    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll, [switch]$Incremental, [string]$ProgressPath, [string]$Html3FragmentsPath, [string]$OutputPath)
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
@@ -1308,6 +1307,14 @@ function New-VideoHtml {
                 $channel = [string]$channels[$nextIndex]
                 if ($skipYtDlp.ContainsKey($channel)) {
                     $scanResults[$nextIndex] = @{ Output=@(); ExitCode=0; FeedOnly=$true }
+                    if ($ProgressPath -ne '') {
+                        $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @() -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
+                        $fragmentName = "$nextIndex.html"
+                        [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
+                        [void]$html3Updates.Add(@{ channel=$channel; fragment=$nextIndex })
+                        $completedScans++
+                        Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates)
+                    }
                     $freeSlots.Enqueue($slot)
                     $nextIndex++
                     continue
@@ -1335,7 +1342,9 @@ function New-VideoHtml {
                     if ($ProgressPath -ne '') {
                         $channel = [string]$channels[$worker.Index]
                         $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @($worker.Output) -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
-                        [void]$html3Updates.Add(@{ channel=$channel; html=$fragment })
+                        $fragmentName = "$($worker.Index).html"
+                        [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
+                        [void]$html3Updates.Add(@{ channel=$channel; fragment=$worker.Index })
                     }
                     $freeSlots.Enqueue($worker.Slot)
                     $workers.RemoveAt($workerIndex)
@@ -1499,12 +1508,12 @@ function New-VideoHtml {
     $pageText = $pageText.Replace('</script></main>', '</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async(all=false)=>{status.textContent=all?"Refreshing all channels...":"Refreshing channels...";try{const b=await (await fetch(all?"' + $refreshAllUrl + '":"' + $refreshUrl + '",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("' + $checkpointUrl + '",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=()=>refreshPage(false);document.querySelector("#refresh-all").onclick=()=>refreshPage(true);document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("' + $channelUrl + '",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("' + $channelUrl + '",{action:"delete",channel:b.dataset.channel});refreshPage()});</script></main>')
     $sb.Clear() | Out-Null
     [void]$sb.Append($pageText)
-    $path = Join-Path $PSScriptRoot 'yy.html'
+    $path = if ($OutputPath -ne '') { $OutputPath } else { Join-Path $PSScriptRoot 'yy.html' }
     [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     Save-ChannelCheckStatus $ChannelStatus
     $script:htmlFailureCount = $failures
     Write-Host "Restored $restoredSelections downloaded target selection(s) in HTML."
-    Write-Host "Generated ./yy.html"
+    Write-Host ('Generated ./' + [System.IO.Path]::GetFileName($path))
     return $true
 }
 
@@ -1662,27 +1671,17 @@ function Send-CallbackResponse {
     Send-CallbackJson $Context $StatusCode @{ message = $Message }
 }
 
-# --html3 keeps the last rendered page visible while a separate PowerShell
-# process builds its replacement.  This makes a refresh useful instead of
-# replacing every card with an otherwise empty progress screen.
+# --html3 has its own shell, state document, and channel fragments.  It never
+# reads or writes yy.html, which remains exclusively owned by --html/--html2.
 function Write-Html3LoadingPage {
     param([string]$Token, [string]$Message)
 
-    $stateUrl = '/html3/' + $Token
     $safeMessage = [System.Net.WebUtility]::HtmlEncode($Message)
-    $progress = '<style>#html3-progress{margin:10px 0 16px}.html3-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html3-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}#html3-progress-status{margin:6px 0 0;color:#8b949e}.html3-loading button,.html3-loading input{pointer-events:none;opacity:.55}</style><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">' + $safeMessage + '</p></div><script>const html3State="' + $stateUrl + '",html3Controls=[...document.querySelectorAll("button,input")],html3Applied=new Set(),html3Apply=u=>{if(!u||html3Applied.has(u.channel))return;html3Applied.add(u.channel);const old=[...document.querySelectorAll("section.channel")].find(x=>{const a=x.querySelector("h2 a");return a&&a.textContent===u.channel});if(!u.html){if(old)old.remove();return}const t=document.createElement("template");t.innerHTML=u.html;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").prepend(fresh);fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)},html3Poll=async()=>{try{const s=await(await fetch(html3State)).json(),e=document.querySelector("#html3-progress-status"),b=document.querySelector(".html3-progress-bar");e.textContent=s.message||"Loading channels...";if(s.total)b.style.width=Math.min(100,100*(s.completed||0)/s.total)+"%";(s.updates||[]).forEach(html3Apply);if(s.done&&s.success){location.reload();return}}catch{}setTimeout(html3Poll,500)};document.documentElement.classList.add("html3-loading");html3Controls.forEach(x=>x.disabled=true);html3Poll()</script>'
-    $pagePath = Join-Path $PSScriptRoot 'yy.html'
-    $page = ''
-    if (Test-Path -LiteralPath $pagePath) {
-        try { $page = [System.IO.File]::ReadAllText($pagePath, [System.Text.Encoding]::UTF8) } catch { $page = '' }
-    }
-    if ($page -match '<main>') {
-        $page = $page -replace '</h1>', ('</h1><style>.html3-loading h1{border-bottom:0}.html3-loading button,.html3-loading input{pointer-events:auto}</style><script>document.addEventListener("DOMContentLoaded",()=>{document.querySelectorAll("button,input").forEach(x=>{if(x.id!=="back-to-top")x.disabled=true});const replay=async()=>{try{const s=await(await fetch(html3State)).json();(s.updates||[]).forEach(html3Apply);if(s.done&&s.success){location.reload();return}}catch{}setTimeout(replay,500)};replay()});setInterval(()=>{const b=document.querySelector("#back-to-top");if(b)b.disabled=false},100)</script>' + $progress)
-    }
-    else {
-        $page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>body{margin:0;padding:16px 60px;background:#0d1117;color:#e6edf3;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif}</style></head><body><h1>YouTube Video Download</h1>' + $progress + '</body></html>'
-    }
-    [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'yy.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
+    $page = @'
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0}.channel-title h2 a{color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:disabled,input:disabled{opacity:.55;cursor:wait}.controls,.checks,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.controls button{padding:4px 9px}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.preview{aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks{margin-top:8px;color:var(--mut)}.video-age{font-size:11px;color:var(--mut);margin-top:3px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:0;display:none;font-size:34px;font-weight:700}.back-to-top.visible{display:flex;align-items:center;justify-content:center}#html3-progress{margin:10px 0 16px}.html3-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html3-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body><h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value"></span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">__MESSAGE__</p></div><main></main><button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button><script>(()=>{const token="__TOKEN__",base="/html3/"+token,stateUrl=base+"state",fragmentUrl=i=>base+"fragment/"+i,api=n=>"/"+n+"/"+token,controls=[...document.querySelectorAll("button,input")],top=document.querySelector("#back-to-top"),status=document.querySelector("#status"),log=document.querySelector("#job-log"),applied=new Set(),saved=new Set();const key=x=>x.dataset.channelId+"|"+x.dataset.videoId+"|"+x.className,remember=()=>document.querySelectorAll("input.y1:checked,input.y2:checked").forEach(x=>saved.add(key(x))),setBusy=b=>controls.forEach(x=>{if(x!==top)x.disabled=b});const apply=async u=>{if(!u||applied.has(u.channel))return;const r=await fetch(fragmentUrl(u.fragment),{cache:"no-store"});if(!r.ok)return;const text=await r.text(),old=[...document.querySelectorAll("section.channel")].find(x=>x.dataset.html3Channel===u.channel);applied.add(u.channel);if(!text){if(old)old.remove();return}remember();const t=document.createElement("template");t.innerHTML=text;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").prepend(fresh);fresh.querySelectorAll("input.y1,input.y2").forEach(x=>{if(saved.has(key(x)))x.checked=true});fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)};const poll=async()=>{try{const s=await (await fetch(stateUrl,{cache:"no-store"})).json(),bar=document.querySelector(".html3-progress-bar");document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";if(s.total)bar.style.width=Math.min(100,100*(s.completed||0)/s.total)+"%";for(const u of s.updates||[])await apply(u);if(s.status==="success"){setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return}if(s.status==="error"){status.textContent=s.error||"Page generation failed.";return}}catch(e){status.textContent="Progress unavailable: "+e.message}setTimeout(poll,500)};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(!b)return;(b.closest(".channel")||document).querySelectorAll("input.y1,input.y2").forEach(x=>x.checked=b.dataset.action!=="none"&&x.className===b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started"};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch(api("checkpoint"),{method:"POST"})).json();status.textContent=b.message;document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?"Checkpoint: "+b.checkpoint_ms:""};const refresh=async all=>{remember();setBusy(true);const b=await (await fetch(api(all?"refresh-all":"refresh"),{method:"POST"})).json();status.textContent=b.message||"Refreshing";applied.clear();poll()};document.querySelector("#refresh").onclick=()=>refresh(false);document.querySelector("#refresh-all").onclick=()=>refresh(true);document.querySelector("#stop").onclick=async()=>{await fetch(api("stop"),{method:"POST"});window.close();location.replace("about:blank")};top.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});const toggle=()=>top.classList.toggle("visible",scrollY>200);addEventListener("scroll",toggle,{passive:true});top.disabled=false;setBusy(true);poll()})()</script></body></html>
+'@
+    $page = $page.Replace('__TOKEN__', $Token).Replace('__MESSAGE__', $safeMessage)
+    [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'yy-html3.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Write-Html3Progress {
@@ -1690,7 +1689,21 @@ function Write-Html3Progress {
 
     $temporary = $Path + '.new.' + $PID
     try {
-        [System.IO.File]::WriteAllText($temporary, (@{completed=$Completed;total=$Total;updates=@($Updates)} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($temporary, (@{status='running';success=$false;message=("Loading channels: $Completed / $Total");completed=$Completed;total=$Total;updates=@($Updates)} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temporary -Destination $Path -Force
+    }
+    finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
+
+function Set-Html3WorkerState {
+    param([string]$Path, [string]$Status, [string]$Message, [string]$Error = '')
+
+    $current = $null
+    if (Test-Path -LiteralPath $Path) { try { $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+    $completed = if ($null -ne $current) { [int]$current.completed } else { 0 }; $total = if ($null -ne $current) { [int]$current.total } else { 0 }; $updates = if ($null -ne $current) { @($current.updates) } else { @() }
+    $temporary = $Path + '.new.' + $PID
+    try {
+        [System.IO.File]::WriteAllText($temporary, (@{status=$Status;success=($Status -eq 'success');message=$Message;error=$Error;completed=$completed;total=$total;updates=$updates} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $temporary -Destination $Path -Force
     }
     finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
@@ -1699,6 +1712,9 @@ function Write-Html3Progress {
 function Start-Html3Worker {
     param([string]$Token, [switch]$RefreshAll)
 
+    # Reset the state before the child starts so a refresh cannot expose the
+    # previous run's explicit success result during process startup.
+    Write-Html3Progress -Path (Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')) -Completed 0 -Total 0
     $safeScriptPath = $PSCommandPath.Replace("'", "''")
     $safeToken = $Token.Replace("'", "''")
     $command = "& '$safeScriptPath' '--html3-worker' '$safeToken'"
@@ -1723,7 +1739,6 @@ function Write-Html3WorkerLogs {
         $oldCount = [int]$Worker.PSObject.Properties[$logSource.Count].Value
         if ($lines.Count -le $oldCount) { continue }
         foreach ($line in @($lines[$oldCount..($lines.Count - 1)])) {
-            if ($line -eq '__HTML3_SUCCESS__') { $Worker.Succeeded = $true; continue }
             Write-Host "[html3] $line"
         }
         $Worker.PSObject.Properties[$logSource.Count].Value = $lines.Count
@@ -1786,7 +1801,8 @@ function Invoke-HtmlCallbackServer {
                 throw
             }
             if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq '/') {
-                $body = [System.IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'yy.html'))
+                $pageName = if ($Html3) { 'yy-html3.html' } else { 'yy.html' }
+                $body = [System.IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $pageName))
                 $context.Response.ContentType = 'text/html; charset=utf-8'
                 $context.Response.ContentLength64 = $body.Length
                 $context.Response.OutputStream.Write($body, 0, $body.Length)
@@ -1797,26 +1813,24 @@ function Invoke-HtmlCallbackServer {
                 Send-CallbackJson $context 200 (Get-DownloadJobStatus $jobs $serverLogs)
                 continue
             }
-            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token") {
+            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/state") {
                 Write-Html3WorkerLogs $html3Worker
-                $done = $null -ne $html3Worker -and $html3Worker.Process.HasExited
-                $exitCode = $null
-                if ($done) {
-                    # HasExited can be true before the Process instance has
-                    # refreshed its exit-code metadata on Windows PowerShell.
-                    # WaitForExit finalizes that metadata before reporting the
-                    # page as failed or ready.
-                    $html3Worker.Process.WaitForExit()
-                    $exitCode = $html3Worker.Process.ExitCode
-                }
-                $success = $done -and $html3Worker.Succeeded
                 $progressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')
-                $progress = $null
-                if (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
-                $completed = 0; $total = 0; $updates = @()
-                if ($null -ne $progress) { $completed = $progress.completed; $total = $progress.total; $updates = @($progress.updates) }
-                $message = if ($done -and $success) { 'Page ready.' } elseif ($done) { "Page generation failed (exit code $exitCode); see server logs." } elseif ($null -ne $progress) { "Loading channels: $($progress.completed) / $($progress.total)" } else { 'Preparing channels...' }
-                Send-CallbackJson $context 200 @{ done=$done; success=$success; message=$message; completed=$completed; total=$total; updates=$updates }
+                if (Test-Path -LiteralPath $progressPath) {
+                    try { Send-CallbackJson $context 200 (Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
+                    catch { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
+                }
+                else { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
+                continue
+            }
+            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\\d+)$')) {
+                $fragmentPath = Join-Path (Join-Path $PSScriptRoot ('yy-html3-' + $Token)) ($Matches[1] + '.html')
+                if (-not (Test-Path -LiteralPath $fragmentPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
+                $body = [System.IO.File]::ReadAllBytes($fragmentPath)
+                $context.Response.ContentType = 'text/html; charset=utf-8'
+                $context.Response.ContentLength64 = $body.Length
+                $context.Response.OutputStream.Write($body, 0, $body.Length)
+                $context.Response.Close()
                 continue
             }
             if ($context.Request.HttpMethod -eq 'OPTIONS' -and $context.Request.Url.AbsolutePath -in @("/download/$Token", "/stop/$Token")) {
@@ -2013,10 +2027,21 @@ if ($OpenMode -eq 'html3-worker') {
     $workerCallbackUrl = 'http://127.0.0.1:8080/download/' + $Html3WorkerToken
     $workerStatus = Read-ChannelCheckStatus
     $workerProgressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Html3WorkerToken + '.json')
-    if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath)) { exit 1 }
-    if ($htmlFailureCount -gt 0) { exit 1 }
-    Write-Host '__HTML3_SUCCESS__'
-    exit 0
+    $workerFragmentsPath = Join-Path $PSScriptRoot ('yy-html3-' + $Html3WorkerToken)
+    try {
+        if (Test-Path -LiteralPath $workerFragmentsPath) { Remove-Item -LiteralPath $workerFragmentsPath -Recurse -Force }
+        New-Item -ItemType Directory -Path $workerFragmentsPath -Force | Out-Null
+        Write-Html3Progress -Path $workerProgressPath -Completed 0 -Total 0
+        if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath -OutputPath (Join-Path $PSScriptRoot 'yy-html3.html'))) { throw 'Could not generate the HTML3 page.' }
+        if ($htmlFailureCount -gt 0) { throw 'One or more channel scans failed.' }
+        Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message 'Page ready.'
+        exit 0
+    }
+    catch {
+        Set-Html3WorkerState -Path $workerProgressPath -Status 'error' -Message 'Page generation failed.' -Error $_.Exception.Message
+        [Console]::Error.WriteLine("HTML3 worker failed: $($_.Exception.Message)")
+        exit 1
+    }
 }
 if ($OpenMode -ne '') {
     if ($OpenMode -in @('html', 'html2', 'html3')) {
