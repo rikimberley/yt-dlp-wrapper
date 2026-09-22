@@ -1677,7 +1677,7 @@ function Write-Html3LoadingPage {
         try { $page = [System.IO.File]::ReadAllText($pagePath, [System.Text.Encoding]::UTF8) } catch { $page = '' }
     }
     if ($page -match '<main>') {
-        $page = $page -replace '</h1>', ('</h1><style>.html3-loading h1{border-bottom:0}.html3-loading button,.html3-loading input{pointer-events:auto}</style><script>setInterval(()=>{const b=document.querySelector("#back-to-top");if(b)b.disabled=false},100)</script>' + $progress)
+        $page = $page -replace '</h1>', ('</h1><style>.html3-loading h1{border-bottom:0}.html3-loading button,.html3-loading input{pointer-events:auto}</style><script>document.addEventListener("DOMContentLoaded",()=>document.querySelectorAll("button,input").forEach(x=>{if(x.id!=="back-to-top")x.disabled=true}));setInterval(()=>{const b=document.querySelector("#back-to-top");if(b)b.disabled=false},100)</script>' + $progress)
     }
     else {
         $page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>body{margin:0;padding:16px 60px;background:#0d1117;color:#e6edf3;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif}</style></head><body><h1>YouTube Video Download</h1>' + $progress + '</body></html>'
