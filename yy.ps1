@@ -1824,7 +1824,7 @@ function Invoke-HtmlCallbackServer {
                 else { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
                 continue
             }
-            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\\d+)$')) {
+            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\d+)$')) {
                 $fragmentPath = Join-Path (Join-Path $PSScriptRoot ('yy-html3-' + $Token)) ($Matches[1] + '.html')
                 if (-not (Test-Path -LiteralPath $fragmentPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
                 $body = [System.IO.File]::ReadAllBytes($fragmentPath)
