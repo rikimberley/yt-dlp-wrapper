@@ -1677,7 +1677,7 @@ function Write-Html3LoadingPage {
         try { $page = [System.IO.File]::ReadAllText($pagePath, [System.Text.Encoding]::UTF8) } catch { $page = '' }
     }
     if ($page -match '<main>') {
-        $page = $page -replace '</h1>', ('</h1>' + $progress)
+        $page = $page -replace '</h1>', ('</h1><style>.html3-loading h1{border-bottom:0}.html3-loading button,.html3-loading input{pointer-events:auto}</style>' + $progress)
     }
     else {
         $page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>body{margin:0;padding:16px 60px;background:#0d1117;color:#e6edf3;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif}</style></head><body><h1>YouTube Video Download</h1>' + $progress + '</body></html>'
@@ -1710,7 +1710,7 @@ function Start-Html3Worker {
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
     $logBase = Join-Path $env:TEMP ('yy-html3-worker-' + $Token)
     $process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-OutputFormat', 'Text', '-EncodedCommand', $encodedCommand) -RedirectStandardOutput ($logBase + '.out') -RedirectStandardError ($logBase + '.err') -PassThru
-    return [pscustomobject]@{ Process=$process; OutputPath=($logBase + '.out'); ErrorPath=($logBase + '.err'); OutputLines=0; ErrorLines=0 }
+    return [pscustomobject]@{ Process=$process; OutputPath=($logBase + '.out'); ErrorPath=($logBase + '.err'); OutputLines=0; ErrorLines=0; Succeeded=$false }
 }
 
 function Write-Html3WorkerLogs {
@@ -1723,6 +1723,7 @@ function Write-Html3WorkerLogs {
         $oldCount = [int]$Worker.PSObject.Properties[$logSource.Count].Value
         if ($lines.Count -le $oldCount) { continue }
         foreach ($line in @($lines[$oldCount..($lines.Count - 1)])) {
+            if ($line -eq '__HTML3_SUCCESS__') { $Worker.Succeeded = $true; continue }
             Write-Host "[html3] $line"
         }
         $Worker.PSObject.Properties[$logSource.Count].Value = $lines.Count
@@ -1808,7 +1809,7 @@ function Invoke-HtmlCallbackServer {
                     $html3Worker.Process.WaitForExit()
                     $exitCode = $html3Worker.Process.ExitCode
                 }
-                $success = $done -and $exitCode -eq 0
+                $success = $done -and $html3Worker.Succeeded
                 $progressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')
                 $progress = $null
                 if (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
@@ -2014,6 +2015,7 @@ if ($OpenMode -eq 'html3-worker') {
     $workerProgressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Html3WorkerToken + '.json')
     if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath)) { exit 1 }
     if ($htmlFailureCount -gt 0) { exit 1 }
+    Write-Host '__HTML3_SUCCESS__'
     exit 0
 }
 if ($OpenMode -ne '') {
