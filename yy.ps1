@@ -1763,9 +1763,18 @@ function Invoke-HtmlCallbackServer {
             if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token") {
                 Write-Html3WorkerLogs $html3Worker
                 $done = $null -ne $html3Worker -and $html3Worker.Process.HasExited
-                $success = $done -and $html3Worker.Process.ExitCode -eq 0
+                $exitCode = $null
+                if ($done) {
+                    # HasExited can be true before the Process instance has
+                    # refreshed its exit-code metadata on Windows PowerShell.
+                    # WaitForExit finalizes that metadata before reporting the
+                    # page as failed or ready.
+                    $html3Worker.Process.WaitForExit()
+                    $exitCode = $html3Worker.Process.ExitCode
+                }
+                $success = $done -and $exitCode -eq 0
                 $progressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')
-                $message = if ($done -and $success) { 'Page ready.' } elseif ($done) { "Page generation failed (exit code $($html3Worker.Process.ExitCode)); see server logs." } elseif (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json; "Loading channels: $($progress.completed) / $($progress.total)" } catch { 'Loading channels...' } } else { 'Preparing channels...' }
+                $message = if ($done -and $success) { 'Page ready.' } elseif ($done) { "Page generation failed (exit code $exitCode); see server logs." } elseif (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json; "Loading channels: $($progress.completed) / $($progress.total)" } catch { 'Loading channels...' } } else { 'Preparing channels...' }
                 Send-CallbackJson $context 200 @{ done=$done; success=$success; message=$message }
                 continue
             }
