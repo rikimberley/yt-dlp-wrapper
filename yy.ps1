@@ -1626,15 +1626,26 @@ function Send-CallbackResponse {
     Send-CallbackJson $Context $StatusCode @{ message = $Message }
 }
 
-# --html3 deliberately keeps --html2's renderer intact.  It first writes this
-# short shell, then a separate PowerShell process replaces it atomically enough
-# for the browser to reload only after the full renderer has completed.
+# --html3 keeps the last rendered page visible while a separate PowerShell
+# process builds its replacement.  This makes a refresh useful instead of
+# replacing every card with an otherwise empty progress screen.
 function Write-Html3LoadingPage {
     param([string]$Token, [string]$Message)
 
     $stateUrl = '/html3/' + $Token
     $safeMessage = [System.Net.WebUtility]::HtmlEncode($Message)
-    $page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>body{margin:0;padding:16px 60px;background:#0d1117;color:#e6edf3;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif}h1{font-size:32px;border-bottom:3px solid #58a6ff;padding-bottom:8px}.progress{max-width:560px;margin:36px auto;padding:24px;border:1px solid #30363d;border-radius:10px;background:#161b22}.bar{height:8px;background:#58a6ff;animation:pulse 1.2s ease-in-out infinite alternate}@keyframes pulse{from{opacity:.35}to{opacity:1}}#status{color:#8b949e}</style></head><body><h1>YouTube Video Download</h1><div class="progress"><div class="bar"></div><p id="status">' + $safeMessage + '</p></div><script>const state="' + $stateUrl + '";const poll=async()=>{try{const s=await(await fetch(state)).json();document.querySelector("#status").textContent=s.message||"Loading channels...";if(s.done){location.reload();return}}catch{}setTimeout(poll,500)};poll()</script></body></html>'
+    $overlay = '<style>#html3-progress{position:fixed;z-index:9999;inset:0;background:rgba(13,17,23,.82);display:grid;place-items:center}.html3-progress-card{width:min(560px,calc(100vw - 32px));padding:24px;border:1px solid #30363d;border-radius:10px;background:#161b22;box-shadow:0 12px 40px #000}.html3-progress-bar{height:8px;background:#58a6ff;animation:html3-pulse 1.2s ease-in-out infinite alternate}@keyframes html3-pulse{from{opacity:.35}to{opacity:1}}#html3-progress-status{color:#8b949e}</style><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-card"><div class="html3-progress-bar"></div><p id="html3-progress-status">' + $safeMessage + '</p></div></div><script>const html3State="' + $stateUrl + '",html3Poll=async()=>{try{const s=await(await fetch(html3State)).json(),e=document.querySelector("#html3-progress-status");e.textContent=s.message||"Loading channels...";if(s.done&&s.success){location.reload();return}}catch{}setTimeout(html3Poll,500)};html3Poll()</script>'
+    $pagePath = Join-Path $PSScriptRoot 'yy.html'
+    $page = ''
+    if (Test-Path -LiteralPath $pagePath) {
+        try { $page = [System.IO.File]::ReadAllText($pagePath, [System.Text.Encoding]::UTF8) } catch { $page = '' }
+    }
+    if ($page -match '<main>') {
+        $page = $page -replace '</body>', ($overlay + '</body>')
+    }
+    else {
+        $page = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>body{margin:0;padding:16px 60px;background:#0d1117;color:#e6edf3;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif}.progress{max-width:560px;margin:36px auto;padding:24px;border:1px solid #30363d;border-radius:10px;background:#161b22}</style></head><body><h1>YouTube Video Download</h1><div class="progress">' + $overlay + '</div></body></html>'
+    }
     [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'yy.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
 }
 
@@ -1652,9 +1663,34 @@ function Write-Html3Progress {
 function Start-Html3Worker {
     param([string]$Token, [switch]$RefreshAll)
 
-    $arguments = @('-NoProfile', '-File', $PSCommandPath, '--html3-worker', $Token)
-    if ($RefreshAll) { $arguments += '--refresh-all' }
-    return Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList $arguments -PassThru
+    $safeScriptPath = $PSCommandPath.Replace("'", "''")
+    $safeToken = $Token.Replace("'", "''")
+    $command = "& '$safeScriptPath' '--html3-worker' '$safeToken'"
+    if ($RefreshAll) { $command += " '--refresh-all'" }
+    # Merge every PowerShell stream before redirecting it.  In particular,
+    # New-VideoHtml uses Write-Host, which otherwise disappears with the
+    # hidden worker process.
+    $command += ' *>&1; exit $LASTEXITCODE'
+    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
+    $logBase = Join-Path $env:TEMP ('yy-html3-worker-' + $Token)
+    $process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-OutputFormat', 'Text', '-EncodedCommand', $encodedCommand) -RedirectStandardOutput ($logBase + '.out') -RedirectStandardError ($logBase + '.err') -PassThru
+    return [pscustomobject]@{ Process=$process; OutputPath=($logBase + '.out'); ErrorPath=($logBase + '.err'); OutputLines=0; ErrorLines=0 }
+}
+
+function Write-Html3WorkerLogs {
+    param($Worker)
+
+    if ($null -eq $Worker) { return }
+    foreach ($logSource in @(@{ Path = $Worker.OutputPath; Count = 'OutputLines' }, @{ Path = $Worker.ErrorPath; Count = 'ErrorLines' })) {
+        if (-not (Test-Path -LiteralPath $logSource.Path)) { continue }
+        $lines = @(Get-Content -LiteralPath $logSource.Path -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '^(#< CLIXML|<Objs Version=)' })
+        $oldCount = [int]$Worker.PSObject.Properties[$logSource.Count].Value
+        if ($lines.Count -le $oldCount) { continue }
+        foreach ($line in @($lines[$oldCount..($lines.Count - 1)])) {
+            Write-Host "[html3] $line"
+        }
+        $Worker.PSObject.Properties[$logSource.Count].Value = $lines.Count
+    }
 }
 
 function Invoke-HtmlCallbackServer {
@@ -1689,6 +1725,7 @@ function Invoke-HtmlCallbackServer {
             $pending = $listener.BeginGetContext($null, $null)
             try {
                 while (-not $pending.AsyncWaitHandle.WaitOne(1000)) {
+                    if ($Html3) { Write-Html3WorkerLogs $html3Worker }
                     if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
                     # Never abandon a download that is still running or queued
                     # just because the browser throttled its timers while the
@@ -1724,10 +1761,12 @@ function Invoke-HtmlCallbackServer {
                 continue
             }
             if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token") {
-                $done = $null -ne $html3Worker -and $html3Worker.HasExited
+                Write-Html3WorkerLogs $html3Worker
+                $done = $null -ne $html3Worker -and $html3Worker.Process.HasExited
+                $success = $done -and $html3Worker.Process.ExitCode -eq 0
                 $progressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')
-                $message = if ($done) { 'Page ready.' } elseif (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json; "Loading channels: $($progress.completed) / $($progress.total)" } catch { 'Loading channels...' } } else { 'Preparing channels...' }
-                Send-CallbackJson $context 200 @{ done=$done; message=$message }
+                $message = if ($done -and $success) { 'Page ready.' } elseif ($done) { "Page generation failed (exit code $($html3Worker.Process.ExitCode)); see server logs." } elseif (Test-Path -LiteralPath $progressPath) { try { $progress = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json; "Loading channels: $($progress.completed) / $($progress.total)" } catch { 'Loading channels...' } } else { 'Preparing channels...' }
+                Send-CallbackJson $context 200 @{ done=$done; success=$success; message=$message }
                 continue
             }
             if ($context.Request.HttpMethod -eq 'OPTIONS' -and $context.Request.Url.AbsolutePath -in @("/download/$Token", "/stop/$Token")) {
@@ -1756,7 +1795,7 @@ function Invoke-HtmlCallbackServer {
             if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -in @("/refresh/$Token", "/refresh-all/$Token")) {
                 $refreshAll = $context.Request.Url.AbsolutePath -eq "/refresh-all/$Token"
                 if ($Html3) {
-                    if ($null -ne $html3Worker -and -not $html3Worker.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
+                    if ($null -ne $html3Worker -and -not $html3Worker.Process.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
                     Write-Html3LoadingPage -Token $Token -Message $(if ($refreshAll) { 'Refreshing all channels...' } else { 'Refreshing channels...' })
                     $html3Worker = Start-Html3Worker -Token $Token -RefreshAll:$refreshAll
                     Send-CallbackResponse $context 202 'Refreshing page.'
@@ -1815,6 +1854,10 @@ function Invoke-HtmlCallbackServer {
     finally {
         [Console]::remove_CancelKeyPress($cancelHandler)
         $script:htmlListener = $null
+        if ($null -ne $html3Worker) {
+            if (-not $html3Worker.Process.HasExited) { Stop-ProcessTree -ProcessId $html3Worker.Process.Id }
+            Write-Html3WorkerLogs $html3Worker
+        }
         if ($listener.IsListening) { $listener.Stop() }
         $listener.Close()
     }

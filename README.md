@@ -69,7 +69,7 @@ re-exporting.
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
 | `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
-| `--html3` | **PowerShell only.** Open a loading page immediately, then replace it with the complete `--html2` page when its background scan finishes; REFRESH and REFRESH ALL use the same non-blocking loading transition |
+| `--html3` | **PowerShell only.** Keep the previous video page visible under a loading overlay while a background scan builds the complete `--html2` page; the page reloads when ready, and worker diagnostics continue to print in the server console. |
 | `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 
 Precedence: `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
@@ -175,12 +175,13 @@ account-visible videos omitted by the public feed are eventually recovered.
 
 PowerShell `--html3` leaves `--html` and `--html2` unchanged. It uses the same
 incremental cache, generated controls, callback token, completion history, and
-download-job server as `--html2`; only the page lifecycle differs. The browser
-first receives a lightweight loading page, which polls the loopback server and
-shows completed/total channel scans while a child PowerShell process builds the
-normal `--html2` page. Once complete, the
-loading page reloads into that full page. REFRESH and REFRESH ALL first replace
-the current page with the same loading page, then start a new background build.
+download-job server as `--html2`; only the page lifecycle differs. If a prior
+page exists, the browser keeps it visible beneath a loading overlay that polls
+the loopback server and shows completed/total channel scans while a child
+PowerShell process builds the normal `--html2` page. Once complete, the page
+reloads into that full page. REFRESH and REFRESH ALL use the same non-blocking
+overlay. The child process's stdout, stderr, and host output are streamed to
+the server console with an `[html3]` prefix.
 
 The page has y1, y2, and none selection controls beside Download selected and
 beside every channel heading. A y1 or y2 control checks that destination's
