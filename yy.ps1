@@ -1168,7 +1168,9 @@ function Get-Html3ChannelFragment {
     if ($null -ne $PriorRecord) { foreach ($entry in @($PriorRecord.entries)) { if ($null -ne $entry -and [string]$entry.id -ne '') { $entries[[string]$entry.id] = $entry } } }
     foreach ($row in @($ScanOutput)) {
         $parts = [regex]::Split([string]$row, "`t", 5)
-        if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:') -or $parts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
+        # The scan runs with a cookie copy, so it can see members-only entries.
+        # A preview must nevertheless be limited to videos anyone can view.
+        if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:') -or $parts[4] -ne 'public') { continue }
         [long]$timestampMs = 0
         if (-not [long]::TryParse($parts[3], [ref]$timestampMs)) { continue }
         if ($timestampMs -lt 100000000000) { $timestampMs *= 1000 }
@@ -1176,7 +1178,7 @@ function Get-Html3ChannelFragment {
         $entries[$id] = [pscustomobject]@{ id=$id; url=$parts[1]; title=$parts[2]; timestamp_ms=$timestampMs; availability=$parts[4] }
     }
     $cards = New-Object System.Text.StringBuilder
-    foreach ($entry in @($entries.Values | Where-Object { [long]$_.timestamp_ms -ge $CutoffMs } | Sort-Object {[long]$_.timestamp_ms} -Descending)) {
+    foreach ($entry in @($entries.Values | Where-Object { [string]$_.availability -eq 'public' -and [long]$_.timestamp_ms -ge $CutoffMs } | Sort-Object {[long]$_.timestamp_ms} -Descending)) {
         $id = [string]$entry.id; $url = [string]$entry.url
         if ($id -eq '' -or $url -eq '') { continue }
         $checkedY1 = if ($Downloaded.ContainsKey("$ChannelId`t$id`ty1")) { ' checked' } else { '' }; $checkedY2 = if ($Downloaded.ContainsKey("$ChannelId`t$id`ty2")) { ' checked' } else { '' }
@@ -1426,7 +1428,9 @@ function New-VideoHtml {
         foreach ($scanRow in @($scan.Output)) {
             $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
             if ($scanParts.Count -lt 5 -or -not $scanParts[0].StartsWith('scan:')) { continue }
-            if ($scanParts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
+            # Keep --html2 and streamed --html3 previews public-only.  In
+            # particular, do not treat an unknown availability as public.
+            if ($scanParts[4] -ne 'public') { continue }
             [long]$approximateMs = 0
             if (-not [long]::TryParse($scanParts[3], [ref]$approximateMs)) { continue }
             if ($approximateMs -lt 100000000000) { $approximateMs *= 1000 }
@@ -1468,7 +1472,8 @@ function New-VideoHtml {
         }
     }
     if ($Incremental) { Save-HtmlVideoCache $videoCache }
-    [void]$sb.AppendLine('<section class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><div class="controls"><input id="channel-add" placeholder="@channel or UC channel id"><button id="channel-add-button" type="button">add</button></div><table class="channel-table"><thead><tr><th>Profile</th><th>Channel</th><th>Last checked</th><th>Latest video</th><th></th></tr></thead><tbody>')
+    $channelIdsStart = $sb.Length
+    [void]$sb.AppendLine('<section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><div class="controls"><input id="channel-add" placeholder="@channel or UC channel id"><button id="channel-add-button" type="button">add</button></div><table class="channel-table"><thead><tr><th>Profile</th><th>Channel</th><th>Last checked</th><th>Latest video</th><th></th></tr></thead><tbody>')
     $managedChannels = @()
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
         $channel = ([string]$rawLine).TrimStart([char]0xFEFF).Trim()
@@ -1503,6 +1508,10 @@ function New-VideoHtml {
     }
     Save-ChannelCheckStatus $ChannelStatus
     [void]$sb.AppendLine('</tbody></table></section>')
+    if ($ProgressPath -ne '') {
+        $channelIdsHtml = $sb.ToString().Substring($channelIdsStart)
+        [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath 'channels.html'), $channelIdsHtml, (New-Object System.Text.UTF8Encoding($false)))
+    }
     [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{let again=false;try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
     $pageText = $sb.ToString().Replace('if(b.running||b.queued)again=true}catch', 'again=true}catch')
     $pageText = $pageText.Replace('jobLog.textContent=(b.logs||[]).join("\n");', 'jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;')
@@ -1514,7 +1523,11 @@ function New-VideoHtml {
     $sb.Clear() | Out-Null
     [void]$sb.Append($pageText)
     $path = if ($OutputPath -ne '') { $OutputPath } else { Join-Path $temporaryDirectory 'yy.html' }
-    [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    # Keep the standalone HTML3 loading shell in place: it consumes the
+    # streamed channel fragments and the final Channel IDs fragment.
+    if ($ProgressPath -eq '') {
+        [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    }
     Save-ChannelCheckStatus $ChannelStatus
     $script:htmlFailureCount = $failures
     Write-Host "Restored $restoredSelections downloaded target selection(s) in HTML."
@@ -1687,6 +1700,17 @@ function Write-Html3LoadingPage {
 '@
     $page = $page.Replace('__TOKEN__', $Token).Replace('__MESSAGE__', $safeMessage)
     $page = $page.Replace('stateUrl=base+"state",fragmentUrl=i=>base+"fragment/"+i', 'stateUrl=base+"/state",fragmentUrl=i=>base+"/fragment/"+i')
+    $page = $page.Replace('border-bottom:3px solid var(--acc);padding-bottom:8px', 'padding-bottom:0')
+    $page = $page.Replace('</h1><p>Select', '</h1><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">__MESSAGE__</p></div><p>Select')
+    $page = $page.Replace('<main></main>', '<main><section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><p>Loading Channel IDs…</p></section></main>')
+    $page = $page.Replace('fragmentUrl=i=>base+"/fragment/"+i,api', 'fragmentUrl=i=>base+"/fragment/"+i,channelsUrl=base+"/channels",api')
+    $page = $page.Replace('setBusy=b=>controls.forEach(x=>{if(x!==top)x.disabled=b})', 'setBusy=b=>document.querySelectorAll("button,input").forEach(x=>{if(x!==top)x.disabled=b})')
+    $page = $page.Replace(';const poll=async()=>', ';const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>')
+    $page = $page.Replace('document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";', 'if(s.status==="running")document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";')
+    $page = $page.Replace('setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return', 'await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";return')
+    $page = $page.Replace('});document.querySelector("#download")', '});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download")')
+    $page = $page.Replace('#html3-progress{margin:10px 0 16px}', '#html3-progress{margin:0 0 16px}')
+    $page = $page.Replace('__MESSAGE__', $safeMessage)
     [System.IO.File]::WriteAllText((Join-Path $temporaryDirectory 'yy-html3.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
 }
 
@@ -1839,6 +1863,16 @@ function Invoke-HtmlCallbackServer {
                 $context.Response.Close()
                 continue
             }
+            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/channels") {
+                $channelsPath = Join-Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token)) 'channels.html'
+                if (-not (Test-Path -LiteralPath $channelsPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
+                $body = [System.IO.File]::ReadAllBytes($channelsPath)
+                $context.Response.ContentType = 'text/html; charset=utf-8'
+                $context.Response.ContentLength64 = $body.Length
+                $context.Response.OutputStream.Write($body, 0, $body.Length)
+                $context.Response.Close()
+                continue
+            }
             if ($context.Request.HttpMethod -eq 'OPTIONS' -and $context.Request.Url.AbsolutePath -in @("/download/$Token", "/stop/$Token")) {
                 $context.Response.StatusCode = 204
                 $context.Response.Headers['Access-Control-Allow-Origin'] = '*'
@@ -1900,7 +1934,7 @@ function Invoke-HtmlCallbackServer {
                 elseif ($change.action -eq 'add' -and -not (@($lines | Where-Object { $_.Trim() -eq $channel }).Count)) { $lines += $channel }
                 else { Send-CallbackResponse $context 400 'Invalid channel action.'; continue }
                 [System.IO.File]::WriteAllLines((Join-Path $PSScriptRoot 'channel-ids.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-                Send-CallbackResponse $context 200 'Channel IDs updated. Refreshing page.'
+                Send-CallbackJson $context 200 @{ message = 'Channel IDs updated. Refreshing page.' }
                 continue
             }
             if ($context.Request.HttpMethod -ne 'POST' -or $context.Request.Url.AbsolutePath -ne "/download/$Token") {
@@ -2040,7 +2074,7 @@ if ($OpenMode -eq 'html3-worker') {
         Write-Html3Progress -Path $workerProgressPath -Completed 0 -Total 0
         if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath -OutputPath (Join-Path $temporaryDirectory 'yy-html3.html'))) { throw 'Could not generate the HTML3 page.' }
         if ($htmlFailureCount -gt 0) { throw 'One or more channel scans failed.' }
-        Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message 'Page ready.'
+        Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message ''
         exit 0
     }
     catch {
