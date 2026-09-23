@@ -1708,6 +1708,7 @@ function Write-Html3LoadingPage {
     $page = $page.Replace('const key=x=>', 'const compactLogs=logs=>{const buckets=new Map(),percents=new Map();return logs.filter(line=>{const m=line.match(/^(\[[^\]]+\])\s+\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);if(!m)return true;const target=m[1],percent=Number(m[2]),previous=percents.get(target);if(previous!==undefined&&percent<previous-1)buckets.set(target,-1);percents.set(target,percent);const bucket=Math.floor(percent/10),last=buckets.has(target)?buckets.get(target):-1,emit=bucket>last||percent>=100;if(emit)buckets.set(target,bucket);return emit})};const showJobs=async()=>{let again=false;try{const b=await (await fetch(api("status"),{cache:"no-store"})).json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";log.textContent=compactLogs(b.logs||[]).join("\n");log.scrollTop=log.scrollHeight;if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};const key=x=>')
     $page = $page.Replace('setBusy=b=>controls.forEach(x=>{if(x!==top)x.disabled=b})', 'setBusy=b=>document.querySelectorAll("button,input").forEach(x=>{if(x!==top)x.disabled=b})')
     $page = $page.Replace(';const poll=async()=>', ';const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>')
+    $page = $page.Replace('for(const u of s.updates||[])await apply(u);', 'for(const u of (Array.isArray(s.updates)?s.updates:(s.updates?[s.updates]:[])))await apply(u);')
     $page = $page.Replace('document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";', 'if(s.status==="running")document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";')
     $page = $page.Replace('setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return', 'await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";return')
     $page = $page.Replace('});document.querySelector("#download")', '});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download")')
@@ -1725,7 +1726,7 @@ function Write-Html3Progress {
     $temporary = $Path + '.new.' + $PID
     try {
         [System.IO.File]::WriteAllText($temporary, (@{status='running';success=$false;message=("Loading channels: $Completed / $Total");completed=$Completed;total=$Total;updates=@($Updates)} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
+        [System.IO.File]::Copy($temporary, $Path, $true)
     }
     finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
 }
@@ -1739,7 +1740,7 @@ function Set-Html3WorkerState {
     $temporary = $Path + '.new.' + $PID
     try {
         [System.IO.File]::WriteAllText($temporary, (@{status=$Status;success=($Status -eq 'success');message=$Message;error=$Error;completed=$completed;total=$total;updates=$updates} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
+        [System.IO.File]::Copy($temporary, $Path, $true)
     }
     finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
 }
