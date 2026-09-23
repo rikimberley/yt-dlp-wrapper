@@ -1168,9 +1168,7 @@ function Get-Html3ChannelFragment {
     if ($null -ne $PriorRecord) { foreach ($entry in @($PriorRecord.entries)) { if ($null -ne $entry -and [string]$entry.id -ne '') { $entries[[string]$entry.id] = $entry } } }
     foreach ($row in @($ScanOutput)) {
         $parts = [regex]::Split([string]$row, "`t", 5)
-        # The scan runs with a cookie copy, so it can see members-only entries.
-        # A preview must nevertheless be limited to videos anyone can view.
-        if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:') -or $parts[4] -ne 'public') { continue }
+        if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:') -or $parts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
         [long]$timestampMs = 0
         if (-not [long]::TryParse($parts[3], [ref]$timestampMs)) { continue }
         if ($timestampMs -lt 100000000000) { $timestampMs *= 1000 }
@@ -1178,7 +1176,7 @@ function Get-Html3ChannelFragment {
         $entries[$id] = [pscustomobject]@{ id=$id; url=$parts[1]; title=$parts[2]; timestamp_ms=$timestampMs; availability=$parts[4] }
     }
     $cards = New-Object System.Text.StringBuilder
-    foreach ($entry in @($entries.Values | Where-Object { [string]$_.availability -eq 'public' -and [long]$_.timestamp_ms -ge $CutoffMs } | Sort-Object {[long]$_.timestamp_ms} -Descending)) {
+    foreach ($entry in @($entries.Values | Where-Object { [string]$_.availability -notin @('subscriber_only', 'private', 'premium_only') -and [long]$_.timestamp_ms -ge $CutoffMs } | Sort-Object {[long]$_.timestamp_ms} -Descending)) {
         $id = [string]$entry.id; $url = [string]$entry.url
         if ($id -eq '' -or $url -eq '') { continue }
         $checkedY1 = if ($Downloaded.ContainsKey("$ChannelId`t$id`ty1")) { ' checked' } else { '' }; $checkedY2 = if ($Downloaded.ContainsKey("$ChannelId`t$id`ty2")) { ' checked' } else { '' }
@@ -1428,9 +1426,7 @@ function New-VideoHtml {
         foreach ($scanRow in @($scan.Output)) {
             $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
             if ($scanParts.Count -lt 5 -or -not $scanParts[0].StartsWith('scan:')) { continue }
-            # Keep --html2 and streamed --html3 previews public-only.  In
-            # particular, do not treat an unknown availability as public.
-            if ($scanParts[4] -ne 'public') { continue }
+            if ($scanParts[4] -in @('subscriber_only', 'private', 'premium_only')) { continue }
             [long]$approximateMs = 0
             if (-not [long]::TryParse($scanParts[3], [ref]$approximateMs)) { continue }
             if ($approximateMs -lt 100000000000) { $approximateMs *= 1000 }

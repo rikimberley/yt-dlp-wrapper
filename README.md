@@ -69,7 +69,7 @@ re-exporting.
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `./.tmp/yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
 | `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
-| `--html3` | **PowerShell only.** Open an independent streaming page. A worker writes token-scoped state and public-video channel fragments, which the page adds as each channel completes; it restores the Channel IDs table (including latest-video status) when the worker finishes. |
+| `--html3` | **PowerShell only.** Open an independent streaming page. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it restores the Channel IDs table (including latest-video status) when the worker finishes. |
 | `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 
 Precedence: `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
