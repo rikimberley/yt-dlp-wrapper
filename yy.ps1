@@ -1406,6 +1406,12 @@ function New-VideoHtml {
             else {
                 [Console]::Error.WriteLine("Warning: could not incrementally scan the videos tab for @$channel; using cached entries")
                 $failures++
+                if ($ProgressPath -ne '') {
+                    [void]$script:html3FailedChannels.Add([pscustomobject]@{
+                        channel = $channel
+                        stage = 'could not scan videos tab; using cached entries'
+                    })
+                }
             }
             $cacheCheckedMs = if ($scanSucceeded) { $checkBatchMs } elseif ($null -ne $priorRecord) { [long]$priorRecord.checked_ms } else { [long]0 }
             $lastFullScanMs = if ($fullScanSucceeded) { $checkBatchMs } elseif ($lastFullScans.ContainsKey($channel)) { [long]$lastFullScans[$channel] } else { [long]0 }
