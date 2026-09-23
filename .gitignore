@@ -40,9 +40,10 @@ channel-id-cache.txt
 channel-ids.txt
 
 # ---------------------------------------------------------------------------
-# Scratch files written by the -U self-update: a same-directory temp file that
-# is renamed into place, and the backup of the wrapper it replaced.
+# Disposable runtime files: self-update staging and backups, generated pages,
+# HTML3 worker state/fragments, subprocess captures, and atomic-write files.
 # ---------------------------------------------------------------------------
+.tmp/
 *.new.*
 *.bak
 yy.html

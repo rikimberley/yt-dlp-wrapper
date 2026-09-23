@@ -55,6 +55,8 @@ cd -- "${0:A:h}" || exit 1
 
 script_dir=${0:A:h}
 script_self=${0:A}
+temporary_directory="$script_dir/.tmp"
+mkdir -p -- "$temporary_directory" || exit 1
 url_file="./current_url.txt"
 channels_file="./channel-ids.txt"
 channel_id_cache_file="./channel-id-cache.txt"
@@ -63,7 +65,7 @@ cookies_file="./cookies.txt"
 channel_status_file="./channel-check-status.json"
 downloaded_videos_file="./downloaded-videos.json"
 html_video_cache_file="./html-video-cache.json"
-html_file="./yy.html"
+html_file="$temporary_directory/yy.html"
 user_agent="Mozilla/5.0"
 accept_language="en-US,en;q=0.9"
 # Pre-accepted consent cookies: without them YouTube can answer a channel page
@@ -555,7 +557,7 @@ read_channel_check_status() {
 }
 
 save_channel_check_status() {
-  local tmp="${channel_status_file}.new.$$" channel first=1
+  local tmp="$temporary_directory/channel-check-status.json.new.$$" channel first=1
   : >| "$tmp" || { printf 'Warning: could not write %s\n' "$channel_status_file" >&2; return 0; }
   print -rn -- '{' >> "$tmp"
   for channel in "${status_channels[@]}"; do
@@ -672,7 +674,7 @@ read_downloaded_videos() {
 }
 
 save_downloaded_videos() {
-  local tmp="${downloaded_videos_file}.new.$$" key first=1
+  local tmp="$temporary_directory/downloaded-videos.json.new.$$" key first=1
   local -a fields
   : >| "$tmp" || { printf 'Warning: could not write %s\n' "$downloaded_videos_file" >&2; return 0; }
   print -rn -- '[' >> "$tmp"
@@ -781,7 +783,7 @@ read_html_video_cache() {
 }
 
 save_html_video_cache() {
-  local tmp="${html_video_cache_file}.new.$$" channel row first=1 entry_first
+  local tmp="$temporary_directory/html-video-cache.json.new.$$" channel row first=1 entry_first
   local -a fields
   : >| "$tmp" || { printf 'Warning: could not write %s\n' "$html_video_cache_file" >&2; return 0; }
   print -rn -- '{' >> "$tmp"
@@ -839,7 +841,7 @@ fetch_url_once() {
   local -a extra
   fetch_body=""; fetch_error=""; fetch_status=0
   [[ "$mode" == "no-consent" ]] || extra=(-H "Cookie: ${consent_cookie}")
-  errfile=$(mktemp) || return 1
+  errfile=$(mktemp "$temporary_directory/yy-fetch-error.XXXXXX") || return 1
   raw=$(curl -sS --compressed --location --max-time "$fetch_timeout_sec" \
     -A "$user_agent" \
     -H "Accept-Language: ${accept_language}" \
@@ -902,7 +904,7 @@ fetch_urls_concurrent() {
   for (( attempt = 1; attempt <= fetch_attempts; attempt++ )); do
     (( ${#pending} )) || break
     (( attempt > 1 )) && sleep $(( attempt - 1 ))
-    dir=$(mktemp -d) || return 0
+    dir=$(mktemp -d "$temporary_directory/yy-fetch.XXXXXX") || return 0
     pids=(); keys=()
     local -a curl_extra
     curl_extra=()
@@ -976,15 +978,13 @@ update_self() {
     printf '%s is already up to date\n' "$name"
     return 0
   fi
-  # Write to a same-directory temp file and rename, so an interrupted write can
-  # never truncate the running script. The .bak is the escape hatch for a clone
-  # that had uncommitted local edits.
-  tmp="./${name}.new.$$"
+  # Keep update scratch files and the recoverable previous copy under ./.tmp.
+  tmp="$temporary_directory/${name}.new.$$"
   print -r -- "$body" > "$tmp" || return 1
   [[ -x "./$name" ]] && { chmod +x "$tmp" || true }
-  [[ -f "./$name" ]] && { cp -p -- "./$name" "./${name}.bak" || true }
+  [[ -f "./$name" ]] && { cp -p -- "./$name" "$temporary_directory/${name}.bak" || true }
   mv -f -- "$tmp" "./$name" || return 1
-  printf 'Updated %s from master (previous copy saved as %s.bak)\n' "$name" "$name"
+  printf 'Updated %s from master (previous copy saved in .tmp)\n' "$name"
 }
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1008,7 @@ cached_channel_id() {
 # failure must never fail a run.
 store_channel_id() {
   local handle=$1 id=$2 tmp h existing
-  tmp=$(mktemp) || return 0
+  tmp=$(mktemp "$temporary_directory/channel-id-cache.txt.new.XXXXXX") || return 0
   if [[ -f "$channel_id_cache_file" ]]; then
     while IFS=$'\t' read -r h existing || [[ -n "$h" ]]; do
       [[ -z "$h" || "$h" == "$handle" ]] && continue
@@ -1051,7 +1051,7 @@ run_ytdlp_metadata() {
     esac
   done
   ytdlp_output=""
-  tmp=$(mktemp) || return 1
+  tmp=$(mktemp "$temporary_directory/yt-dlp-metadata.XXXXXX") || return 1
   if (( show_progress )); then
     "$@" >"$tmp" 2> >(
       while IFS= read -r line; do
@@ -1429,7 +1429,7 @@ HTMLJS
   print -r -- "$js"
 }
 
-# Build ./yy.html from qualifying account-visible entries on each /videos tab.
+# Build ./.tmp/yy.html from qualifying account-visible entries on each /videos tab.
 # $1 is the callback base URL, $2 enables REFRESH ALL (scan even stale
 # channels), $3 enables --html2's incremental cache. Leaves the number of
 # channels that could not be scanned in $html_failure_count.
@@ -1561,15 +1561,15 @@ generate_html() {
   # Scan pool. Each slot owns an ephemeral copy of the cookie jar so concurrent
   # yt-dlp processes never rewrite the same file; the copies are removed on the
   # way out, including on interruption.
-  result_dir=$(mktemp -d) || return 1
+  result_dir=$(mktemp -d "$temporary_directory/yy-html-scan.XXXXXX") || return 1
   local -a scan_cookie_files free_slots worker_pid worker_slot worker_index
   # Declared here, not inside the pool loop: a bare `local name` for a variable
   # that already exists in the same scope makes zsh *print* it (`w=0`).
   local w done_any=0
   local -a cleanup_paths
   for (( slot = 0; slot < MAX_THREADS; slot++ )); do
-    cp -f -- "$cookies_file" "./cookies${slot}.txt" 2>/dev/null || continue
-    scan_cookie_files+=("./cookies${slot}.txt")
+    cp -f -- "$cookies_file" "$temporary_directory/cookies${slot}.txt" 2>/dev/null || continue
+    scan_cookie_files+=("$temporary_directory/cookies${slot}.txt")
     free_slots+=("$slot")
   done
   html_scan_cleanup() {
@@ -1789,7 +1789,7 @@ generate_html() {
   done
   save_channel_check_status
 
-  tmp_page="${html_file}.new.$$"
+  tmp_page="$temporary_directory/yy.html.new.$$"
   {
     print -r -- '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title>'
     print -r -- "$html_page_css"
@@ -2016,7 +2016,7 @@ start_next_download_job() {
   local id base
   for id in "${job_ids[@]}"; do
     [[ "${job_state[$id]}" == queued ]] || continue
-    base=$(mktemp -t yy-html-job) || return 1
+    base=$(mktemp "$temporary_directory/yy-html-job.XXXXXX") || return 1
     job_log[$id]="${base}.out"
     job_rcfile[$id]="${base}.rc"
     rm -f -- "$base"
@@ -2143,7 +2143,7 @@ apply_channel_change() {
     channel_change_error='Invalid channel id.'
     return 1
   fi
-  tmp="${channels_file}.new.$$"
+  tmp="$temporary_directory/channel-ids.txt.new.$$"
   : >| "$tmp" || { channel_change_error='Could not update channel-ids.txt.'; return 1; }
   if [[ -f "$channels_file" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do

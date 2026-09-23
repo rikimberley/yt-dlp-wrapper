@@ -34,9 +34,9 @@ signed updater:
 
 `-U` also refreshes the wrapper itself from the head of `master` in this repo,
 so a copy that lives outside a git clone stays current. The download is refused
-unless it starts with the expected shebang, and the copy it replaces is kept as
-`yy.zsh.bak` / `yy.ps1.bak` — so if you had uncommitted local edits, they are
-recoverable there.
+unless it starts with the expected shebang, and the copy it replaces is kept
+under `./.tmp/yy.zsh.bak` or `./.tmp/yy.ps1.bak` — so if you had uncommitted
+local edits, they are recoverable there.
 
 You also need a `channel-ids.txt` next to the wrappers if you want `-o`/`-O` —
 one channel handle (a leading `@` is optional) or raw `UC…` id per line, with
@@ -67,7 +67,7 @@ re-exporting.
 | `-p <path>` | Download into `<path>` instead of the automatic/default path |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
-| `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
+| `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `./.tmp/yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
 | `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
 | `--html3` | **PowerShell only.** Open an independent streaming page. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it stays interactive when the worker finishes. |
 | `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
@@ -210,8 +210,9 @@ large channels can require many continuation pages.
 | `channel-check-status.json` | Per-channel last-checked time, latest video time and avatar *(gitignored)* |
 | `html-video-cache.json` | `--html2` incremental video metadata *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
-| `yy.html` | Generated `--html` video grid *(gitignored)* |
-| `yy-html3.html`, `yy-html3-*.json`, `yy-html3-*/` | Generated standalone `--html3` shell, state, and channel fragments *(gitignored)* |
+| `.tmp/yy.html` | Generated `--html` / `--html2` video grid *(gitignored)* |
+| `.tmp/yy-html3.html`, `.tmp/yy-html3-*.json`, `.tmp/yy-html3-*/` | Generated standalone `--html3` shell, state, and channel fragments *(gitignored)* |
+| `.tmp/` | Disposable yt-dlp captures, worker cookie copies, atomic-write files, and self-update backups *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |
 | `t/` | Download output *(gitignored)* |
 

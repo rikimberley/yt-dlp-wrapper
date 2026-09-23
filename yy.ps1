@@ -66,6 +66,10 @@ $ProgressPreference = 'SilentlyContinue'
 
 # cd to the script's directory
 Set-Location -LiteralPath $PSScriptRoot
+$temporaryDirectory = Join-Path $PSScriptRoot '.tmp'
+if (-not (Test-Path -LiteralPath $temporaryDirectory)) {
+    New-Item -ItemType Directory -Path $temporaryDirectory -Force | Out-Null
+}
 
 $urlFile = './current_url.txt'
 $channelsFile = './channel-ids.txt'
@@ -448,17 +452,18 @@ function Update-Self {
         }
     }
 
-    # Write to a same-directory temp file and rename, so an interrupted write can
-    # never truncate the running script. UTF-8 *without* a BOM: Set-Content
+    # Stage the update in ./.tmp, then replace the target only after its full
+    # contents were written. UTF-8 *without* a BOM: Set-Content
     # -Encoding UTF8 on 5.1 would prepend one and the file would stop matching
     # the repo byte for byte. The .bak is the escape hatch for a clone that had
     # uncommitted local edits.
-    $temp = "$target.new.$PID"
+    $temp = Join-Path $temporaryDirectory ($Name + '.new.' + $PID)
+    $backup = Join-Path $temporaryDirectory ($Name + '.bak')
     try {
         [System.IO.File]::WriteAllText(
             $temp, $normalized, (New-Object System.Text.UTF8Encoding($false)))
         if (Test-Path -LiteralPath $target) {
-            Copy-Item -LiteralPath $target -Destination "$target.bak" -Force
+            Copy-Item -LiteralPath $target -Destination $backup -Force
         }
         Move-Item -LiteralPath $temp -Destination $target -Force
     }
@@ -470,7 +475,7 @@ function Update-Self {
         return $false
     }
 
-    Write-Host "Updated $Name from master (previous copy saved as $Name.bak)"
+    Write-Host "Updated $Name from master (previous copy saved in .tmp)"
     return $true
 }
 
@@ -652,8 +657,8 @@ function Invoke-YtDlpMetadata {
     $exe = Get-YtDlpPath
     if ($exe -eq '') { return @{ Output = @(); ExitCode = 1 } }
     $token = [guid]::NewGuid().ToString('N')
-    $stdout = Join-Path $PSScriptRoot "yt-dlp.$token.stdout"
-    $stderr = Join-Path $PSScriptRoot "yt-dlp.$token.stderr"
+    $stdout = Join-Path $temporaryDirectory "yt-dlp.$token.stdout"
+    $stderr = Join-Path $temporaryDirectory "yt-dlp.$token.stderr"
     try {
         $argumentLine = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' ')
         $process = Start-Process -FilePath $exe -ArgumentList $argumentLine -NoNewWindow `
@@ -710,8 +715,8 @@ function Start-HtmlScanWorker {
     param([string]$Executable, [string[]]$Arguments, [string]$Channel, [int]$Index, [int]$Slot)
 
     $token = [guid]::NewGuid().ToString('N')
-    $stdout = Join-Path $PSScriptRoot "yt-dlp.$token.stdout"
-    $stderr = Join-Path $PSScriptRoot "yt-dlp.$token.stderr"
+    $stdout = Join-Path $temporaryDirectory "yt-dlp.$token.stdout"
+    $stderr = Join-Path $temporaryDirectory "yt-dlp.$token.stderr"
     try {
         $argumentLine = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument ([string]$_) }) -join ' ')
         $process = Start-Process -FilePath $Executable -ArgumentList $argumentLine -NoNewWindow `
@@ -907,7 +912,7 @@ function Read-HtmlVideoCache {
 
 function Save-HtmlVideoCache {
     param([hashtable]$Cache)
-    $temp = "$htmlVideoCacheFile.new.$PID"
+    $temp = Join-Path $temporaryDirectory ((Split-Path -Leaf $htmlVideoCacheFile) + '.new.' + $PID)
     try {
         [System.IO.File]::WriteAllText($temp, ($Cache | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $temp -Destination $htmlVideoCacheFile -Force
@@ -959,7 +964,7 @@ function Read-DownloadedVideos {
 
 function Save-DownloadedVideos {
     param($Items)
-    $tmp = $downloadedVideosFile + '.new.' + [guid]::NewGuid().ToString('N')
+    $tmp = Join-Path $temporaryDirectory ((Split-Path -Leaf $downloadedVideosFile) + '.new.' + [guid]::NewGuid().ToString('N'))
     try {
         $values = @($Items)
         $json = if ($values.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $values -Depth 3 }
@@ -1295,7 +1300,7 @@ function New-VideoHtml {
     $freeSlots = New-Object 'System.Collections.Generic.Queue[int]'
     try {
         for ($slot = 0; $slot -lt $MAX_THREADS; $slot++) {
-            $workerCookieFile = "./cookies$slot.txt"
+            $workerCookieFile = Join-Path $temporaryDirectory "cookies$slot.txt"
             Copy-Item -LiteralPath $cookiesFile -Destination $workerCookieFile -Force
             [void]$scanCookieFiles.Add($workerCookieFile)
             $freeSlots.Enqueue($slot)
@@ -1508,7 +1513,7 @@ function New-VideoHtml {
     $pageText = $pageText.Replace('</script></main>', '</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async(all=false)=>{status.textContent=all?"Refreshing all channels...":"Refreshing channels...";try{const b=await (await fetch(all?"' + $refreshAllUrl + '":"' + $refreshUrl + '",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("' + $checkpointUrl + '",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=()=>refreshPage(false);document.querySelector("#refresh-all").onclick=()=>refreshPage(true);document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("' + $channelUrl + '",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("' + $channelUrl + '",{action:"delete",channel:b.dataset.channel});refreshPage()});</script></main>')
     $sb.Clear() | Out-Null
     [void]$sb.Append($pageText)
-    $path = if ($OutputPath -ne '') { $OutputPath } else { Join-Path $PSScriptRoot 'yy.html' }
+    $path = if ($OutputPath -ne '') { $OutputPath } else { Join-Path $temporaryDirectory 'yy.html' }
     [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     Save-ChannelCheckStatus $ChannelStatus
     $script:htmlFailureCount = $failures
@@ -1572,7 +1577,7 @@ function Start-NextDownloadJob {
     $safeUrl = ([string]$job.Url).Replace("'", "''")
     $command = "`$ProgressPreference = 'SilentlyContinue'; & '$safeHook' '-p' '$safePath' '-t' '$safeUrl'; exit `$LASTEXITCODE"
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
-    $logBase = Join-Path $env:TEMP ('yy-html-job-' + [guid]::NewGuid().ToString('N'))
+    $logBase = Join-Path $temporaryDirectory ('yy-html-job-' + [guid]::NewGuid().ToString('N'))
     Write-Host "Running: $($job.Hook) -p $($job.DownloadPath) -t $($job.Url)"
     $job.Process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-OutputFormat', 'Text', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encodedCommand) -RedirectStandardOutput ($logBase + '.out') -RedirectStandardError ($logBase + '.err') -PassThru
     $job.OutputPath = $logBase + '.out'; $job.ErrorPath = $logBase + '.err'; $job.State = 'running'
@@ -1682,7 +1687,7 @@ function Write-Html3LoadingPage {
 '@
     $page = $page.Replace('__TOKEN__', $Token).Replace('__MESSAGE__', $safeMessage)
     $page = $page.Replace('stateUrl=base+"state",fragmentUrl=i=>base+"fragment/"+i', 'stateUrl=base+"/state",fragmentUrl=i=>base+"/fragment/"+i')
-    [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'yy-html3.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $temporaryDirectory 'yy-html3.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Write-Html3Progress {
@@ -1715,7 +1720,7 @@ function Start-Html3Worker {
 
     # Reset the state before the child starts so a refresh cannot expose the
     # previous run's explicit success result during process startup.
-    Write-Html3Progress -Path (Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')) -Completed 0 -Total 0
+    Write-Html3Progress -Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token + '.json')) -Completed 0 -Total 0
     $safeScriptPath = $PSCommandPath.Replace("'", "''")
     $safeToken = $Token.Replace("'", "''")
     $command = "& '$safeScriptPath' '--html3-worker' '$safeToken'"
@@ -1725,7 +1730,7 @@ function Start-Html3Worker {
     # hidden worker process.
     $command += ' *>&1; exit $LASTEXITCODE'
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
-    $logBase = Join-Path $env:TEMP ('yy-html3-worker-' + $Token)
+    $logBase = Join-Path $temporaryDirectory ('yy-html3-worker-' + $Token)
     $process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-OutputFormat', 'Text', '-EncodedCommand', $encodedCommand) -RedirectStandardOutput ($logBase + '.out') -RedirectStandardError ($logBase + '.err') -PassThru
     return [pscustomobject]@{ Process=$process; OutputPath=($logBase + '.out'); ErrorPath=($logBase + '.err'); OutputLines=0; ErrorLines=0; Succeeded=$false }
 }
@@ -1803,7 +1808,7 @@ function Invoke-HtmlCallbackServer {
             }
             if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq '/') {
                 $pageName = if ($Html3) { 'yy-html3.html' } else { 'yy.html' }
-                $body = [System.IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $pageName))
+                $body = [System.IO.File]::ReadAllBytes((Join-Path $temporaryDirectory $pageName))
                 $context.Response.ContentType = 'text/html; charset=utf-8'
                 $context.Response.ContentLength64 = $body.Length
                 $context.Response.OutputStream.Write($body, 0, $body.Length)
@@ -1816,7 +1821,7 @@ function Invoke-HtmlCallbackServer {
             }
             if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/state") {
                 Write-Html3WorkerLogs $html3Worker
-                $progressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Token + '.json')
+                $progressPath = Join-Path $temporaryDirectory ('yy-html3-' + $Token + '.json')
                 if (Test-Path -LiteralPath $progressPath) {
                     try { Send-CallbackJson $context 200 (Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
                     catch { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
@@ -1825,7 +1830,7 @@ function Invoke-HtmlCallbackServer {
                 continue
             }
             if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\d+)$')) {
-                $fragmentPath = Join-Path (Join-Path $PSScriptRoot ('yy-html3-' + $Token)) ($Matches[1] + '.html')
+                $fragmentPath = Join-Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token)) ($Matches[1] + '.html')
                 if (-not (Test-Path -LiteralPath $fragmentPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
                 $body = [System.IO.File]::ReadAllBytes($fragmentPath)
                 $context.Response.ContentType = 'text/html; charset=utf-8'
@@ -2027,13 +2032,13 @@ $channelCheckStatus = Read-ChannelCheckStatus
 if ($OpenMode -eq 'html3-worker') {
     $workerCallbackUrl = 'http://127.0.0.1:8080/download/' + $Html3WorkerToken
     $workerStatus = Read-ChannelCheckStatus
-    $workerProgressPath = Join-Path $PSScriptRoot ('yy-html3-' + $Html3WorkerToken + '.json')
-    $workerFragmentsPath = Join-Path $PSScriptRoot ('yy-html3-' + $Html3WorkerToken)
+    $workerProgressPath = Join-Path $temporaryDirectory ('yy-html3-' + $Html3WorkerToken + '.json')
+    $workerFragmentsPath = Join-Path $temporaryDirectory ('yy-html3-' + $Html3WorkerToken)
     try {
         if (Test-Path -LiteralPath $workerFragmentsPath) { Remove-Item -LiteralPath $workerFragmentsPath -Recurse -Force }
         New-Item -ItemType Directory -Path $workerFragmentsPath -Force | Out-Null
         Write-Html3Progress -Path $workerProgressPath -Completed 0 -Total 0
-        if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath -OutputPath (Join-Path $PSScriptRoot 'yy-html3.html'))) { throw 'Could not generate the HTML3 page.' }
+        if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath -OutputPath (Join-Path $temporaryDirectory 'yy-html3.html'))) { throw 'Could not generate the HTML3 page.' }
         if ($htmlFailureCount -gt 0) { throw 'One or more channel scans failed.' }
         Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message 'Page ready.'
         exit 0
