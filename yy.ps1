@@ -1206,6 +1206,7 @@ function New-VideoHtml {
     $scanCutoffSec = [Math]::Max(0, $checkpointDayStartSec - 86400)
     $checkpointAge = Format-RelativeVideoTime $checkpointMs
     $failures = 0
+    if ($ProgressPath -ne '') { $script:html3FailedChannels = New-Object System.Collections.ArrayList }
     $checkBatchMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $downloaded = @{}
     foreach ($item in @(Read-DownloadedVideos)) {
@@ -1238,7 +1239,11 @@ function New-VideoHtml {
         if ($channel -match '^UC[A-Za-z0-9_-]+$') { $htmlChannelIds[$channel] = $channel }
         else {
             $resolved = Resolve-ChannelId -Handle $channel -ChannelUrl (Get-ChannelUrl $channel) -Cache $channelIdCache
-            if ($resolved.Id -eq '') { $failures++; continue }
+            if ($resolved.Id -eq '') {
+                $failures++
+                if ($ProgressPath -ne '') { [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not resolve channel id'}) }
+                continue
+            }
             $htmlChannelIds[$channel] = $resolved.Id
         }
         $channelCutoff = [long]$scanCutoffSec
@@ -1421,7 +1426,12 @@ function New-VideoHtml {
             }
             $scan = @{ Output = $cachedRows; ExitCode = 0 }
         }
-        if ($scan.ExitCode -notin @(0, 101)) { [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel"); $failures++; continue }
+        if ($scan.ExitCode -notin @(0, 101)) {
+            [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel")
+            $failures++
+            if ($ProgressPath -ne '') { [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not scan videos tab'}) }
+            continue
+        }
         $rows = New-Object System.Collections.ArrayList
         foreach ($scanRow in @($scan.Output)) {
             $scanParts = [regex]::Split([string]$scanRow, "`t", 5)
@@ -1710,7 +1720,7 @@ function Write-Html3LoadingPage {
     $page = $page.Replace(';const poll=async()=>', ';const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>')
     $page = $page.Replace('for(const u of s.updates||[])await apply(u);', 'for(const u of (Array.isArray(s.updates)?s.updates:(s.updates?[s.updates]:[])))await apply(u);')
     $page = $page.Replace('document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";', 'if(s.status==="running")document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";')
-    $page = $page.Replace('setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return', 'await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";return')
+    $page = $page.Replace('setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return', 'await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";const failed=Array.isArray(s.failed_channels)?s.failed_channels:(s.failed_channels?[s.failed_channels]:[]);if(failed.length)status.textContent="Completed with channel errors: "+failed.map(x=>"@"+x.channel+" ("+x.stage+")").join(", ");return')
     $page = $page.Replace('});document.querySelector("#download")', '});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download")')
     $page = $page.Replace('if(!items.length){status.textContent="Select at least one video";return}const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started"', 'if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}')
     $page = $page.Replace('top.disabled=false;setBusy(true);poll()', 'top.disabled=false;setInterval(()=>fetch(api("heartbeat"),{method:"POST",keepalive:true}),2000);showJobs();setBusy(true);poll()')
@@ -1732,14 +1742,14 @@ function Write-Html3Progress {
 }
 
 function Set-Html3WorkerState {
-    param([string]$Path, [string]$Status, [string]$Message, [string]$Error = '')
+    param([string]$Path, [string]$Status, [string]$Message, [string]$Error = '', $FailedChannels = @())
 
     $current = $null
     if (Test-Path -LiteralPath $Path) { try { $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
     $completed = if ($null -ne $current) { [int]$current.completed } else { 0 }; $total = if ($null -ne $current) { [int]$current.total } else { 0 }; $updates = if ($null -ne $current) { @($current.updates) } else { @() }
     $temporary = $Path + '.new.' + $PID
     try {
-        [System.IO.File]::WriteAllText($temporary, (@{status=$Status;success=($Status -eq 'success');message=$Message;error=$Error;completed=$completed;total=$total;updates=$updates} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($temporary, (@{status=$Status;success=($Status -eq 'success');message=$Message;error=$Error;failed_channels=@($FailedChannels);completed=$completed;total=$total;updates=$updates} | ConvertTo-Json -Compress -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
         [System.IO.File]::Copy($temporary, $Path, $true)
     }
     finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
@@ -2079,8 +2089,11 @@ if ($OpenMode -eq 'html3-worker') {
         New-Item -ItemType Directory -Path $workerFragmentsPath -Force | Out-Null
         Write-Html3Progress -Path $workerProgressPath -Completed 0 -Total 0
         if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath -OutputPath (Join-Path $temporaryDirectory 'yy-html3.html'))) { throw 'Could not generate the HTML3 page.' }
-        if ($htmlFailureCount -gt 0) { throw 'One or more channel scans failed.' }
-        Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message ''
+        $failedChannels = @($script:html3FailedChannels)
+        foreach ($failedChannel in $failedChannels) {
+            Write-Host "HTML3 skipped failed channel @$($failedChannel.channel): $($failedChannel.stage)"
+        }
+        Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message '' -FailedChannels $failedChannels
         exit 0
     }
     catch {
