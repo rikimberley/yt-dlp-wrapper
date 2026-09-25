@@ -163,7 +163,8 @@ Missing or unreadable caches are rebuilt. Successful scans merge new metadata
 with cached cards; failed scans retain cached cards. `REFRESH` retains the
 45-day active-channel filter, while `REFRESH ALL` checks every channel using
 the same incremental boundary. Missing channel avatars are fetched concurrently
-and retained in `channel-check-status.json`.
+and retained in `channel-check-status.json`. On startup, stale status and
+incremental-video cache records older than 45 days are pruned.
 
 Cached `--html2` channels that completed a yt-dlp scan within the last 24 hours
 are first checked through their public Atom feeds concurrently.
@@ -207,12 +208,12 @@ large channels can require many continuation pages.
 | `checkpoint.txt` | Epoch timestamp `-o` compares against; missing or empty means "no checkpoint" (0), so every video counts as new *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
 | `downloaded-videos.json` | Successful HTML downloads retained for 45 days *(gitignored)* |
-| `channel-check-status.json` | Per-channel last-checked time, latest video time and avatar *(gitignored)* |
-| `html-video-cache.json` | `--html2` incremental video metadata *(gitignored)* |
+| `channel-check-status.json` | Per-channel last-checked time, latest video time and avatar; records older than 45 days are pruned on startup *(gitignored)* |
+| `html-video-cache.json` | `--html2` incremental video metadata; records older than 45 days are pruned when read *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
 | `.tmp/yy.html` | Generated `--html` / `--html2` video grid *(gitignored)* |
 | `.tmp/yy-html3.html`, `.tmp/yy-html3-*.json`, `.tmp/yy-html3-*/` | Generated standalone `--html3` shell, state, and channel fragments *(gitignored)* |
-| `.tmp/` | Disposable yt-dlp captures, worker cookie copies, atomic-write files, and self-update backups *(gitignored)* |
+| `.tmp/` | Disposable yt-dlp captures, worker cookie copies, atomic-write files, and self-update backups. Starting `--html3` removes `yy-html*` artifacts and `yt-dlp.<guid>.stdout`/`.stderr` captures older than 45 days; backups and unrelated files are retained *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |
 | `t/` | Download output *(gitignored)* |
 

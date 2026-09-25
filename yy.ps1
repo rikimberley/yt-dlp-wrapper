@@ -899,12 +899,42 @@ function Save-ChannelCheckStatus {
     [System.IO.File]::WriteAllText($channelStatusFile, ($Status | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Remove-StaleChannelCheckStatus {
+    param([hashtable]$Status)
+
+    $cutoffMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - (45L * 86400L * 1000L)
+    $removed = 0
+    foreach ($channel in @($Status.Keys)) {
+        $record = $Status[$channel]
+        [long]$checkedMs = 0
+        if ($null -ne $record -and $null -ne $record.PSObject.Properties['checked_ms']) {
+            [void][long]::TryParse([string]$record.checked_ms, [ref]$checkedMs)
+        }
+        if ($checkedMs -gt 0 -and $checkedMs -lt $cutoffMs) {
+            [void]$Status.Remove($channel)
+            $removed++
+        }
+    }
+    if ($removed -gt 0) { Save-ChannelCheckStatus $Status }
+}
+
 function Read-HtmlVideoCache {
     if (-not (Test-Path -LiteralPath $htmlVideoCacheFile)) { return @{} }
     try {
         $value = Get-Content -Raw -LiteralPath $htmlVideoCacheFile -Encoding UTF8 | ConvertFrom-Json
         $result = @{}
-        foreach ($property in $value.PSObject.Properties) { $result[$property.Name] = $property.Value }
+        $cutoffMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - (45L * 86400L * 1000L)
+        $changed = $false
+        foreach ($property in $value.PSObject.Properties) {
+            $record = $property.Value
+            [long]$checkedMs = 0
+            if ($null -ne $record -and $null -ne $record.PSObject.Properties['checked_ms']) {
+                [void][long]::TryParse([string]$record.checked_ms, [ref]$checkedMs)
+            }
+            if ($checkedMs -gt 0 -and $checkedMs -lt $cutoffMs) { $changed = $true; continue }
+            $result[$property.Name] = $record
+        }
+        if ($changed) { Save-HtmlVideoCache $result }
         return $result
     }
     catch { [Console]::Error.WriteLine("Warning: could not read $htmlVideoCacheFile; rebuilding it"); return @{} }
@@ -1788,6 +1818,18 @@ function Set-Html3WorkerState {
     finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
 }
 
+function Remove-StaleTemporaryArtifacts {
+    $cutoff = [DateTime]::UtcNow.AddDays(-45)
+    $stale = @(Get-ChildItem -LiteralPath $temporaryDirectory -Force -ErrorAction SilentlyContinue | Where-Object {
+        ($_.Name -like 'yy-html*' -or $_.Name -match '^yt-dlp\.[0-9a-f]{32}\.(stdout|stderr)$') -and
+        $_.LastWriteTimeUtc -lt $cutoff
+    })
+    foreach ($item in $stale) {
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($stale.Count -gt 0) { Write-Host "Pruned $($stale.Count) temporary HTML/yt-dlp artifact(s) older than 45 days." }
+}
+
 function Start-Html3Worker {
     param([string]$Token, [switch]$RefreshAll)
 
@@ -2112,6 +2154,7 @@ $openFailures = 0
 $openChannelCount = 0
 $checkpointAfterChecksMs = [long]0
 $channelCheckStatus = Read-ChannelCheckStatus
+Remove-StaleChannelCheckStatus $channelCheckStatus
 if ($OpenMode -eq 'html3-worker') {
     $workerCallbackUrl = 'http://127.0.0.1:8080/download/' + $Html3WorkerToken
     $workerStatus = Read-ChannelCheckStatus
@@ -2145,6 +2188,7 @@ if ($OpenMode -ne '') {
         $token = [guid]::NewGuid().ToString('N')
         $callbackUrl = 'http://127.0.0.1:8080/download/' + $token
         if ($OpenMode -eq 'html3') {
+            Remove-StaleTemporaryArtifacts
             Write-Html3LoadingPage -Token $token -Message 'Loading channels...'
             if (-not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental -Html3)) { $openFailures = 1 }
         }
