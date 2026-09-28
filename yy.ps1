@@ -1207,15 +1207,28 @@ function Get-Html3ChannelFragment {
         $entries[$id] = [pscustomobject]@{ id=$id; url=$parts[1]; title=$parts[2]; timestamp_ms=$timestampMs; availability=$parts[4] }
     }
     $cards = New-Object System.Text.StringBuilder
+    $restoredTargetSelections = 0
+    $visibleCards = 0
     foreach ($entry in @($entries.Values | Where-Object { [string]$_.availability -notin @('subscriber_only', 'private', 'premium_only') -and [long]$_.timestamp_ms -ge $CutoffMs } | Sort-Object {[long]$_.timestamp_ms} -Descending)) {
         $id = [string]$entry.id; $url = [string]$entry.url
         if ($id -eq '' -or $url -eq '') { continue }
         # A restored target means this video was already submitted for download.
         # Remove the whole card rather than offering either target again.
-        if ($Downloaded.ContainsKey("$ChannelId`t$id`ty1") -or $Downloaded.ContainsKey("$ChannelId`t$id`ty2")) { continue }
+        $restoredY1 = $Downloaded.ContainsKey("$ChannelId`t$id`ty1")
+        $restoredY2 = $Downloaded.ContainsKey("$ChannelId`t$id`ty2")
+        if ($restoredY1 -or $restoredY2) {
+            if ($restoredY1) { $restoredTargetSelections++ }
+            if ($restoredY2) { $restoredTargetSelections++ }
+            continue
+        }
         $checkedY1 = ''; $checkedY2 = ''
         $card = '<article class="card"><a class="video-link" href="{2}" target="_blank" rel="noopener noreferrer"><div class="preview"><img src="{0}" alt=""></div><div class="video-title">{1}</div></a><div class="video-age">{3}</div><div class="checks"><label><input class="y1" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{7}> y1</label><label><input class="y2" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{8}> y2</label></div></article>' -f ([System.Net.WebUtility]::HtmlEncode("https://i.ytimg.com/vi/$id/hqdefault.jpg")), ([System.Net.WebUtility]::HtmlEncode([string]$entry.title)), ([System.Net.WebUtility]::HtmlEncode($url)), ([System.Net.WebUtility]::HtmlEncode((Format-RelativeVideoTime ([long]$entry.timestamp_ms)))), ([System.Net.WebUtility]::HtmlEncode('./' + $Channel)), ([System.Net.WebUtility]::HtmlEncode($ChannelId)), ([System.Net.WebUtility]::HtmlEncode($id)), $checkedY1, $checkedY2
         [void]$cards.AppendLine($card)
+        $visibleCards++
+    }
+    if ($restoredTargetSelections -gt 0) {
+        if ($visibleCards -eq 0) { Write-Host "Remove @$Channel from preview section: no visible cards after $restoredTargetSelections downloaded target selection(s) loaded." }
+        else { Write-Host "Update @$Channel to show $visibleCards visible card(s) after $restoredTargetSelections downloaded target selection(s) loaded." }
     }
     if ($cards.Length -eq 0) { return '' }
     $heading = [System.Net.WebUtility]::HtmlEncode((Get-ChannelUrl $Channel))
