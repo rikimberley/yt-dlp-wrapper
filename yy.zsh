@@ -141,10 +141,13 @@ Options:
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
   --py                Switch this directory to the Python build: fetch
-                      py/yy.zsh and py/yy.py from master, back up the current
-                      copies into .tmp, and replace ./yy.zsh and ./yy.py.
-                      Exits without downloading. Takes precedence over -U,
-                      which would otherwise refresh the script this replaces.
+                      py/yy.py, py/yy.zsh and py/yy.ps1 from master, back up
+                      the current copies into .tmp, and replace ./yy.py,
+                      ./yy.zsh and ./yy.ps1. Both wrappers are switched, not
+                      just this one, so the directory is never half of each
+                      build. Exits without downloading. Takes precedence over
+                      -U, which would otherwise refresh the script this
+                      replaces.
   -o                  Open each channel in ./channel-ids.txt that published a
                       public video after ./checkpoint.txt, then exit without
                       downloading. Exits non-zero if a channel check failed.
@@ -1231,7 +1234,10 @@ update_self() {
   # Keep update scratch files and the recoverable previous copy under ./.tmp.
   tmp="$temporary_directory/${name}.new.$$"
   print -r -- "$body" > "$tmp" || return 1
-  [[ -x "./$name" ]] && { chmod +x "$tmp" || true }
+  # A .zsh wrapper is always made executable: --py and --no-py can create one
+  # in a directory that never had it, and -x on the absent target would leave
+  # the new file unrunnable.
+  if [[ -x "./$name" || "$name" == *.zsh ]]; then chmod +x "$tmp" || true; fi
   [[ -f "./$name" ]] && { cp -p -- "./$name" "$temporary_directory/${name}.bak" || true }
   mv -f -- "$tmp" "./$name" || return 1
   printf 'Updated %s from master (previous copy saved in .tmp)\n' "$name"
@@ -2925,16 +2931,31 @@ if (( ! output_path_passed )) && [[ "$run_url" =~ '^https?://([^/]+\.)?youtube\.
 fi
 
 if (( switch_to_py )); then
-  # The implementation is fetched first and the launcher only if it lands.
+  # The implementation is fetched first and the launchers only if it lands.
   # The reverse order can leave ./yy.zsh as a launcher with no ./yy.py beside
   # it, which is a directory with no working wrapper and no way back.
   if ! update_self 'yy.py' '#!/usr/bin/env python3' 'py/yy.py'; then
     printf 'Error: could not fetch py/yy.py; ./yy.zsh left untouched\n' >&2
     exit 1
   fi
+  # Both wrappers are switched, not just the one that is running. A directory
+  # holding a yy.zsh launcher next to a shell-build yy.ps1 is two different
+  # builds sharing one state directory, and whichever wrapper the next run
+  # picks would decide which build it got.
+  #
+  # The *other* wrapper goes first and this one last, so a failure leaves the
+  # wrapper the user just invoked still able to understand --py and retry. The
+  # reverse order replaces ./yy.zsh with a launcher that rejects --py, and the
+  # only way forward would be the other wrapper or a manual download.
+  if ! update_self 'yy.ps1' '#!/usr/bin/env pwsh' 'py/yy.ps1'; then
+    printf 'Error: could not fetch py/yy.ps1; ./yy.py was replaced but both\n' >&2
+    printf '       wrappers are still the shell build. Re-run --py.\n' >&2
+    exit 1
+  fi
   if ! update_self 'yy.zsh' '#!/bin/zsh' 'py/yy.zsh'; then
-    printf 'Error: could not fetch py/yy.zsh; ./yy.py was replaced but\n' >&2
-    printf '       ./yy.zsh is still the shell build. Re-run --py.\n' >&2
+    printf 'Error: could not fetch py/yy.zsh; ./yy.py and ./yy.ps1 are now the\n' >&2
+    printf '       Python build but ./yy.zsh is still the shell build.\n' >&2
+    printf '       Re-run --py; what already landed is left alone.\n' >&2
     exit 1
   fi
   printf 'Switched to the Python build. Previous copies are in .tmp.\n'

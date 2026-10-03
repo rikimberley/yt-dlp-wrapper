@@ -2711,11 +2711,12 @@ Options:
                       without downloading. The previous copies are kept in
                       .tmp. Exits non-zero if a refresh failed.
   --no-py             Switch this directory back to the shell build: fetch
-                      yy.zsh (or yy.ps1) from the root of master, back up the
-                      current launcher into .tmp, and replace it. Handled by
-                      the launcher itself, not here, so it still works when
-                      yy.py or the Python interpreter is the broken thing.
-                      The shell build's --py is the inverse.
+                      yy.zsh and yy.ps1 from the root of master, back up the
+                      current launchers into .tmp, and replace both, so the
+                      directory is never half of each build. Handled by the
+                      launcher itself, not here, so it still works when yy.py
+                      or the Python interpreter is the broken thing. The shell
+                      build's --py is the inverse.
   -o                  For each channel in ./channel-ids.txt, open its /videos
                       tab only if it has a public video published after
                       ./checkpoint.txt. Exits without downloading, and exits

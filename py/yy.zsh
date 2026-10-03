@@ -21,30 +21,50 @@ script_raw_base="https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/ma
 # --no-py: replace this launcher with the shell build from the head of master,
 # the inverse of the shell build's --py. Handled before yy.py and the
 # interpreter are looked for, for the reason given above.
-for arg in "$@"; do
-  [[ "$arg" == "--no-py" ]] || continue
-
+#
+# Both wrappers are replaced, not just this one: a shell-build yy.zsh sitting
+# next to a yy.ps1 launcher is two different builds sharing one state
+# directory, and whichever wrapper the next run picks would decide which
+# build it got.
+no_py_fetch() {
+  local name=$1 sentinel=$2 body tmp
   body=$(curl -fsSL --compressed --retry 3 --max-time 60 \
-    "$script_raw_base/yy.zsh") || {
-    printf 'Error: could not fetch yy.zsh from master\n' >&2
-    exit 1
+    "$script_raw_base/$name") || {
+    printf 'Error: could not fetch %s from master\n' "$name" >&2
+    return 1
   }
   # Same sentinel rule as -U: a captive portal or a 404 page written here
   # would leave the directory with no working wrapper and no way back.
-  if [[ "$body" != '#!/bin/zsh'* ]]; then
-    printf 'Error: refusing to overwrite yy.zsh: ' >&2
-    printf 'fetched body does not start with #!/bin/zsh\n' >&2
-    exit 1
+  if [[ "$body" != "${sentinel}"* ]]; then
+    printf 'Error: refusing to overwrite %s: ' "$name" >&2
+    printf 'fetched body does not start with %s\n' "$sentinel" >&2
+    return 1
   fi
   mkdir -p "$script_dir/.tmp"
-  tmp="$script_dir/yy.zsh.new.$$"
-  print -r -- "$body" > "$tmp" || exit 1
-  [[ -x "$script_dir/yy.zsh" ]] && { chmod +x "$tmp" || true }
-  [[ -f "$script_dir/yy.zsh" ]] && {
-    cp -p -- "$script_dir/yy.zsh" "$script_dir/.tmp/yy.zsh.bak" || true
+  tmp="$script_dir/${name}.new.$$"
+  print -r -- "$body" > "$tmp" || return 1
+  # Always executable for the zsh wrapper: --no-py can create one where the
+  # target does not exist yet, and -x on an absent file is false.
+  if [[ -x "$script_dir/$name" || "$name" == *.zsh ]]; then chmod +x "$tmp" || true; fi
+  [[ -f "$script_dir/$name" ]] && {
+    cp -p -- "$script_dir/$name" "$script_dir/.tmp/${name}.bak" || true
   }
-  mv -f -- "$tmp" "$script_dir/yy.zsh" || exit 1
-  printf 'Switched to the shell build. Previous copy is in .tmp/yy.zsh.bak\n'
+  mv -f -- "$tmp" "$script_dir/$name" || return 1
+  return 0
+}
+
+for arg in "$@"; do
+  [[ "$arg" == "--no-py" ]] || continue
+
+  # The *other* wrapper goes first and this one last, so a failure leaves the
+  # launcher the user just invoked still able to understand --no-py and retry.
+  no_py_fetch 'yy.ps1' '#!/usr/bin/env pwsh' || exit 1
+  if ! no_py_fetch 'yy.zsh' '#!/bin/zsh'; then
+    printf 'Error: ./yy.ps1 is now the shell build but ./yy.zsh is still a\n' >&2
+    printf '       launcher. Re-run --no-py; what already landed is kept.\n' >&2
+    exit 1
+  fi
+  printf 'Switched to the shell build. Previous copies are in .tmp.\n'
   if [[ -f "$script_dir/yy.py" ]]; then
     printf 'yy.py is left in place but unused; the shell build never reads it.\n'
   fi

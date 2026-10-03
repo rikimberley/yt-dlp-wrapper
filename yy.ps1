@@ -148,10 +148,13 @@ Options:
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
   --py                Switch this directory to the Python build: fetch
-                      py/yy.ps1 and py/yy.py from master, back up the current
-                      copies into .tmp, and replace ./yy.ps1 and ./yy.py.
-                      Exits without downloading. Takes precedence over -U,
-                      which would otherwise refresh the script this replaces.
+                      py/yy.py, py/yy.zsh and py/yy.ps1 from master, back up
+                      the current copies into .tmp, and replace ./yy.py,
+                      ./yy.zsh and ./yy.ps1. Both wrappers are switched, not
+                      just this one, so the directory is never half of each
+                      build. Exits without downloading. Takes precedence over
+                      -U, which would otherwise refresh the script this
+                      replaces.
   -o                  Open each channel in ./channel-ids.txt that published a
                       public video after ./checkpoint.txt, then exit without
                       downloading. Exits non-zero if a channel check failed.
@@ -600,6 +603,12 @@ function Update-Self {
             Copy-Item -LiteralPath $target -Destination $backup -Force
         }
         Move-Item -LiteralPath $temp -Destination $target -Force
+        # A .zsh wrapper must stay runnable. On Windows this is a no-op, but
+        # --py/--no-py under pwsh on macOS can create a yy.zsh that never
+        # existed here, and it would arrive without its execute bit.
+        if ($Name.EndsWith('.zsh') -and (Get-Command chmod -ErrorAction SilentlyContinue)) {
+            & chmod +x $target 2>$null | Out-Null
+        }
     }
     catch {
         [Console]::Error.WriteLine("Warning: could not write ${Name}: $($_.Exception.Message)")
@@ -2292,7 +2301,7 @@ if (-not $OutputPathPassed -and
 }
 
 if ($SwitchToPy) {
-    # The implementation is fetched first and the launcher only if it lands.
+    # The implementation is fetched first and the launchers only if it lands.
     # The reverse order can leave ./yy.ps1 as a launcher with no ./yy.py beside
     # it, which is a directory with no working wrapper and no way back.
     if (-not (Update-Self 'yy.py' '#!/usr/bin/env python3' 'py/yy.py')) {
@@ -2300,11 +2309,29 @@ if ($SwitchToPy) {
             'Error: could not fetch py/yy.py; ./yy.ps1 left untouched')
         exit 1
     }
+    # Both wrappers are switched, not just the one that is running. A directory
+    # holding a yy.ps1 launcher next to a shell-build yy.zsh is two different
+    # builds sharing one state directory, and whichever wrapper the next run
+    # picks would decide which build it got.
+    #
+    # The *other* wrapper goes first and this one last, so a failure leaves the
+    # wrapper the user just invoked still able to understand --py and retry.
+    # The reverse order replaces ./yy.ps1 with a launcher that rejects --py,
+    # and the only way forward would be the other wrapper or a manual download.
+    if (-not (Update-Self 'yy.zsh' '#!/bin/zsh' 'py/yy.zsh')) {
+        [Console]::Error.WriteLine(
+            'Error: could not fetch py/yy.zsh; ./yy.py was replaced but both')
+        [Console]::Error.WriteLine(
+            '       wrappers are still the shell build. Re-run --py.')
+        exit 1
+    }
     if (-not (Update-Self 'yy.ps1' '#!/usr/bin/env pwsh' 'py/yy.ps1')) {
         [Console]::Error.WriteLine(
-            'Error: could not fetch py/yy.ps1; ./yy.py was replaced but')
+            'Error: could not fetch py/yy.ps1; ./yy.py and ./yy.zsh are now the')
         [Console]::Error.WriteLine(
-            '       ./yy.ps1 is still the shell build. Re-run --py.')
+            '       Python build but ./yy.ps1 is still the shell build.')
+        [Console]::Error.WriteLine(
+            '       Re-run --py; what already landed is left alone.')
         exit 1
     }
     Write-Host 'Switched to the Python build. Previous copies are in .tmp.'

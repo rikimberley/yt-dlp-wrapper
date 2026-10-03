@@ -33,22 +33,17 @@ function Write-LauncherError {
 # --no-py: replace this launcher with the shell build from the head of master,
 # the inverse of the shell build's --py. Handled before yy.py and the
 # interpreter are looked for, for the reason given in the header.
-$wantsShellBuild = $false
-foreach ($a in $args) { if ([string]$a -ceq '--no-py') { $wantsShellBuild = $true } }
-
-if ($wantsShellBuild) {
-    # 5.1 defaults to TLS 1.0, which raw.githubusercontent.com refuses, and its
-    # Invoke-WebRequest never advertises gzip. Both are fixed the same way the
-    # shell build fixes them.
-    try {
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
-    }
-    catch { }
+#
+# Both wrappers are replaced, not just this one: a shell-build yy.ps1 sitting
+# next to a yy.zsh launcher is two different builds sharing one state
+# directory, and whichever wrapper the next run picks would decide which build
+# it got.
+function Invoke-NoPyFetch {
+    param([string]$Name, [string]$Sentinel)
 
     $body = $null
     try {
-        $request = [Net.HttpWebRequest]::Create("$scriptRawBase/yy.ps1")
+        $request = [Net.HttpWebRequest]::Create("$scriptRawBase/$Name")
         $request.Method = 'GET'
         $request.Timeout = 60000
         $request.AutomaticDecompression =
@@ -62,20 +57,20 @@ if ($wantsShellBuild) {
         finally { $response.Dispose() }
     }
     catch {
-        Write-LauncherError "Error: could not fetch yy.ps1 from master: $($_.Exception.Message)"
-        exit 1
+        Write-LauncherError "Error: could not fetch $Name from master: $($_.Exception.Message)"
+        return $false
     }
 
     # Same sentinel rule as -U: a captive portal or a 404 page written here
     # would leave the directory with no working wrapper and no way back.
-    if ($null -eq $body -or -not $body.StartsWith('#!/usr/bin/env pwsh')) {
-        Write-LauncherError 'Error: refusing to overwrite yy.ps1: fetched body does not start with #!/usr/bin/env pwsh'
-        exit 1
+    if ($null -eq $body -or -not $body.StartsWith($Sentinel)) {
+        Write-LauncherError "Error: refusing to overwrite ${Name}: fetched body does not start with $Sentinel"
+        return $false
     }
 
-    $self = Join-Path $PSScriptRoot 'yy.ps1'
+    $destination = Join-Path $PSScriptRoot $Name
     $tempDir = Join-Path $PSScriptRoot '.tmp'
-    $temp = Join-Path $PSScriptRoot ('yy.ps1.new.' + $PID)
+    $temp = Join-Path $PSScriptRoot ($Name + '.new.' + $PID)
     try {
         if (-not (Test-Path -LiteralPath $tempDir)) {
             New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -85,20 +80,49 @@ if ($wantsShellBuild) {
         $normalized = $body.Replace("`r`n", "`n").TrimEnd("`n") + "`n"
         [IO.File]::WriteAllText(
             $temp, $normalized, (New-Object Text.UTF8Encoding($false)))
-        if (Test-Path -LiteralPath $self) {
-            Copy-Item -LiteralPath $self `
-                -Destination (Join-Path $tempDir 'yy.ps1.bak') -Force
+        if (Test-Path -LiteralPath $destination) {
+            Copy-Item -LiteralPath $destination `
+                -Destination (Join-Path $tempDir ($Name + '.bak')) -Force
         }
-        Move-Item -LiteralPath $temp -Destination $self -Force
+        Move-Item -LiteralPath $temp -Destination $destination -Force
+        # A .zsh wrapper must stay runnable. No-op on Windows, but --no-py
+        # under pwsh on macOS can create a yy.zsh that never existed here.
+        if ($Name.EndsWith('.zsh') -and (Get-Command chmod -ErrorAction SilentlyContinue)) {
+            & chmod +x $destination 2>$null | Out-Null
+        }
     }
     catch {
-        Write-LauncherError "Error: could not write yy.ps1: $($_.Exception.Message)"
+        Write-LauncherError "Error: could not write ${Name}: $($_.Exception.Message)"
         if (Test-Path -LiteralPath $temp) {
             Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
         }
+        return $false
+    }
+    return $true
+}
+
+$wantsShellBuild = $false
+foreach ($a in $args) { if ([string]$a -ceq '--no-py') { $wantsShellBuild = $true } }
+
+if ($wantsShellBuild) {
+    # 5.1 defaults to TLS 1.0, which raw.githubusercontent.com refuses, and its
+    # Invoke-WebRequest never advertises gzip. Both are fixed the same way the
+    # shell build fixes them.
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
+    }
+    catch { }
+
+    # The *other* wrapper goes first and this one last, so a failure leaves the
+    # launcher the user just invoked still able to understand --no-py and retry.
+    if (-not (Invoke-NoPyFetch 'yy.zsh' '#!/bin/zsh')) { exit 1 }
+    if (-not (Invoke-NoPyFetch 'yy.ps1' '#!/usr/bin/env pwsh')) {
+        Write-LauncherError 'Error: ./yy.zsh is now the shell build but ./yy.ps1 is still a'
+        Write-LauncherError '       launcher. Re-run --no-py; what already landed is kept.'
         exit 1
     }
-    Write-Host 'Switched to the shell build. Previous copy is in .tmp/yy.ps1.bak'
+    Write-Host 'Switched to the shell build. Previous copies are in .tmp.'
     if (Test-Path -LiteralPath $target) {
         Write-Host 'yy.py is left in place but unused; the shell build never reads it.'
     }
