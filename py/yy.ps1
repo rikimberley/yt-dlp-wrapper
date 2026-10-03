@@ -17,8 +17,17 @@ $target = Join-Path $PSScriptRoot 'yy.py'
 $minMajor = 3
 $minMinor = 9
 
+# Launcher errors go to stderr, matching yy.zsh. Write-Error is deliberately
+# not used: with $ErrorActionPreference = 'Stop' it throws, printing a source
+# excerpt and squiggles around a message the user cannot act on any better
+# for having seen the line number.
+function Write-LauncherError {
+    param([string]$Message)
+    [Console]::Error.WriteLine($Message)
+}
+
 if (-not (Test-Path -LiteralPath $target)) {
-    Write-Error "Error: $target not found"
+    Write-LauncherError "Error: $target not found"
     exit 1
 }
 
@@ -59,12 +68,12 @@ foreach ($candidate in $candidates) {
 }
 
 if (-not $pythonExe) {
-    Write-Host "Error: no Python $minMajor.$minMinor+ interpreter found."
-    Write-Host 'Install one, or set YY_PYTHON to its full path:'
-    Write-Host '  winget install Python.Python.3.12'
-    Write-Host '  or download from https://www.python.org/downloads/'
-    Write-Host 'Note: a bare "python" on PATH may be the Microsoft Store stub,'
-    Write-Host 'which is why it is probed rather than trusted.'
+    Write-LauncherError "Error: no Python $minMajor.$minMinor+ interpreter found."
+    Write-LauncherError 'Install one, or set YY_PYTHON to its full path:'
+    Write-LauncherError '  winget install Python.Python.3.12'
+    Write-LauncherError '  or download from https://www.python.org/downloads/'
+    Write-LauncherError 'Note: a bare "python" on PATH may be the Microsoft Store stub,'
+    Write-LauncherError 'which is why it is probed rather than trusted.'
     exit 1
 }
 

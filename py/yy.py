@@ -757,6 +757,104 @@ def fetch_urls_concurrent(url_map, what, send_consent=True):
 
 
 # ---------------------------------------------------------------------------
+# Self update
+#
+# A copy living outside a git clone (the Windows box) has no other way to
+# track the repo, so -U refreshes the files in place from the head of master.
+#
+# Unlike the shells, which each refresh only themselves, there are now two
+# pieces: the implementation (yy.py) and the launcher that found an
+# interpreter for it. Refreshing one without the other can pair a new launcher
+# with an old implementation, so both are refreshed in the same run.
+#
+# Only launchers that are *already* present are refreshed. A deployed Windows
+# copy has yy.ps1 and no yy.zsh, and -U is not the place to start handing it
+# files it never had.
+# ---------------------------------------------------------------------------
+
+# Each payload must start with its sentinel. A captive portal or a 404 page
+# written over one of these would leave the machine with no working wrapper at
+# all -- and no way to self-update out of it.
+UPDATE_SENTINELS = (
+    ("yy.py", "#!/usr/bin/env python3"),
+    ("yy.zsh", "#!/bin/zsh"),
+    ("yy.ps1", "#!/usr/bin/env pwsh"),
+)
+
+
+def update_self_file(name, sentinel):
+    """Refresh one file beside this script. Returns True when it is current."""
+    url = "%s/%s" % (SCRIPT_RAW_BASE, name)
+    body = fetch_url(url, "%s from master" % name, send_consent=False)
+    if body is None:
+        sys.stderr.write("Warning: could not refresh %s from master\n" % name)
+        return False
+    if not body.startswith(sentinel):
+        sys.stderr.write(
+            "Warning: refusing to overwrite %s: fetched body does not start "
+            "with %s\n" % (name, sentinel)
+        )
+        return False
+
+    target = SCRIPT_DIR / name
+    if read_text_file(target) == body:
+        print("%s is already up to date" % name)
+        return True
+
+    # Stage in the *same directory* as the target: os.replace is only atomic
+    # within one filesystem, and an interrupted write must never be able to
+    # truncate the file that is running.
+    temp_path = SCRIPT_DIR / ("%s.new.%s" % (name, os.getpid()))
+    try:
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(body)
+        if target.exists():
+            # Carry the execute bit across, or a refreshed yy.zsh stops being
+            # runnable as ./yy.zsh.
+            shutil.copymode(str(target), str(temp_path))
+            TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(
+                    str(target), str(TEMPORARY_DIRECTORY / ("%s.bak" % name))
+                )
+            except OSError as error:
+                sys.stderr.write(
+                    "Warning: could not save a backup copy of %s: %s\n"
+                    % (name, error)
+                )
+        os.replace(str(temp_path), str(target))
+    except OSError as error:
+        sys.stderr.write("Warning: could not write %s: %s\n" % (name, error))
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        return False
+
+    print("Updated %s from master (previous copy saved in .tmp)" % name)
+    return True
+
+
+def run_update():
+    """-U: update the yt-dlp binary, then this wrapper. Never downloads."""
+    exe = ytdlp_path()
+    if exe is None:
+        sys.stderr.write("Error: yt-dlp binary not found next to this script\n")
+        return 1
+    # The shells ignore yt-dlp's own exit code here too: a failed binary
+    # update must not stop the wrapper from being refreshed.
+    run_cmd([exe, "-U"])
+
+    ok = True
+    for name, sentinel in UPDATE_SENTINELS:
+        if name != SCRIPT_PATH.name and not (SCRIPT_DIR / name).exists():
+            continue
+        if not update_self_file(name, sentinel):
+            ok = False
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
 # Channel identity and the public-video feed
 # ---------------------------------------------------------------------------
 
@@ -2608,9 +2706,10 @@ Options:
   -t <temp_url>       Download this URL once, without persisting it.
   -p <path>           Download into <path>. Without -p, a youtube.com/@<id>
                       URL downloads to ./<id>, otherwise to ./t.
-  -U                  Update ./yt-dlp and refresh this script from the head of
-                      master on GitHub, then exit without downloading.
-                      Exits non-zero if the refresh failed.
+  -U                  Update ./yt-dlp, then refresh yy.py and the launcher
+                      beside it from the head of master on GitHub, and exit
+                      without downloading. The previous copies are kept in
+                      .tmp. Exits non-zero if a refresh failed.
   -o                  For each channel in ./channel-ids.txt, open its /videos
                       tab only if it has a public video published after
                       ./checkpoint.txt. Exits without downloading, and exits
@@ -2744,8 +2843,7 @@ def main(argv):
         return 1
 
     if opts.do_update:
-        sys.stderr.write("Error: -U is not implemented in this build yet\n")
-        return 2
+        return run_update()
 
     # A positional URL is persisted even when -t overrides what actually runs.
     if opts.url:
