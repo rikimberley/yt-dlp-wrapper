@@ -137,7 +137,7 @@ Download output keeps lifecycle messages, warnings, errors, and completion
 lines, while repetitive yt-dlp percentage updates are reduced to one snapshot
 per 10 percentage points for each transferred format. The browser displays the
 last 80 retained log entries and refreshes that view once per second.
-Use `STOP SERVER` in the page, or Ctrl+C in the wrapper console, to end the
+Use `STOP SERVER` in the page (HTML3 asks for confirmation first), or Ctrl+C in the wrapper console, to end the
 loopback server; the button attempts to close its page (and falls back to a
 blank page when the browser disallows programmatic closing). Closing the page
 also stops the server after five minutes without any page request. Every page
