@@ -1287,10 +1287,18 @@ store_channel_id() {
 
 # Extract the UC… channel id from a channel page, trying each known shape.
 scrape_channel_id() {
-  local html=$1 id pattern
+  local html=$1 id pattern token
   for pattern in 'channel_id=UC[A-Za-z0-9_-]*' '"externalId":"UC[A-Za-z0-9_-]*' '/channel/UC[A-Za-z0-9_-]*'; do
-    id=$(printf '%s' "$html" | grep -o "$pattern" | sed -n '1s/.*\(UC[A-Za-z0-9_-]*\).*/\1/p') || id=""
-    if [[ -n "$id" ]]; then
+    token=$(printf '%s' "$html" | grep -o "$pattern" | head -1) || token=""
+    [[ -n "$token" ]] || continue
+    # Strip the prefix rather than re-matching UC… inside the token. A
+    # second match with a leading .* is greedy, so it backtracks to the
+    # *last* UC in the token: UCLr9zotVorE1-hH48UZpUCw yielded "UCw", which
+    # still looks like a valid id and so was cached and used, and every feed
+    # fetch for that channel then 404'd. A UC id contains no = / or ", so
+    # trimming to the last one of those is exact for all three prefixes.
+    id=${token##*[=/\"]}
+    if [[ "$id" =~ ^UC[A-Za-z0-9_-]+$ ]]; then
       print -r -- "$id"
       return 0
     fi
