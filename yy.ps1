@@ -23,6 +23,7 @@
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
+# - uses -h/--help to print the full usage summary and exit
 #
 # Examples:
 #   ./yy.ps1 'https://example.com/video'
@@ -37,6 +38,7 @@
 #   ./yy.ps1 --html3
 #   ./yy.ps1 --html3 --html3-incognito
 #   ./yy.ps1 -c
+#   ./yy.ps1 --help
 #   ./yy.ps1 -o -c
 #
 # Note: arguments are parsed by hand from $args rather than via param(), because
@@ -122,10 +124,69 @@ $htmlFailureCount = 0
 $Html3WorkerToken = ''
 $Html3WorkerRefreshAll = $false
 $Html3Incognito = $false
+$ShowHelp = $false
+
+function Write-Usage {
+    $usage = @'
+yy.ps1 - convenience wrapper around ./yt-dlp
+
+Usage:
+  ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U]
+           [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
+  ./yy.ps1 -h | --help
+
+Arguments:
+  <url>               Persist this URL to ./current_url.txt, then download it.
+                      With no arguments, the stored URL is re-downloaded.
+
+Options:
+  -t <temp_url>       Download this URL once, without persisting it.
+  -p <path>           Download into <path>. Without -p, a youtube.com/@<id>
+                      URL downloads to ./<id>, otherwise to ./t.
+  -U                  Update ./yt-dlp and refresh this script from the head of
+                      master on GitHub, then exit without downloading.
+                      Exits non-zero if the refresh failed.
+  -o                  Open each channel in ./channel-ids.txt that published a
+                      public video after ./checkpoint.txt, then exit without
+                      downloading. Exits non-zero if a channel check failed.
+  -O                  Open every channel in ./channel-ids.txt unconditionally,
+                      then exit without downloading.
+  --html              Generate a local 6-column video grid with y1/y2
+                      selections and serve it on http://127.0.0.1:8080.
+  --html2             As --html, with a persistent incremental scan cache, so
+                      later runs scan only a one-day overlap per channel.
+  --html3             As --html2, but open a loading shell immediately and
+                      stream one fragment per channel from a background worker.
+                      Already-downloaded video cards are dropped.
+  --html3-incognito   With --html3, open the page in a Chrome/Chromium
+                      incognito window instead of the default browser.
+  -c                  Overwrite ./checkpoint.txt with the current epoch-ms
+                      timestamp, then exit without downloading. Runs after
+                      -o/-O, so "-o -c" means "open the new ones, then mark
+                      everything as seen".
+  -h, --help          Show this help and exit.
+
+-o, -O, --html, --html2 and --html3 are mutually exclusive.
+Flag precedence: -h, then -U, then -o/-O/--html*, then -c, then download.
+
+Examples:
+  ./yy.ps1 'https://example.com/video'
+  ./yy.ps1 -t 'https://example.com/one-off'
+  ./yy.ps1 -p ./my-videos -t 'https://example.com/one-off'
+  ./yy.ps1 -U
+  ./yy.ps1 -o -c
+  ./yy.ps1 --html2
+  ./yy.ps1 --html3 --html3-incognito
+'@
+    Write-Host $usage
+}
 
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
-    if ($a -ceq '-t') {
+    if ($a -ceq '-h' -or $a -ceq '--help') {
+        $ShowHelp = $true
+    }
+    elseif ($a -ceq '-t') {
         $i++
         if ($i -ge $args.Count) {
             [Console]::Error.WriteLine('Error: -t requires a URL argument')
@@ -189,6 +250,11 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
 }
 
+if ($ShowHelp) {
+    Write-Usage
+    exit 0
+}
+
 if ($Html3Incognito -and $OpenMode -ne 'html3') {
     [Console]::Error.WriteLine('Error: --html3-incognito requires --html3')
     exit 1
@@ -196,6 +262,21 @@ if ($Html3Incognito -and $OpenMode -ne 'html3') {
 
 # Windows PowerShell 5.1 does not understand the `e escape, and printed the raw
 # "e[34m" sequence, so no colour is applied here.
+# yy.zsh writes every plain-text state file as UTF-8 with no BOM and LF line
+# endings. Set-Content would emit CRLF on Windows, and -Encoding UTF8 prepends a
+# BOM on 5.1, so a file written here would not be byte-identical to the one the
+# zsh wrapper writes. WriteAllText keeps both wrappers producing the same bytes.
+# The path is resolved against $PSScriptRoot because Set-Location does not move
+# the .NET process working directory, which these relative paths would bind to.
+function Write-TextFileLf {
+    param([string]$Path, [string[]]$Lines)
+
+    $full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($PSScriptRoot, $Path))
+    $text = ''
+    if ($null -ne $Lines -and $Lines.Count -gt 0) { $text = [string]::Join("`n", $Lines) + "`n" }
+    [System.IO.File]::WriteAllText($full, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function Write-RunLine {
     param([string[]]$Cmd)
 
@@ -561,7 +642,7 @@ function Write-ChannelIdCache {
         foreach ($key in ($Map.Keys | Sort-Object)) {
             $lines += ($key + "`t" + $Map[$key])
         }
-        Set-Content -LiteralPath $channelIdCacheFile -Value $lines -Encoding UTF8
+        Write-TextFileLf -Path $channelIdCacheFile -Lines $lines
     }
     catch {
         [Console]::Error.WriteLine("Warning: could not write ${channelIdCacheFile}: $($_.Exception.Message)")
@@ -915,7 +996,7 @@ function Set-CheckpointNow {
 function Set-CheckpointAt {
     param([long]$TimestampMs)
 
-    Set-Content -LiteralPath $checkpointFile -Value ([string]$TimestampMs) -Encoding ASCII
+    Write-TextFileLf -Path $checkpointFile -Lines @([string]$TimestampMs)
     Write-Host "Checkpoint updated: $TimestampMs"
 }
 
@@ -2081,7 +2162,7 @@ function Invoke-HtmlCallbackServer {
                 if ($change.action -eq 'delete') { $lines = @($lines | Where-Object { $_.Trim() -ne $channel }) }
                 elseif ($change.action -eq 'add' -and -not (@($lines | Where-Object { $_.Trim() -eq $channel }).Count)) { $lines += $channel }
                 else { Send-CallbackResponse $context 400 'Invalid channel action.'; continue }
-                [System.IO.File]::WriteAllLines((Join-Path $PSScriptRoot 'channel-ids.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+                Write-TextFileLf -Path $channelsFile -Lines $lines
                 Send-CallbackJson $context 200 @{ message = 'Channel IDs updated. Refreshing page.' }
                 continue
             }
@@ -2179,7 +2260,7 @@ $currentUrl = ''
 
 if (-not [string]::IsNullOrEmpty($Url)) {
     $currentUrl = $Url
-    Set-Content -LiteralPath $urlFile -Value $currentUrl -NoNewline:$false
+    Write-TextFileLf -Path $urlFile -Lines @($currentUrl)
 }
 elseif (Test-Path -LiteralPath $urlFile) {
     $currentUrl = (Get-Content -LiteralPath $urlFile -TotalCount 1)

@@ -52,10 +52,11 @@ re-exporting.
 ## Usage
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2] [-c]
-
-# PowerShell also supports --html3.
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
 ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
+
+# Full usage summary from either wrapper:
+./yy.zsh --help
 ```
 
 | Flag | Effect |
@@ -69,11 +70,12 @@ re-exporting.
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `./.tmp/yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
 | `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
-| `--html3` | **PowerShell only.** Open an independent streaming page in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. |
-| `--html3-incognito` | **PowerShell only; requires `--html3`.** On Windows, open HTML3 in Chrome Incognito, reusing an existing Incognito window when Chrome has one. If Chrome is unavailable, fall back to the default browser. |
-| `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
+| `--html3` | Open an independent streaming page in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. |
+| `--html3-incognito` | **Requires `--html3`.** Open HTML3 in a Chrome/Chromium incognito window. `yy.ps1` reuses an existing Windows Chrome Incognito window; `yy.zsh` also accepts `/Applications/Google Chrome.app` or a Chromium binary on `PATH`. If none is found, fall back to the default browser with a warning. |
+| `-c` | With `-o`, `--html`, `--html2`, or `--html3`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
+| `-h`, `--help` | Print the usage summary and exit |
 
-Precedence: `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
+Precedence: `-h`/`--help`, then `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
 `-O`, `--html`, `--html2`, and `--html3` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
@@ -175,7 +177,7 @@ normal cookie-backed yt-dlp scan. At least once every 24 hours each eligible
 channel receives a full yt-dlp scan even when its feed appears unchanged, so
 account-visible videos omitted by the public feed are eventually recovered.
 
-PowerShell `--html3` leaves `--html` and `--html2` unchanged. It writes its
+`--html3` leaves `--html` and `--html2` unchanged. It writes its
 own `yy-html3.html` shell and uses a token-scoped JSON state file plus one local
 fragment file per completed channel. The browser polls `/html3/<token>/state`
 and fetches fragments from `/html3/<token>/fragment/<index>`; it disables
@@ -215,7 +217,7 @@ large channels can require many continuation pages.
 | `current_url.txt` | Last URL *(gitignored)* |
 | `.tmp/yy.html` | Generated `--html` / `--html2` video grid *(gitignored)* |
 | `.tmp/yy-html3.html`, `.tmp/yy-html3-*.json`, `.tmp/yy-html3-*/` | Generated standalone `--html3` shell, state, and channel fragments *(gitignored)* |
-| `.tmp/` | Disposable yt-dlp captures, worker cookie copies, atomic-write files, and self-update backups. Starting `--html3` removes `yy-html*` artifacts and `yt-dlp.<guid>.stdout`/`.stderr` captures older than 45 days; backups and unrelated files are retained *(gitignored)* |
+| `.tmp/` | Disposable yt-dlp captures, worker cookie copies, atomic-write files, and self-update backups. Starting `--html3` removes `yy-html*`/`yy-fetch*` artifacts and yt-dlp metadata captures older than 45 days; backups and unrelated files are retained *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |
 | `t/` | Download output *(gitignored)* |
 
