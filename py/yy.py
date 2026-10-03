@@ -1456,7 +1456,7 @@ def run_scan_pool(plans, exe, cookies_source, on_progress=None):
                 results[plan.channel] = (ok, entries)
                 completed += 1
                 if on_progress:
-                    on_progress(completed, len(pending))
+                    on_progress(completed, len(pending), plan, ok, entries)
     finally:
         pool.cleanup()
     return results
@@ -1490,12 +1490,24 @@ def merge_channel_entries(cached_entries, scanned, keep_cutoff_ms):
 
 
 def scan_all_channels(
-    channels, checkpoint_ms, incremental, refresh_all, on_progress=None
+    channels,
+    checkpoint_ms,
+    incremental,
+    refresh_all,
+    on_progress=None,
+    on_channel=None,
 ):
     """Full scan cycle: plan, gate, scan, merge, persist.
 
     Returns (per_channel_entries, failures) where per_channel_entries maps a
     channel to its merged, newest-first entry list.
+
+    Each channel is finalized the moment its own scan settles rather than
+    after the whole pool drains, so --html3 can publish one fragment at a
+    time. on_channel(channel, entries, channel_id) fires per channel, with entries
+    None when that channel produced nothing usable; on_progress(completed, total)
+    follows it. Both run on a scan worker thread, so the shared cache and
+    status maps are mutated under a lock.
     """
     exe = ytdlp_path()
     if exe is None:
@@ -1518,72 +1530,1062 @@ def scan_all_channels(
     if incremental:
         apply_feed_gate(plans, cache, checkpoint_ms, batch_ms)
 
-    results = run_scan_pool(plans, exe, COOKIES_FILE, on_progress)
-
     keep_cutoff_ms = scan_cutoff_for(checkpoint_ms) * 1000
     per_channel = {}
-    for plan in plans:
+    total = len(plans)
+    state_lock = threading.Lock()
+    completed_count = [0]
+
+    def finalize(plan, scanned_ok, scanned):
+        """Merge and persist one channel, then report it."""
         channel = plan.channel
-        scanned_ok, scanned = results.get(channel, (True, []))
-        # A gated channel was never scanned, so it has no fresh rows but is
-        # not a failure either.
-        full_scan_ok = scanned_ok and not plan.skip_scan
-        cached_rows = cache.get(channel, {}).get("entries", []) if incremental else []
+        with state_lock:
+            # A gated channel was never scanned, so it has no fresh rows but
+            # is not a failure either.
+            full_scan_ok = scanned_ok and not plan.skip_scan
+            cached_rows = (
+                cache.get(channel, {}).get("entries", []) if incremental else []
+            )
 
-        if not scanned_ok:
-            if incremental:
-                sys.stderr.write(
-                    "Warning: could not incrementally scan the videos tab for "
-                    "@%s; using cached entries\n" % channel
+            entries = None
+            if not scanned_ok:
+                if incremental:
+                    sys.stderr.write(
+                        "Warning: could not incrementally scan the videos tab "
+                        "for @%s; using cached entries\n" % channel
+                    )
+                    failures.append(
+                        (channel, "could not scan videos tab; using cached entries")
+                    )
+                else:
+                    sys.stderr.write(
+                        "Warning: could not scan the videos tab for @%s\n" % channel
+                    )
+                    failures.append((channel, "could not scan videos tab"))
+
+            if scanned_ok or incremental:
+                entries = merge_channel_entries(cached_rows, scanned, keep_cutoff_ms)
+                per_channel[channel] = entries
+
+                newest = max(
+                    (e.timestamp_ms for e in entries if e.is_public), default=0
                 )
-                failures.append(
-                    (channel, "could not scan videos tab; using cached entries")
+                print(
+                    "@%s: %s visible video(s) in the checkpoint overlap"
+                    % (channel, sum(1 for e in entries if e.is_public))
                 )
-            else:
-                sys.stderr.write(
-                    "Warning: could not scan the videos tab for @%s\n" % channel
+
+                if incremental:
+                    prior = cache.get(channel, {})
+                    cache[channel] = {
+                        "channel_id": plan.channel_id,
+                        "checked_ms": (
+                            batch_ms if scanned_ok else prior.get("checked_ms", 0)
+                        ),
+                        "last_full_scan_ms": (
+                            batch_ms if full_scan_ok else plan.last_full_ms
+                        ),
+                        "feed_newest_ms": (
+                            plan.feed_newest_ms
+                            if (scanned_ok and plan.feed_newest_ms)
+                            else prior.get("feed_newest_ms", 0)
+                        ),
+                        "entries": [entry.to_cache() for entry in entries],
+                    }
+
+                # preserve=1: a scan that found nothing must not erase a
+                # channel's known age, or the staleness filter would drop it
+                # on the next run.
+                record = status.setdefault(
+                    channel,
+                    {"checked_ms": 0, "latest_video_ms": 0, "thumbnail": ""},
                 )
-                failures.append((channel, "could not scan videos tab"))
-                continue
+                record["checked_ms"] = batch_ms
+                if newest:
+                    record["latest_video_ms"] = newest
 
-        entries = merge_channel_entries(cached_rows, scanned, keep_cutoff_ms)
-        per_channel[channel] = entries
+            completed_count[0] += 1
+            done = completed_count[0]
 
-        newest = max((e.timestamp_ms for e in entries if e.is_public), default=0)
-        print(
-            "@%s: %s visible video(s) in the checkpoint overlap"
-            % (channel, sum(1 for e in entries if e.is_public))
-        )
+        if on_channel:
+            # The resolved UC… id must come from the plan: a channel that was
+            # not already cached has none on disk yet, and a card rendered
+            # with an empty channel id fails selection validation.
+            on_channel(channel, entries, plan.channel_id)
+        if on_progress:
+            on_progress(done, total)
 
-        if incremental:
-            prior = cache.get(channel, {})
-            cache[channel] = {
-                "channel_id": plan.channel_id,
-                "checked_ms": batch_ms if scanned_ok else prior.get("checked_ms", 0),
-                "last_full_scan_ms": (
-                    batch_ms if full_scan_ok else plan.last_full_ms
-                ),
-                "feed_newest_ms": (
-                    plan.feed_newest_ms
-                    if (scanned_ok and plan.feed_newest_ms)
-                    else prior.get("feed_newest_ms", 0)
-                ),
-                "entries": [entry.to_cache() for entry in entries],
-            }
+    # Gated channels need no network at all, so publish them first: the page
+    # gets its cached cards immediately instead of waiting on the pool.
+    for plan in plans:
+        if plan.skip_scan:
+            finalize(plan, True, [])
 
-        # preserve=1: a scan that found nothing must not erase a channel's
-        # known age, or the staleness filter would drop it on the next run.
-        record = status.setdefault(
-            channel, {"checked_ms": 0, "latest_video_ms": 0, "thumbnail": ""}
-        )
-        record["checked_ms"] = batch_ms
-        if newest:
-            record["latest_video_ms"] = newest
+    finalized = {plan.channel for plan in plans if plan.skip_scan}
+
+    def pool_progress(_completed, _total, plan, ok, entries):
+        finalized.add(plan.channel)
+        finalize(plan, ok, entries)
+
+    results = run_scan_pool(plans, exe, COOKIES_FILE, pool_progress)
+
+    # run_scan_pool can return a result without ever reporting it: it fails
+    # the whole batch when no cookie jar could be staged, and it drops a
+    # future that raised. Reconcile, or those channels would never be
+    # finalized and the progress total would never be reached.
+    for plan in plans:
+        if plan.channel in finalized:
+            continue
+        scanned_ok, scanned = results.get(plan.channel, (True, []))
+        finalize(plan, scanned_ok, scanned)
 
     if incremental:
         save_html_video_cache(cache)
     save_channel_check_status(status)
     return per_channel, failures
+
+
+# ---------------------------------------------------------------------------
+# --html3
+#
+# --html3 writes a loading shell immediately and then fills it in: a scan
+# worker publishes one HTML fragment per channel, and the page polls /state
+# and splices each fragment in as it appears. The whole page is therefore
+# reachable before any channel has been scanned.
+#
+# The shells run the scan in a second *process* (`yy.zsh --html3-worker`)
+# because they are single-threaded and would otherwise block the listener.
+# Python has threads, so the worker is a thread here and the fragments and
+# state live in memory instead of in .tmp files. The HTTP contract the page
+# depends on - the endpoints, the JSON shape and the fragment URLs - is
+# unchanged, so the page asset below is the shells' asset verbatim.
+# ---------------------------------------------------------------------------
+
+HTML3_PAGE_TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;padding-bottom:0}h2{font-size:22px;margin:0}.channel-title h2 a{color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:disabled,input:disabled{opacity:.55;cursor:wait}.controls,.checks,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.controls button{padding:4px 9px}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.preview{aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks{margin-top:8px;color:var(--mut)}.video-age{font-size:11px;color:var(--mut);margin-top:3px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:0;display:none;font-size:34px;font-weight:700}.back-to-top.visible{display:flex;align-items:center;justify-content:center}#html3-progress{margin:0 0 16px}.html3-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html3-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}.channel-table tr.html3-channel-error td{background:#3C050F;border-bottom-color:#7a1828;color:#fff}.channel-table tr.html3-channel-error a{color:#fff}#channel-add{width:27em}h2{color:var(--acc)}.channel-title h2 a{text-decoration:underline;text-underline-offset:3px}button:hover{border-color:var(--acc);background:#1c2230}.video-link:hover{color:var(--acc)}.preview{position:relative}.preview img{transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.back-to-top{border:none;box-shadow:0 2px 8px rgba(0,0,0,.45)}.back-to-top:hover{background:#79c0ff}#html3-error-panel{position:fixed;z-index:10;top:18px;left:50%;transform:translateX(-50%);max-width:min(720px,calc(100vw - 32px));padding:16px 20px;border:2px solid #ff7b72;border-radius:8px;background:#1b1114;box-shadow:0 8px 28px rgba(0,0,0,.55);color:#ff7b72;font-size:18px}#html3-error-panel[hidden]{display:none}</style><style>.html3-progress-bar{position:relative;overflow:hidden}.html3-progress-bar.loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);animation:html3-progress-shimmer 1.2s linear infinite}@keyframes html3-progress-shimmer{to{transform:translateX(100%)}}</style></head><body><h1>YouTube Video Download</h1><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">__MESSAGE__</p></div><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">__CHECKPOINT__</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><div id="html3-error-panel" role="alert" aria-live="assertive" hidden><div id="html3-errors"></div></div><pre id="job-log" class="job-log"></pre><main><section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><p>Loading Channel IDs...</p></section></main><button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button><script>(()=>{const token="__TOKEN__",base="/html3/"+token,stateUrl=base+"/state",fragmentUrl=i=>base+"/fragment/"+i,channelsUrl=base+"/channels",api=n=>"/"+n+"/"+token,controls=[...document.querySelectorAll("button,input")],top=document.querySelector("#back-to-top"),status=document.querySelector("#status"),errors=document.querySelector("#html3-errors"),errorPanel=document.querySelector("#html3-error-panel"),log=document.querySelector("#job-log"),applied=new Set(),saved=new Set();let html3Failures=[];const html3FailureSummary=()=>html3Failures.length?"Completed with channel errors: "+html3Failures.map(x=>"@"+x.channel+" ("+x.stage+")").join(", "):"";const compactLogs=logs=>{const buckets=new Map(),percents=new Map();return logs.filter(line=>{if(/^\[y[12]\]\s*$/.test(line))return false;const m=line.match(/^(\[[^\]]+\])\s+\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);if(!m)return true;const target=m[1],percent=Number(m[2]),previous=percents.get(target);if(previous!==undefined&&percent<previous-1)buckets.set(target,-1);percents.set(target,percent);const bucket=Math.floor(percent/10),last=buckets.has(target)?buckets.get(target):-1,emit=bucket>last||percent>=100;if(emit)buckets.set(target,bucket);return emit})};const showJobs=async()=>{let again=false;try{const b=await (await fetch(api("status"),{cache:"no-store"})).json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";log.textContent=compactLogs(b.logs||[]).join("\n");log.scrollTop=log.scrollHeight;if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};const relativeCheckpoint=ms=>{const s=Math.max(0,Math.floor((Date.now()-Number(ms))/1000)),u=[[31536000,"year"],[2592000,"month"],[604800,"week"],[86400,"day"],[3600,"hour"],[60,"minute"]];if(s<60)return "just now";for(const[d,n]of u)if(s>=d){const x=Math.floor(s/d);return x+" "+n+(x===1?"":"s")+" ago"}},checkpointText=ms=>{if(!ms)return "";const d=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"}).format(new Date(Number(ms)));return "Checkpoint: "+d+" Pacific Time ("+relativeCheckpoint(ms)+")"};const key=x=>x.dataset.channelId+"|"+x.dataset.videoId+"|"+x.className,remember=()=>document.querySelectorAll("input.y1:checked,input.y2:checked").forEach(x=>saved.add(key(x))),setBusy=b=>document.querySelectorAll("button,input").forEach(x=>{if(x!==top)x.disabled=b});const apply=async u=>{if(!u||applied.has(u.channel))return;const r=await fetch(fragmentUrl(u.fragment),{cache:"no-store"});if(!r.ok)return;const text=await r.text(),old=[...document.querySelectorAll("section.channel")].find(x=>x.dataset.html3Channel===u.channel);applied.add(u.channel);if(!text){if(old)old.remove();return}remember();const t=document.createElement("template");t.innerHTML=text;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").insertBefore(fresh,document.querySelector("#channel-ids"));fresh.querySelectorAll("input.y1,input.y2").forEach(x=>{if(saved.has(key(x)))x.checked=true});fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)};const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>{try{const s=await (await fetch(stateUrl,{cache:"no-store"})).json(),bar=document.querySelector(".html3-progress-bar");bar.classList.toggle("loading",s.status==="running");if(s.status==="running")document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";if(s.total){const partial=s.status==="running"?.5:0;bar.style.width=Math.min(100,100*((s.completed||0)+partial)/s.total)+"%";}for(const u of (Array.isArray(s.updates)?s.updates:(s.updates?[s.updates]:[])))await apply(u);if(s.status==="success"){await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";html3Failures=Array.isArray(s.failed_channels)?s.failed_channels:(s.failed_channels?[s.failed_channels]:[]);errors.textContent=html3FailureSummary();errorPanel.hidden=!html3Failures.length;return}if(s.status==="error"){status.textContent=s.error||"Page generation failed.";return}}catch(e){status.textContent="Progress unavailable: "+e.message}setTimeout(poll,500)};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(!b)return;(b.closest(".channel")||document).querySelectorAll("input.y1,input.y2").forEach(x=>{if(b.dataset.action==="none")x.checked=false;else if(x.className===b.dataset.action)x.checked=true})});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch(api("checkpoint"),{method:"POST"})).json();status.textContent=b.message;document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?checkpointText(b.checkpoint_ms):""};const refresh=async all=>{remember();html3Failures=[];errors.textContent="";errorPanel.hidden=true;setBusy(true);const b=await (await fetch(api(all?"refresh-all":"refresh"),{method:"POST"})).json();status.textContent=b.message||"Refreshing";applied.clear();poll()};document.querySelector("#refresh").onclick=()=>refresh(false);document.querySelector("#refresh-all").onclick=()=>refresh(true);document.querySelector("#stop").onclick=async()=>{if(!window.confirm("Stop the local server? Active downloads will continue."))return;try{const b=await (await fetch(api("stop"),{method:"POST"})).json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};top.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});const toggle=()=>top.classList.toggle("visible",scrollY>200);addEventListener("scroll",toggle,{passive:true});top.disabled=false;document.addEventListener("click",e=>{if(!errorPanel.hidden&&!errorPanel.contains(e.target))errorPanel.hidden=true});setInterval(()=>fetch(api("heartbeat"),{method:"POST",keepalive:true}),2000);showJobs();setBusy(true);poll()})()</script></body></html>"""
+
+HTML3_HOST = "127.0.0.1"
+HTML3_PORT = 8080
+HTML3_HEARTBEAT_TIMEOUT_SEC = 30 * 60
+HTML3_LOG_LIMIT = 400
+HTML3_LOG_WINDOW = 80
+DOWNLOAD_PROGRESS_STEP_PERCENT = 10
+
+NON_PUBLIC_TARGETS = ("y1", "y2")
+TARGET_DIR_RE = re.compile(r'^\./[^\\/:*?"<>|]+$')
+DOWNLOAD_PERCENT_RE = re.compile(r"^\[download\]\s+([0-9]+(?:\.[0-9]+)?)%")
+OG_IMAGE_RE = re.compile(r'<meta property="og:image" content="([^"]*)"')
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*\x07")
+ANSI_CHARSET_RE = re.compile(r"\x1b[()][A-Za-z0-9]")
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+RELATIVE_UNITS = (
+    (31536000, "year"),
+    (2592000, "month"),
+    (604800, "week"),
+    (86400, "day"),
+    (3600, "hour"),
+    (60, "minute"),
+)
+
+
+def html_escape(value):
+    import html as html_module
+
+    return html_module.escape(coerce_str(value), quote=True)
+
+
+def format_relative_ms(raw):
+    """"3 days ago" for an epoch-ms timestamp; empty when unset."""
+    ms = coerce_int(raw)
+    if ms <= 0:
+        return ""
+    ms = normalise_entry_ms(ms)
+    seconds = max(0, now_sec() - ms // 1000)
+    for divisor, unit in RELATIVE_UNITS:
+        count = seconds // divisor
+        if count >= 1:
+            return "%d %s%s ago" % (count, unit, "" if count == 1 else "s")
+    return "just now"
+
+
+def pacific_time_text(epoch_sec):
+    """Format in Pacific time, degrading to local time without the zone db.
+
+    zoneinfo is stdlib from 3.9, but on Windows it has no bundled database
+    and the tzdata package is deliberately not a dependency here. Falling
+    back keeps the page honest about which clock it is showing instead of
+    silently labelling local time as Pacific.
+    """
+    import datetime
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        stamp = datetime.datetime.fromtimestamp(
+            epoch_sec, ZoneInfo("America/Los_Angeles")
+        )
+        return stamp.strftime("%m/%d/%Y, %H:%M:%S"), "Pacific Time"
+    except Exception:
+        stamp = datetime.datetime.fromtimestamp(epoch_sec)
+        return stamp.strftime("%m/%d/%Y, %H:%M:%S"), "local time"
+
+
+def format_html3_checkpoint_text(ms):
+    ms = coerce_int(ms)
+    if ms <= 0:
+        return ""
+    stamp, zone = pacific_time_text(ms // 1000)
+    return "Checkpoint: %s %s (%s)" % (stamp, zone, format_relative_ms(ms))
+
+
+def strip_control_chars(text):
+    """Drop ANSI sequences and raw control bytes from a yt-dlp log line.
+
+    yt-dlp emits colour and cursor sequences even when its output is a pipe,
+    so a progress line carries a raw ESC. json.dumps would escape it legally,
+    but the page would then render \\u001b[K instead of text.
+    """
+    text = ANSI_CSI_RE.sub("", coerce_str(text))
+    text = ANSI_OSC_RE.sub("", text)
+    text = ANSI_CHARSET_RE.sub("", text)
+    return CONTROL_CHARS_RE.sub("", text)
+
+
+def channel_thumbnails_concurrent(keys):
+    """Fetch each channel's og:image avatar. Missing ones are simply absent."""
+    if not keys:
+        return {}
+    bodies = fetch_urls_concurrent(
+        {key: channel_url_for(key) for key in keys}, "avatar"
+    )
+    thumbnails = {}
+    for key, body in bodies.items():
+        match = OG_IMAGE_RE.search(body)
+        if match:
+            thumbnails[key] = match.group(1).replace("&amp;", "&")
+    return thumbnails
+
+
+# --- page fragments --------------------------------------------------------
+
+def render_channel_fragment(channel, channel_id, entries, cutoff_ms, downloaded):
+    """Render one channel's card section.
+
+    Returns (html, visible, dropped). Unlike --html/--html2, a video already
+    submitted for download loses its whole card rather than coming back with
+    a restored checkbox, so either target being present drops it.
+    """
+    cards = []
+    dropped = 0
+    for entry in entries or ():
+        if not entry.is_public:
+            continue
+        if entry.timestamp_ms < cutoff_ms:
+            continue
+        if not entry.id or not entry.url:
+            continue
+        hit = 0
+        for target in NON_PUBLIC_TARGETS:
+            if (channel_id, entry.id, target) in downloaded:
+                hit += 1
+        if hit:
+            dropped += hit
+            continue
+        thumb = "https://i.ytimg.com/vi/%s/hqdefault.jpg" % entry.id
+        checks = "".join(
+            '<label><input class="%s" data-url="%s" data-path="%s" '
+            'data-channel-id="%s" data-video-id="%s" type="checkbox"> %s</label>'
+            % (
+                target,
+                html_escape(entry.url),
+                html_escape("./%s" % channel),
+                html_escape(channel_id),
+                html_escape(entry.id),
+                target,
+            )
+            for target in NON_PUBLIC_TARGETS
+        )
+        cards.append(
+            '<article class="card"><a class="video-link" href="%s" target="_blank" '
+            'rel="noopener noreferrer"><div class="preview"><img src="%s" alt="">'
+            '</div><div class="video-title">%s</div></a>'
+            '<div class="video-age">%s</div><div class="checks">%s</div></article>'
+            % (
+                html_escape(entry.url),
+                html_escape(thumb),
+                html_escape(entry.title),
+                html_escape(format_relative_ms(entry.timestamp_ms)),
+                checks,
+            )
+        )
+
+    if dropped:
+        if cards:
+            print(
+                "Update @%s to show %s visible card(s) after %s downloaded "
+                "target selection(s) loaded." % (channel, len(cards), dropped)
+            )
+        else:
+            print(
+                "Remove @%s from preview section: no visible cards after %s "
+                "downloaded target selection(s) loaded." % (channel, dropped)
+            )
+    if not cards:
+        return "", 0, dropped
+
+    controls = "".join(
+        '<button data-action="%s" type="button">%s</button>' % (name, name)
+        for name in ("y1", "y2", "none")
+    )
+    fragment = (
+        '<section class="channel" data-html3-channel="%s"><div class="channel-title">'
+        '<h2><a href="%s" target="_blank" rel="noopener noreferrer">%s</a></h2>'
+        '<div class="controls">%s</div></div><div class="grid">%s</div></section>'
+        % (
+            html_escape(channel),
+            html_escape(channel_url_for(channel)),
+            html_escape(channel),
+            controls,
+            "\n".join(cards),
+        )
+    )
+    return fragment, len(cards), dropped
+
+
+def render_channels_section(channels, status, failed_channels):
+    """Render the Channel IDs table, newest-checked first."""
+    failed = {name.lstrip("@") for name, _stage in failed_channels}
+    rows = []
+    for display in channels:
+        key = display.lstrip("@")
+        record = status.get(key) or {}
+        rows.append(
+            (
+                coerce_int(record.get("checked_ms")),
+                coerce_int(record.get("latest_video_ms")),
+                display,
+                key,
+                coerce_str(record.get("thumbnail")),
+            )
+        )
+    rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+
+    body = []
+    for checked_ms, latest_ms, display, key, thumbnail in rows:
+        avatar = ""
+        if thumbnail:
+            avatar = (
+                '<img src="%s" alt="" width="42" height="42" '
+                'style="border-radius:50%%;object-fit:cover">' % html_escape(thumbnail)
+            )
+        body.append(
+            '<tr%s><td>%s</td><td><a href="%s" target="_blank" '
+            'rel="noopener noreferrer">%s</a></td><td>%s</td><td>%s</td>'
+            '<td><button class="channel-delete" data-channel="%s" type="button">'
+            "delete</button></td></tr>"
+            % (
+                ' class="html3-channel-error"' if key in failed else "",
+                avatar,
+                html_escape(channel_url_for(key)),
+                html_escape(display),
+                html_escape(format_relative_ms(checked_ms) if checked_ms else "never"),
+                html_escape(format_relative_ms(latest_ms) if latest_ms else "unknown"),
+                html_escape(display),
+            )
+        )
+
+    return (
+        '<section id="channel-ids" class="channel"><div class="channel-bar"></div>'
+        '<div class="channel-title"><h2>Channel IDs</h2></div>'
+        '<div class="controls"><input id="channel-add" '
+        'placeholder="@channel or UC channel id">'
+        '<button id="channel-add-button" type="button">add</button></div>'
+        '<table class="channel-table"><thead><tr><th>Profile</th><th>Channel</th>'
+        "<th>Last checked</th><th>Latest video</th><th></th></tr></thead><tbody>\n"
+        "%s</tbody></table></section>" % "\n".join(body)
+    )
+
+
+def render_loading_page(token, message):
+    page = HTML3_PAGE_TEMPLATE
+    page = page.replace("__TOKEN__", token)
+    page = page.replace("__MESSAGE__", html_escape(message))
+    page = page.replace(
+        "__CHECKPOINT__",
+        html_escape(format_html3_checkpoint_text(read_checkpoint_ms())),
+    )
+    return page
+
+
+# --- download jobs ---------------------------------------------------------
+
+def validate_video_selection(item):
+    """Accept only structured selections, never a path or URL the page could
+    have been tricked into inventing."""
+    target = coerce_str(item.get("target"))
+    url = coerce_str(item.get("url"))
+    target_dir = coerce_str(item.get("path"))
+    channel_id = coerce_str(item.get("channel_id"))
+    video_id = coerce_str(item.get("video_id"))
+    if target not in NON_PUBLIC_TARGETS:
+        return None
+    if not UC_ID_RE.match(channel_id):
+        return None
+    if not VIDEO_ID_RE.match(video_id):
+        return None
+    if not TARGET_DIR_RE.match(target_dir) or target_dir in ("./.", "./.."):
+        return None
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return None
+    host = url.split("://", 1)[1].split("/")[0].split("?")[0].split("#")[0]
+    host = host.rsplit("@", 1)[-1].split(":")[0].lower()
+    if not (host in ("youtu.be", "youtube.com") or host.endswith(".youtube.com")):
+        return None
+    return {
+        "target": target,
+        "url": url,
+        "path": target_dir,
+        "channel_id": channel_id,
+        "video_id": video_id,
+    }
+
+
+class DownloadJob:
+    __slots__ = (
+        "target",
+        "url",
+        "path",
+        "channel_id",
+        "video_id",
+        "hook",
+        "state",
+        "succeeded",
+        "last_percent",
+        "last_bucket",
+    )
+
+    def __init__(self, item, hook):
+        self.target = item["target"]
+        self.url = item["url"]
+        self.path = item["path"]
+        self.channel_id = item["channel_id"]
+        self.video_id = item["video_id"]
+        self.hook = hook
+        self.state = "queued"
+        self.succeeded = False
+        self.last_percent = -1
+        self.last_bucket = -1
+
+    def should_emit(self, line):
+        """One log line per 10% of a download, so the page log stays readable.
+
+        A second format - normally audio after video - restarts near zero and
+        gets its own buckets.
+        """
+        match = DOWNLOAD_PERCENT_RE.match(line)
+        if not match:
+            return True
+        percent = int(float(match.group(1)))
+        if self.last_percent >= 0 and percent < self.last_percent - 1:
+            self.last_bucket = -1
+        self.last_percent = percent
+        bucket = percent // DOWNLOAD_PROGRESS_STEP_PERCENT
+        if bucket > self.last_bucket or percent >= 100:
+            self.last_bucket = bucket
+            return True
+        return False
+
+
+def iter_process_lines(stream):
+    """Yield lines split on CR as well as LF.
+
+    yt-dlp rewrites its progress line with a bare CR, so reading by LF alone
+    would withhold the whole download as one enormous line.
+    """
+    buffer = ""
+    while True:
+        chunk = stream.read(1)
+        if not chunk:
+            break
+        if chunk in ("\r", "\n"):
+            if buffer:
+                yield buffer
+                buffer = ""
+            continue
+        buffer += chunk
+    if buffer:
+        yield buffer
+
+
+class JobManager:
+    """Runs y1/y2 hooks one at a time, y2 before y1."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = []
+        self.logs = []
+        self.worker = None
+
+    def submit(self, items):
+        """Queue validated selections. Returns (started, error)."""
+        if not items:
+            return 0, "No video selections received"
+        selections = []
+        for item in items:
+            checked = validate_video_selection(item)
+            if checked is None:
+                return 0, "Invalid video selection received"
+            selections.append(checked)
+
+        downloaded = {downloaded_key(r) for r in read_downloaded_videos()}
+        queued = []
+        # y2 drains before y1, keeping the page's order within each target.
+        for pass_target in ("y2", "y1"):
+            for item in selections:
+                if item["target"] != pass_target:
+                    continue
+                key = (item["channel_id"], item["video_id"], item["target"])
+                if key in downloaded:
+                    print(
+                        "Skipped previously downloaded selection: %s / %s / %s" % key
+                    )
+                    continue
+                # y1/y2 run the local yy1/yy2 hooks found on PATH, matching
+                # the shells. The hooks are what make the two labels mean
+                # different destinations. A shell alias or function is not
+                # accepted and cannot be: this is a child process that never
+                # sources a shell rc, so a hook has to be a real executable.
+                hook_name = "y" + pass_target
+                hook = shutil.which(hook_name)
+                if not hook:
+                    return 0, "Local %s hook was not found on PATH" % hook_name
+                queued.append(DownloadJob(item, hook))
+
+        with self.lock:
+            for job in queued:
+                self.jobs.append(job)
+                print("Queued: %s -p %s -t %s" % (job.hook, job.path, job.url))
+            self._ensure_worker()
+        return len(queued), None
+
+    def _ensure_worker(self):
+        """Caller holds the lock."""
+        if self.worker is not None and self.worker.is_alive():
+            return
+        self.worker = threading.Thread(target=self._drain, daemon=True)
+        self.worker.start()
+
+    def _next_queued(self):
+        with self.lock:
+            for job in self.jobs:
+                if job.state == "queued":
+                    job.state = "running"
+                    return job
+        return None
+
+    def _drain(self):
+        while True:
+            job = self._next_queued()
+            if job is None:
+                return
+            self._run(job)
+
+    def _append_log(self, entry):
+        print(entry)
+        with self.lock:
+            self.logs.append(entry)
+            if len(self.logs) > HTML3_LOG_LIMIT:
+                del self.logs[: len(self.logs) - HTML3_LOG_LIMIT]
+
+    def _run(self, job):
+        print("Running: %s -p %s -t %s" % (job.hook, job.path, job.url))
+        try:
+            process = subprocess.Popen(
+                [job.hook, "-p", job.path, "-t", job.url],
+                cwd=str(BASE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1,
+                errors="replace",
+            )
+        except OSError as error:
+            self._append_log("[%s] could not start %s: %s" % (job.target, job.hook, error))
+            with self.lock:
+                job.state = "failed"
+            return
+
+        for raw in iter_process_lines(process.stdout):
+            line = strip_control_chars(raw).strip()
+            if not line:
+                continue
+            if "has already been downloaded" in line or (
+                line.startswith("[download]") and "100%" in line
+            ):
+                job.succeeded = True
+            if not job.should_emit(line):
+                continue
+            self._append_log("[%s] %s" % (job.target, line))
+        process.stdout.close()
+        rc = process.wait()
+
+        with self.lock:
+            # A hook that reports failure but demonstrably finished the
+            # transfer still counts, mirroring the shells.
+            job.state = "completed" if (rc == 0 or job.succeeded) else "failed"
+        if job.state == "completed":
+            add_downloaded_video(job.channel_id, job.video_id, job.target)
+
+    def status(self):
+        with self.lock:
+            counts = {"running": 0, "queued": 0, "completed": 0, "failed": 0}
+            for job in self.jobs:
+                counts[job.state if job.state in counts else "failed"] += 1
+            counts["logs"] = list(self.logs[-HTML3_LOG_WINDOW:])
+            return counts
+
+    def active_count(self):
+        with self.lock:
+            return sum(1 for job in self.jobs if job.state in ("queued", "running"))
+
+
+def add_downloaded_video(channel_id, video_id, target):
+    """Record a completed download, keeping any original timestamp."""
+    records = read_downloaded_videos()
+    key = (channel_id, video_id, target)
+    if any(downloaded_key(record) == key for record in records):
+        print(
+            "Downloaded-video record already exists; keeping original "
+            "timestamp: %s / %s / %s" % key
+        )
+        return
+    print("Recording completed download: %s / %s / %s" % key)
+    records.append(
+        {
+            "channel_id": channel_id,
+            "video_id": video_id,
+            "target": target,
+            "download_epoch": now_sec(),
+        }
+    )
+    save_downloaded_videos(records)
+
+
+def apply_channel_change(payload):
+    """Apply an add/delete from the Channel IDs table. Returns an error or None."""
+    action = coerce_str(payload.get("action"))
+    channel = trim(coerce_str(payload.get("channel")))
+    if not channel or any(c in channel for c in "\r\n#"):
+        return "Invalid channel id."
+    if action not in ("add", "delete"):
+        return "Invalid channel action."
+
+    content = read_text_file(CHANNELS_FILE)
+    kept = []
+    found = False
+    wanted = channel.lstrip("@")
+    for line in (content or "").splitlines():
+        # read_channels() strips a leading @, so the page sends the bare
+        # handle even when the file stores "@handle". Compare both stripped
+        # or deleting such an entry would silently never match.
+        if trim(line).lstrip("@") == wanted:
+            found = True
+            if action == "delete":
+                continue
+        kept.append(line)
+    if action == "add" and not found:
+        kept.append(channel)
+    try:
+        write_text_file(CHANNELS_FILE, kept)
+    except OSError:
+        return "Could not update %s." % CHANNELS_FILE.name
+    return None
+
+
+# --- the scan worker and its state ----------------------------------------
+
+class Html3State:
+    """Everything the page polls for, guarded by one lock."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "running"
+        self.message = "Loading channels..."
+        self.error = ""
+        self.completed = 0
+        self.total = 0
+        self.updates = []
+        self.fragments = {}
+        self.channels_html = ""
+        self.failed = []
+        self.worker = None
+
+    def reset(self):
+        with self.lock:
+            self.status = "running"
+            self.message = "Loading channels..."
+            self.error = ""
+            self.completed = 0
+            self.total = 0
+            self.updates = []
+            self.fragments = {}
+            self.failed = []
+
+    def publish_fragment(self, channel, html_text):
+        with self.lock:
+            index = len(self.updates)
+            self.fragments[index] = html_text
+            self.updates.append({"channel": channel, "fragment": index})
+
+    def set_progress(self, completed, total):
+        with self.lock:
+            self.completed = completed
+            self.total = total
+            self.message = "Loading channels: %s / %s" % (completed, total)
+
+    def finish(self, status, message, error="", failed=()):
+        with self.lock:
+            self.status = status
+            self.message = message
+            self.error = error
+            self.failed = list(failed)
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "status": self.status,
+                "success": self.status == "success",
+                "message": self.message,
+                "error": self.error,
+                "completed": self.completed,
+                "total": self.total,
+                "updates": list(self.updates),
+                "failed_channels": [
+                    {"channel": name, "stage": stage} for name, stage in self.failed
+                ],
+            }
+
+    def fragment(self, index):
+        with self.lock:
+            return self.fragments.get(index)
+
+    def channels(self):
+        with self.lock:
+            return self.channels_html
+
+    def set_channels(self, html_text):
+        with self.lock:
+            self.channels_html = html_text
+
+    def running(self):
+        return self.worker is not None and self.worker.is_alive()
+
+    def start(self, refresh_all):
+        self.reset()
+        self.worker = threading.Thread(
+            target=html3_scan_worker, args=(self, refresh_all), daemon=True
+        )
+        self.worker.start()
+
+
+def html3_scan_worker(state, refresh_all):
+    """Scan every channel and publish one fragment each, as they settle."""
+    try:
+        channels = read_channels()
+        if channels is None:
+            state.finish("error", "Page generation failed.", "No channels to scan.")
+            return
+
+        checkpoint_ms = read_checkpoint_ms()
+        cutoff_ms = scan_cutoff_for(checkpoint_ms) * 1000
+        downloaded = {downloaded_key(record) for record in read_downloaded_videos()}
+
+        def on_channel(channel, entries, channel_id):
+            fragment, _visible, _dropped = render_channel_fragment(
+                channel, channel_id, entries, cutoff_ms, downloaded
+            )
+            state.publish_fragment(channel, fragment)
+
+        state.set_progress(0, len(channels))
+        per_channel, failures = scan_all_channels(
+            channels,
+            checkpoint_ms,
+            True,
+            refresh_all,
+            on_progress=state.set_progress,
+            on_channel=on_channel,
+        )
+        if per_channel is None:
+            state.finish(
+                "error", "Page generation failed.", "Could not scan any channel."
+            )
+            return
+
+        status = read_channel_check_status()
+        keys = [c.lstrip("@") for c in channels]
+        missing = [k for k in keys if not coerce_str((status.get(k) or {}).get("thumbnail"))]
+        for key, thumbnail in channel_thumbnails_concurrent(missing).items():
+            record = status.setdefault(
+                key, {"checked_ms": 0, "latest_video_ms": 0, "thumbnail": ""}
+            )
+            record["thumbnail"] = thumbnail
+        save_channel_check_status(status)
+
+        state.set_channels(render_channels_section(channels, status, failures))
+
+        if failures:
+            summary = ", ".join("@%s (%s)" % (c, s) for c, s in failures)
+            print("HTML3 completed with channel errors: %s" % summary)
+        else:
+            print("HTML3 completed with no channel errors.")
+        state.finish("success", "", failed=failures)
+    except Exception as error:  # a worker crash must surface on the page
+        sys.stderr.write("HTML3 worker failed: %s\n" % error)
+        state.finish("error", "Page generation failed.", str(error))
+
+
+# --- the callback server ---------------------------------------------------
+
+def build_html3_handler(token, state, jobs, control):
+    from http.server import BaseHTTPRequestHandler
+
+    class Html3Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "yy"
+
+        def log_message(self, *_args):
+            """The console is the scan log, not an access log."""
+
+        # --- replies ---
+        def _send(self, code, body, content_type="application/json; charset=utf-8"):
+            payload = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except OSError:
+                # A page that navigated away mid-reply is not an error.
+                pass
+
+        def _json(self, code, payload):
+            self._send(code, json.dumps(payload))
+
+        def _message(self, code, message):
+            self._json(code, {"message": message})
+
+        def _html(self, code, body):
+            self._send(code, body, "text/html; charset=utf-8")
+
+        def _body(self):
+            length = coerce_int(self.headers.get("Content-Length"))
+            if length <= 0:
+                return {}
+            try:
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return {}
+
+        # --- routing ---
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            control.touch()
+            if path == "/":
+                self._html(200, render_loading_page(token, "Loading channels..."))
+                return
+            prefix = "/html3/%s/" % token
+            if path.startswith(prefix):
+                rest = path[len(prefix) :]
+                if rest == "state":
+                    self._json(200, state.snapshot())
+                    return
+                if rest == "channels":
+                    self._html(200, state.channels())
+                    return
+                if rest.startswith("fragment/"):
+                    index = rest[len("fragment/") :]
+                    if index.isdigit():
+                        fragment = state.fragment(int(index))
+                        if fragment is not None:
+                            self._html(200, fragment)
+                            return
+                    self._message(404, "Not found")
+                    return
+            if path == "/status/%s" % token:
+                self._json(200, jobs.status())
+                return
+            self._message(404, "Not found")
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            control.touch()
+            if not path.endswith("/%s" % token):
+                self._message(404, "Not found")
+                return
+            action = path[1 : -(len(token) + 1)]
+
+            if action == "heartbeat":
+                self._message(200, "")
+            elif action == "stop":
+                self._message(200, "Server stopped.")
+                control.stop()
+            elif action == "checkpoint":
+                checkpoint_ms = now_ms()
+                set_checkpoint_at(checkpoint_ms)
+                self._json(
+                    200,
+                    {"message": "Checkpoint updated.", "checkpoint_ms": checkpoint_ms},
+                )
+            elif action in ("refresh", "refresh-all"):
+                refresh_all = action == "refresh-all"
+                print(
+                    "Refreshing HTML page from %s channels in channel-ids.txt..."
+                    % ("all" if refresh_all else "recent")
+                )
+                if state.running():
+                    self._message(409, "A page update is already running.")
+                else:
+                    state.start(refresh_all)
+                    self._message(202, "Refreshing page.")
+            elif action == "channel":
+                error = apply_channel_change(self._body())
+                if error:
+                    self._message(400, error)
+                else:
+                    self._message(200, "Channel IDs updated. Refreshing page.")
+            elif action == "download":
+                payload = self._body()
+                items = payload.get("items")
+                started, error = jobs.submit(items if isinstance(items, list) else [])
+                if error:
+                    self._message(400, error)
+                else:
+                    self._message(200, "Started %s local download job(s)." % started)
+            else:
+                self._message(404, "Not found")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    return Html3Handler
+
+
+class ServerControl:
+    """Heartbeat clock and stop flag, shared with the request handler."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_beat = now_sec()
+        self.stopped = threading.Event()
+
+    def touch(self):
+        # Any request proves the page is alive, not just the heartbeat: a
+        # background tab may have its dedicated heartbeat timer throttled.
+        with self.lock:
+            self.last_beat = now_sec()
+
+    def idle_for(self):
+        with self.lock:
+            return now_sec() - self.last_beat
+
+    def stop(self):
+        self.stopped.set()
+
+
+def open_html3_url(url, incognito):
+    """Open the page, preferring a Chrome incognito window when asked."""
+    if not incognito:
+        return open_url(url)
+    chrome_app = Path("/Applications/Google Chrome.app")
+    if chrome_app.is_dir() and shutil.which("open"):
+        return run_cmd(["open", "-na", "Google Chrome", "--args", "--incognito", url])
+    for candidate in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ):
+        exe = shutil.which(candidate)
+        if exe:
+            try:
+                subprocess.Popen(
+                    [exe, "--incognito", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print("Opened: %s" % url)
+                return 0
+            except OSError:
+                break
+    sys.stderr.write(
+        "Warning: Google Chrome was not found; opening HTML3 in the default browser.\n"
+    )
+    return open_url(url)
+
+
+def run_html3(incognito):
+    """Serve the page until STOP SERVER, Ctrl-C, or the page stops answering."""
+    import secrets
+    from http.server import ThreadingHTTPServer
+
+    if read_channels() is None:
+        return 1
+
+    token = secrets.token_hex(16)
+    state = Html3State()
+    jobs = JobManager()
+    control = ServerControl()
+    handler = build_html3_handler(token, state, jobs, control)
+
+    try:
+        server = ThreadingHTTPServer((HTML3_HOST, HTML3_PORT), handler)
+    except OSError as error:
+        sys.stderr.write(
+            "Error: http://%s:%s is unavailable (%s)\n"
+            % (HTML3_HOST, HTML3_PORT, error)
+        )
+        return 1
+    server.daemon_threads = True
+
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2})
+    thread.daemon = True
+    thread.start()
+
+    # The shell is written first and the scan runs in the background, so the
+    # page is reachable immediately instead of after a full channel sweep.
+    state.start(False)
+    url = "http://%s:%s/" % (HTML3_HOST, HTML3_PORT)
+    open_html3_url(url, incognito)
+    print(
+        "Waiting for DOWNLOAD SELECTED on %s (Ctrl+C or STOP SERVER exits)" % url
+    )
+
+    try:
+        while not control.stopped.is_set():
+            if control.stopped.wait(0.5):
+                break
+            # Never abandon a download that is still running or queued just
+            # because the browser throttled its timers in a background tab.
+            if (
+                control.idle_for() >= HTML3_HEARTBEAT_TIMEOUT_SEC
+                and jobs.active_count() == 0
+            ):
+                print("HTML page closed or disconnected; stopping server.")
+                break
+    except KeyboardInterrupt:
+        print("")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1725,11 +2727,6 @@ def set_open_mode(opts, mode):
 
 YOUTUBE_HANDLE_RE = re.compile(r"^https?://([^/]+\.)?youtube\.com/@([^/?#]+)")
 
-NOT_IMPLEMENTED = {
-    "html3": "--html3",
-}
-
-
 def main(argv):
     try:
         opts = parse_args(argv)
@@ -1756,13 +2753,14 @@ def main(argv):
         write_text_file(URL_FILE, [opts.url])
 
     if opts.open_mode is not None:
-        if opts.open_mode in NOT_IMPLEMENTED:
-            sys.stderr.write(
-                "Error: %s is not implemented in this build yet\n"
-                % NOT_IMPLEMENTED[opts.open_mode]
-            )
-            return 2
         TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        if opts.open_mode == "html3":
+            rc = run_html3(opts.html3_incognito)
+            # The page's own CHECKPOINT button is the normal way to advance
+            # the checkpoint here; -c still works and applies on exit.
+            if opts.set_checkpoint and rc == 0:
+                set_checkpoint_at(now_ms())
+            return rc
         rc = run_open_mode(check=(opts.open_mode == "check"))
         # -c runs after -O, so "open everything, then mark it all seen" works.
         # The checkpoint is held back when too much of the run failed, so it
