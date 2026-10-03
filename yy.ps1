@@ -281,11 +281,11 @@ function Open-Html3Url {
         return
     }
 
-    $chromeCandidates = @(
+    $chromeCandidates = @(@(
         (Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
         (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     if ($chromeCandidates.Count -eq 0) {
         Write-Warning 'Google Chrome was not found; opening HTML3 in the default browser.'
         Open-Url $TargetUrl
