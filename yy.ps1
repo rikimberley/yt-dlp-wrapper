@@ -360,14 +360,23 @@ function Get-ChannelUrl {
 function Open-Url {
     param([string]$TargetUrl)
 
+    # Every branch keeps the child's stdout off this function's success
+    # stream. Without that the text lands on the success stream of whatever
+    # called it: Invoke-OpenMode returned an Object[] of leaked strings with
+    # its hashtable last, and reading .Failures off that array threw. The real
+    # macOS `open` is silent, which is why this stayed hidden, but xdg-open
+    # warns and the stub `open` used for testing prints.
+    #
+    # Out-Host rather than Out-Null so the text is still shown, matching
+    # yy.zsh, where the child simply inherits the terminal.
     switch (Get-PlatformName) {
         'macos' {
             Write-RunLine @('open', '--', $TargetUrl)
-            & open -- $TargetUrl
+            & open -- $TargetUrl | Out-Host
         }
         'linux' {
             Write-RunLine @('xdg-open', $TargetUrl)
-            & xdg-open $TargetUrl
+            & xdg-open $TargetUrl | Out-Host
         }
         default {
             Write-RunLine @('Start-Process', $TargetUrl)
@@ -2220,9 +2229,21 @@ function Invoke-HtmlCallbackServer {
 }
 
 # Implement -o (check against the checkpoint) and -O (open everything).
-# Returns the number of listed channels and the number whose check failed.
+# Reports the number of listed channels and the number whose check failed.
+# Results are published through $script: variables and the function returns
+# nothing, mirroring run_open_mode in yy.zsh. A return value here would be
+# whatever accumulated on the success stream, so a single stray Write-Output
+# or an unswallowed external command anywhere in this long function would
+# turn the result into an Object[] and break the caller. Not worth the risk
+# for two integers.
+$script:openModeFailures = 0
+$script:openModeChannelCount = 0
+
 function Invoke-OpenMode {
     param([string]$Mode, [hashtable]$ChannelStatus)
+
+    $script:openModeFailures = 0
+    $script:openModeChannelCount = 0
 
     if (-not (Test-Path -LiteralPath $channelsFile)) {
         [Console]::Error.WriteLine("Error: $channelsFile does not exist")
@@ -2276,7 +2297,8 @@ function Invoke-OpenMode {
         [Console]::Error.WriteLine("Error: $failures channel check(s) failed")
     }
     Save-ChannelCheckStatus $ChannelStatus
-    return @{ Failures = $failures; ChannelCount = $channelCount }
+    $script:openModeFailures = $failures
+    $script:openModeChannelCount = $channelCount
 }
 
 $currentUrl = ''
@@ -2399,9 +2421,9 @@ if ($OpenMode -ne '') {
         if ($htmlFailureCount -gt 0) { $openFailures = 1 }
     }
     else {
-        $openResult = Invoke-OpenMode $OpenMode $channelCheckStatus
-        $openFailures = $openResult.Failures
-        $openChannelCount = $openResult.ChannelCount
+        Invoke-OpenMode $OpenMode $channelCheckStatus | Out-Null
+        $openFailures = $script:openModeFailures
+        $openChannelCount = $script:openModeChannelCount
         if ($OpenMode -eq 'check') { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
     }
 }
