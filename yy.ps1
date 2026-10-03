@@ -16,8 +16,10 @@
 #   skip any download
 # - uses --html to generate a local 6-column video grid with y1/y2 selections
 # - uses --html2 for the same page with persistent incremental scan caching
-# - uses --html3 to open an independent loading shell in Chrome Incognito on
-#   Windows and stream channel fragments from a worker
+# - uses --html3 to open an independent loading shell and stream channel
+#   fragments from a worker
+# - uses --html3-incognito with --html3 to open that shell in Chrome Incognito
+#   on Windows
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -33,6 +35,7 @@
 #   ./yy.ps1 --html
 #   ./yy.ps1 --html2
 #   ./yy.ps1 --html3
+#   ./yy.ps1 --html3 --html3-incognito
 #   ./yy.ps1 -c
 #   ./yy.ps1 -o -c
 #
@@ -118,6 +121,7 @@ $SetCheckpoint = $false
 $htmlFailureCount = 0
 $Html3WorkerToken = ''
 $Html3WorkerRefreshAll = $false
+$Html3Incognito = $false
 
 for ($i = 0; $i -lt $args.Count; $i++) {
     $a = [string]$args[$i]
@@ -166,6 +170,9 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         $Html3WorkerToken = [string]$args[$i]
         if (($i + 1) -lt $args.Count -and [string]$args[$i + 1] -ceq '--refresh-all') { $Html3WorkerRefreshAll = $true; $i++ }
     }
+    elseif ($a -ceq '--html3-incognito') {
+        $Html3Incognito = $true
+    }
     elseif ($a -ceq '-c') {
         $SetCheckpoint = $true
     }
@@ -180,6 +187,11 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         }
         $Url = $a
     }
+}
+
+if ($Html3Incognito -and $OpenMode -ne 'html3') {
+    [Console]::Error.WriteLine('Error: --html3-incognito requires --html3')
+    exit 1
 }
 
 # Windows PowerShell 5.1 does not understand the `e escape, and printed the raw
@@ -270,13 +282,13 @@ function Open-Url {
     }
 }
 
-# HTML3 is a local, interactive page. On Windows, open it in Chrome's
-# Incognito profile so it can be kept separate from ordinary browsing. Chrome
-# reuses an existing Incognito window when one is already open.
+# HTML3 normally opens in the default browser. With -Incognito, Windows opens
+# it in Chrome's Incognito profile, reusing an existing Incognito window when
+# one is already open.
 function Open-Html3Url {
-    param([string]$TargetUrl)
+    param([string]$TargetUrl, [switch]$Incognito)
 
-    if ((Get-PlatformName) -ne 'windows') {
+    if (-not $Incognito -or (Get-PlatformName) -ne 'windows') {
         Open-Url $TargetUrl
         return
     }
@@ -1936,7 +1948,7 @@ function Invoke-HtmlCallbackServer {
     try {
         [Console]::add_CancelKeyPress($cancelHandler)
         if ($Html3) { $html3Worker = Start-Html3Worker -Token $Token }
-        if ($Html3) { Open-Html3Url 'http://127.0.0.1:8080/' }
+        if ($Html3) { Open-Html3Url 'http://127.0.0.1:8080/' -Incognito:$Html3Incognito }
         else { Open-Url 'http://127.0.0.1:8080/' }
         Write-Host 'Waiting for DOWNLOAD SELECTED on http://127.0.0.1:8080/ (Ctrl+C or STOP SERVER exits)'
         while ($listener.IsListening -and -not $script:htmlStopRequested) {

@@ -55,7 +55,7 @@ re-exporting.
 ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2] [-c]
 
 # PowerShell also supports --html3.
-./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [-c]
+./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
 ```
 
 | Flag | Effect |
@@ -69,7 +69,8 @@ re-exporting.
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `./.tmp/yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
 | `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
-| `--html3` | **PowerShell only.** Open an independent streaming page. On Windows it opens in Chrome Incognito, reusing an existing Incognito window when Chrome has one; if Chrome is unavailable, it falls back to the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. |
+| `--html3` | **PowerShell only.** Open an independent streaming page in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. |
+| `--html3-incognito` | **PowerShell only; requires `--html3`.** On Windows, open HTML3 in Chrome Incognito, reusing an existing Incognito window when Chrome has one. If Chrome is unavailable, fall back to the default browser. |
 | `-c` | With `-o`, `--html`, or `--html2`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 
 Precedence: `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
