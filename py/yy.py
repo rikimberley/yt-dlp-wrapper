@@ -2694,8 +2694,8 @@ USAGE = """\
 yy.py - convenience wrapper around ./yt-dlp
 
 Usage:
-  yy [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html3]
-     [--html3-incognito] [-c]
+  yy [<url>] [-t <temp_url>] [-p <path>] [-U] [--no-py]
+     [-o | -O | --html3] [--html3-incognito] [-c]
   yy -h | --help
 
 Arguments:
@@ -2710,6 +2710,12 @@ Options:
                       beside it from the head of master on GitHub, and exit
                       without downloading. The previous copies are kept in
                       .tmp. Exits non-zero if a refresh failed.
+  --no-py             Switch this directory back to the shell build: fetch
+                      yy.zsh (or yy.ps1) from the root of master, back up the
+                      current launcher into .tmp, and replace it. Handled by
+                      the launcher itself, not here, so it still works when
+                      yy.py or the Python interpreter is the broken thing.
+                      The shell build's --py is the inverse.
   -o                  For each channel in ./channel-ids.txt, open its /videos
                       tab only if it has a public video published after
                       ./checkpoint.txt. Exits without downloading, and exits

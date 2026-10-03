@@ -106,6 +106,7 @@ temp_url=""
 output_path="./t"
 output_path_passed=0
 do_update=0
+switch_to_py=0
 open_mode=""
 html_mode=0
 html_incremental=0
@@ -124,7 +125,7 @@ print_usage() {
 yy.zsh - convenience wrapper around ./yt-dlp
 
 Usage:
-  ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U]
+  ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
            [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
   ./yy.zsh -h | --help
 
@@ -139,6 +140,11 @@ Options:
   -U                  Update ./yt-dlp and refresh this script from the head of
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
+  --py                Switch this directory to the Python build: fetch
+                      py/yy.zsh and py/yy.py from master, back up the current
+                      copies into .tmp, and replace ./yy.zsh and ./yy.py.
+                      Exits without downloading. Takes precedence over -U,
+                      which would otherwise refresh the script this replaces.
   -o                  Open each channel in ./channel-ids.txt that published a
                       public video after ./checkpoint.txt, then exit without
                       downloading. Exits non-zero if a channel check failed.
@@ -160,7 +166,8 @@ Options:
   -h, --help          Show this help and exit.
 
 -o, -O, --html, --html2 and --html3 are mutually exclusive.
-Flag precedence: -h, then -U, then -o/-O/--html*, then -c, then download.
+Flag precedence: -h, then --py, then -U, then -o/-O/--html*, then -c, then
+download.
 
 Examples:
   ./yy.zsh 'https://example.com/video'
@@ -197,6 +204,9 @@ while (( $# > 0 )); do
       ;;
     -U)
       do_update=1
+      ;;
+    --py)
+      switch_to_py=1
       ;;
     -o|-O)
       if [[ -n "$open_mode" ]]; then
@@ -1199,11 +1209,13 @@ fetch_urls_concurrent() {
 # living outside a git clone (the Windows box) still tracks the repo. $2 is the
 # first line the payload must start with; anything else is assumed to be an
 # error page or a captive-portal interstitial and is refused, because writing it
-# would leave the machine with no working wrapper at all.
+# would leave the machine with no working wrapper at all. $3 is the path under
+# master to fetch, which defaults to $1 and differs only for --py, where the
+# payload for ./yy.zsh comes from py/yy.zsh.
 update_self() {
-  local name=$1 sentinel=$2 url body tmp
-  url="${script_raw_base}/${name}"
-  body=$(fetch_url "$url" "${name} from master") || {
+  local name=$1 sentinel=$2 remote=${3:-$1} url body tmp
+  url="${script_raw_base}/${remote}"
+  body=$(fetch_url "$url" "${remote} from master") || {
     printf 'Warning: could not refresh %s from master\n' "$name" >&2
     return 1
   }
@@ -2910,6 +2922,23 @@ run_url=$current_url
 
 if (( ! output_path_passed )) && [[ "$run_url" =~ '^https?://([^/]+\.)?youtube\.com/@([^/?#]+)' ]]; then
   output_path="./${match[2]}"
+fi
+
+if (( switch_to_py )); then
+  # The implementation is fetched first and the launcher only if it lands.
+  # The reverse order can leave ./yy.zsh as a launcher with no ./yy.py beside
+  # it, which is a directory with no working wrapper and no way back.
+  if ! update_self 'yy.py' '#!/usr/bin/env python3' 'py/yy.py'; then
+    printf 'Error: could not fetch py/yy.py; ./yy.zsh left untouched\n' >&2
+    exit 1
+  fi
+  if ! update_self 'yy.zsh' '#!/bin/zsh' 'py/yy.zsh'; then
+    printf 'Error: could not fetch py/yy.zsh; ./yy.py was replaced but\n' >&2
+    printf '       ./yy.zsh is still the shell build. Re-run --py.\n' >&2
+    exit 1
+  fi
+  printf 'Switched to the Python build. Previous copies are in .tmp.\n'
+  exit 0
 fi
 
 if (( do_update )); then

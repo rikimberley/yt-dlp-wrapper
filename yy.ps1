@@ -117,6 +117,7 @@ $TempUrl = ''
 $OutputPath = './t'
 $OutputPathPassed = $false
 $Update = $false
+$SwitchToPy = $false
 $OpenMode = ''
 $HtmlMode = $false
 $SetCheckpoint = $false
@@ -131,7 +132,7 @@ function Write-Usage {
 yy.ps1 - convenience wrapper around ./yt-dlp
 
 Usage:
-  ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U]
+  ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
            [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
   ./yy.ps1 -h | --help
 
@@ -146,6 +147,11 @@ Options:
   -U                  Update ./yt-dlp and refresh this script from the head of
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
+  --py                Switch this directory to the Python build: fetch
+                      py/yy.ps1 and py/yy.py from master, back up the current
+                      copies into .tmp, and replace ./yy.ps1 and ./yy.py.
+                      Exits without downloading. Takes precedence over -U,
+                      which would otherwise refresh the script this replaces.
   -o                  Open each channel in ./channel-ids.txt that published a
                       public video after ./checkpoint.txt, then exit without
                       downloading. Exits non-zero if a channel check failed.
@@ -167,7 +173,8 @@ Options:
   -h, --help          Show this help and exit.
 
 -o, -O, --html, --html2 and --html3 are mutually exclusive.
-Flag precedence: -h, then -U, then -o/-O/--html*, then -c, then download.
+Flag precedence: -h, then --py, then -U, then -o/-O/--html*, then -c, then
+download.
 
 Examples:
   ./yy.ps1 'https://example.com/video'
@@ -205,6 +212,9 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
     elseif ($a -ceq '-U') {
         $Update = $true
+    }
+    elseif ($a -ceq '--py') {
+        $SwitchToPy = $true
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
         if ($OpenMode -ne '' -or $HtmlMode) {
@@ -548,10 +558,14 @@ function Get-WebContent {
 # because writing it would leave the machine with no working wrapper at all.
 # Returns $true on success (including "already up to date").
 function Update-Self {
-    param([string]$Name, [string]$Sentinel)
+    param([string]$Name, [string]$Sentinel, [string]$Remote = '')
 
-    $uri = "$scriptRawBase/$Name"
-    $body = Get-WebContent $uri "$Name from master"
+    # $Remote is the path under master to fetch. It defaults to $Name and
+    # differs only for --py, where the payload for ./yy.ps1 comes from
+    # py/yy.ps1.
+    if ($Remote -eq '') { $Remote = $Name }
+    $uri = "$scriptRawBase/$Remote"
+    $body = Get-WebContent $uri "$Remote from master"
     if ($null -eq $body -or $body -eq '') {
         [Console]::Error.WriteLine("Warning: could not refresh $Name from master")
         return $false
@@ -2275,6 +2289,26 @@ if (-not [string]::IsNullOrEmpty($TempUrl)) {
 if (-not $OutputPathPassed -and
     $runUrl -match '^https?://(?:[^/]+\.)?youtube\.com/@([^/?#]+)') {
     $OutputPath = './' + $Matches[1]
+}
+
+if ($SwitchToPy) {
+    # The implementation is fetched first and the launcher only if it lands.
+    # The reverse order can leave ./yy.ps1 as a launcher with no ./yy.py beside
+    # it, which is a directory with no working wrapper and no way back.
+    if (-not (Update-Self 'yy.py' '#!/usr/bin/env python3' 'py/yy.py')) {
+        [Console]::Error.WriteLine(
+            'Error: could not fetch py/yy.py; ./yy.ps1 left untouched')
+        exit 1
+    }
+    if (-not (Update-Self 'yy.ps1' '#!/usr/bin/env pwsh' 'py/yy.ps1')) {
+        [Console]::Error.WriteLine(
+            'Error: could not fetch py/yy.ps1; ./yy.py was replaced but')
+        [Console]::Error.WriteLine(
+            '       ./yy.ps1 is still the shell build. Re-run --py.')
+        exit 1
+    }
+    Write-Host 'Switched to the Python build. Previous copies are in .tmp.'
+    exit 0
 }
 
 if ($Update) {

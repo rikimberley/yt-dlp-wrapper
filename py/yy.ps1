@@ -7,7 +7,10 @@
 # Must run on Windows PowerShell 5.1, so: no backtick-e escapes, no bare
 # $IsWindows, and nothing that needs pwsh 6+.
 #
-# Keep this script trivial. Anything added here is a divergence again.
+# Keep this script trivial. Anything added here is a divergence again. The one
+# exception is --no-py below, which has to live here: it exists to recover a
+# directory whose yy.py or Python interpreter is the thing that is broken, so
+# it cannot be implemented in yy.py.
 # ---------------------------------------------------------------------------
 
 Set-StrictMode -Version Latest
@@ -16,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 $target = Join-Path $PSScriptRoot 'yy.py'
 $minMajor = 3
 $minMinor = 9
+$scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master'
 
 # Launcher errors go to stderr, matching yy.zsh. Write-Error is deliberately
 # not used: with $ErrorActionPreference = 'Stop' it throws, printing a source
@@ -24,6 +28,81 @@ $minMinor = 9
 function Write-LauncherError {
     param([string]$Message)
     [Console]::Error.WriteLine($Message)
+}
+
+# --no-py: replace this launcher with the shell build from the head of master,
+# the inverse of the shell build's --py. Handled before yy.py and the
+# interpreter are looked for, for the reason given in the header.
+$wantsShellBuild = $false
+foreach ($a in $args) { if ([string]$a -ceq '--no-py') { $wantsShellBuild = $true } }
+
+if ($wantsShellBuild) {
+    # 5.1 defaults to TLS 1.0, which raw.githubusercontent.com refuses, and its
+    # Invoke-WebRequest never advertises gzip. Both are fixed the same way the
+    # shell build fixes them.
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
+    }
+    catch { }
+
+    $body = $null
+    try {
+        $request = [Net.HttpWebRequest]::Create("$scriptRawBase/yy.ps1")
+        $request.Method = 'GET'
+        $request.Timeout = 60000
+        $request.AutomaticDecompression =
+            [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+        $response = $request.GetResponse()
+        try {
+            $reader = New-Object IO.StreamReader(
+                $response.GetResponseStream(), [Text.Encoding]::UTF8)
+            try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        }
+        finally { $response.Dispose() }
+    }
+    catch {
+        Write-LauncherError "Error: could not fetch yy.ps1 from master: $($_.Exception.Message)"
+        exit 1
+    }
+
+    # Same sentinel rule as -U: a captive portal or a 404 page written here
+    # would leave the directory with no working wrapper and no way back.
+    if ($null -eq $body -or -not $body.StartsWith('#!/usr/bin/env pwsh')) {
+        Write-LauncherError 'Error: refusing to overwrite yy.ps1: fetched body does not start with #!/usr/bin/env pwsh'
+        exit 1
+    }
+
+    $self = Join-Path $PSScriptRoot 'yy.ps1'
+    $tempDir = Join-Path $PSScriptRoot '.tmp'
+    $temp = Join-Path $PSScriptRoot ('yy.ps1.new.' + $PID)
+    try {
+        if (-not (Test-Path -LiteralPath $tempDir)) {
+            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        }
+        # UTF-8 without a BOM and LF endings, or the file stops matching the
+        # repo byte for byte and every -U afterwards sees a difference.
+        $normalized = $body.Replace("`r`n", "`n").TrimEnd("`n") + "`n"
+        [IO.File]::WriteAllText(
+            $temp, $normalized, (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $self) {
+            Copy-Item -LiteralPath $self `
+                -Destination (Join-Path $tempDir 'yy.ps1.bak') -Force
+        }
+        Move-Item -LiteralPath $temp -Destination $self -Force
+    }
+    catch {
+        Write-LauncherError "Error: could not write yy.ps1: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
+        exit 1
+    }
+    Write-Host 'Switched to the shell build. Previous copy is in .tmp/yy.ps1.bak'
+    if (Test-Path -LiteralPath $target) {
+        Write-Host 'yy.py is left in place but unused; the shell build never reads it.'
+    }
+    exit 0
 }
 
 if (-not (Test-Path -LiteralPath $target)) {
