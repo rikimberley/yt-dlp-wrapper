@@ -23,6 +23,9 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 MIN_PYTHON = (3, 9)
@@ -143,6 +146,24 @@ DOWNLOADED_VIDEO_TTL_SEC = 45 * 86400
 
 UC_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]+$")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+USER_AGENT = "Mozilla/5.0"
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+# Pre-accepted consent cookies: without them YouTube can answer a channel page
+# with a consent interstitial that carries no channel_id, which looks exactly
+# like "channel has no public videos". No account cookies are ever sent here;
+# the channel-check path stays logged-out so the Atom feed remains
+# public-by-construction and never exposes members-only videos.
+CONSENT_COOKIE = "SOCS=CAI; CONSENT=YES+cb"
+FETCH_TIMEOUT_SEC = 45
+FETCH_ATTEMPTS = 3
+YTDLP_TIMEOUT_SEC = 30
+YTDLP_ATTEMPTS = 1
+YTDLP_DEADLINE_SEC = 30
+MAX_THREADS = 16
+# Once this many channels have exhausted their feed retries in one run, stop
+# fetching feeds entirely and go straight to the uploads fallback.
+FEED_FAILURE_LIMIT = 3
 
 SCRIPT_RAW_BASE = (
     "https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master/py"
@@ -597,6 +618,497 @@ def ytdlp_path():
     return None
 
 
+def run_ytdlp_metadata(args, deadline_sec=YTDLP_DEADLINE_SEC, progress_label=None):
+    """Run yt-dlp and capture stdout.
+
+    deadline_sec of 0 waits forever, which a full channel scan legitimately
+    needs. Returns (returncode, stdout); a timeout reports returncode 124 to
+    match the shell's convention.
+    """
+    cmd = [str(part) for part in args]
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(BASE_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if not progress_label else None,
+            timeout=deadline_sec if deadline_sec > 0 else None,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            "Warning: yt-dlp metadata probe timed out after %s seconds\n"
+            % deadline_sec
+        )
+        return 124, ""
+    except OSError as error:
+        sys.stderr.write("Warning: could not run yt-dlp (%s)\n" % error)
+        return 1, ""
+    out = completed.stdout.decode("utf-8", "replace") if completed.stdout else ""
+    return completed.returncode, out
+
+
+# ---------------------------------------------------------------------------
+# HTTP fetching
+#
+# Requests advertise gzip and are retried, because a single transient hiccup
+# would otherwise be indistinguishable from an empty channel. A channel page
+# is ~1.2 MB raw but ~270 KB compressed, and the uncompressed transfer is what
+# used to time out and surface as "no public videos found".
+# ---------------------------------------------------------------------------
+
+class FetchResult:
+    def __init__(self, body=None, status=0, error=""):
+        self.body = body
+        self.status = status
+        self.error = error
+
+    @property
+    def ok(self):
+        return self.body is not None
+
+
+def fetch_url_once(url, send_consent=True):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": ACCEPT_LANGUAGE,
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if send_consent:
+        headers["Cookie"] = CONSENT_COOKIE
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SEC) as response:
+            raw = response.read()
+            encoding = (response.headers.get("Content-Encoding") or "").lower()
+            if encoding == "gzip":
+                import gzip
+
+                raw = gzip.decompress(raw)
+            elif encoding == "deflate":
+                import zlib
+
+                try:
+                    raw = zlib.decompress(raw)
+                except zlib.error:
+                    raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+            return FetchResult(raw.decode("utf-8", "replace"), response.status or 200)
+    except urllib.error.HTTPError as error:
+        return FetchResult(None, error.code, "HTTP %s" % error.code)
+    except Exception as error:  # URLError, timeout, bad gzip, ...
+        return FetchResult(None, 0, str(error) or error.__class__.__name__)
+
+
+def fetch_url(url, what, send_consent=True):
+    """Fetch with retries. Returns the body, or None when every attempt failed."""
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        if attempt > 1:
+            time.sleep(attempt - 1)
+        result = fetch_url_once(url, send_consent)
+        if result.ok:
+            return result.body
+        sys.stderr.write(
+            "Warning: fetch of %s failed (attempt %s/%s): %s\n"
+            % (what, attempt, FETCH_ATTEMPTS, result.error)
+        )
+        # A settled 4xx is an answer, not a hiccup; retrying only delays the
+        # correct failure report. 408 and 429 are explicitly retryable.
+        if 400 <= result.status < 500 and result.status not in (408, 429):
+            break
+    sys.stderr.write(
+        "Warning: giving up on %s (%s): %s\n" % (what, url, result.error)
+    )
+    return None
+
+
+def fetch_urls_concurrent(url_map, what, send_consent=True):
+    """Fetch many URLs at once. Only successfully fetched keys are returned."""
+    if not url_map:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = max(1, min(MAX_THREADS, len(url_map)))
+    bodies = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            key: pool.submit(fetch_url, url, "%s for %s" % (what, key), send_consent)
+            for key, url in url_map.items()
+        }
+        for key, future in futures.items():
+            try:
+                body = future.result()
+            except Exception as error:
+                sys.stderr.write(
+                    "Warning: fetch of %s for %s failed: %s\n" % (what, key, error)
+                )
+                body = None
+            if body is not None:
+                bodies[key] = body
+    return bodies
+
+
+# ---------------------------------------------------------------------------
+# Channel identity and the public-video feed
+# ---------------------------------------------------------------------------
+
+def channel_url_for(channel):
+    """A raw UC… id is used directly; anything else is treated as a handle."""
+    if UC_ID_RE.match(channel):
+        return "https://www.youtube.com/channel/%s/videos" % channel
+    return "https://www.youtube.com/@%s/videos" % urllib.parse.quote(
+        channel, safe="._~-"
+    )
+
+
+CHANNEL_ID_PATTERNS = [
+    re.compile(r"channel_id=(UC[A-Za-z0-9_-]+)"),
+    re.compile(r'"externalId":"(UC[A-Za-z0-9_-]+)"'),
+    re.compile(r"/channel/(UC[A-Za-z0-9_-]+)"),
+]
+
+
+def scrape_channel_id(html):
+    for pattern in CHANNEL_ID_PATTERNS:
+        match = pattern.search(html)
+        if match:
+            return match.group(1)
+    return None
+
+
+def channel_id_via_ytdlp(url):
+    """Last-resort resolution using yt-dlp, which tracks YouTube's page layout
+    far better than the regexes above. Stays logged-out, so the result remains
+    public-by-construction."""
+    exe = ytdlp_path()
+    if exe is None:
+        return None
+    rc, out = run_ytdlp_metadata(
+        [
+            exe,
+            "--ignore-config",
+            "--no-warnings",
+            "--socket-timeout",
+            YTDLP_TIMEOUT_SEC,
+            "--retries",
+            YTDLP_ATTEMPTS,
+            "--extractor-retries",
+            YTDLP_ATTEMPTS,
+            "--flat-playlist",
+            "--playlist-items",
+            "0",
+            "--print",
+            "playlist:%(channel_id)s",
+            url,
+        ]
+    )
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        line = trim(line)
+        if UC_ID_RE.match(line):
+            return line
+    return None
+
+
+def resolve_channel_id(handle, channel_url, skip_cache=False):
+    """Resolve a handle to its UC id, cheapest method first.
+
+    Returns (channel_id, source) where source is 'cache', 'page' or 'yt-dlp',
+    or (None, None) when every method failed. Every non-cache result is
+    written through to the cache.
+    """
+    if not skip_cache:
+        cached = cached_channel_id(handle)
+        if cached:
+            return cached, "cache"
+
+    html = fetch_url(channel_url, "channel page for @%s" % handle)
+    if html is not None:
+        channel_id = scrape_channel_id(html)
+        if channel_id:
+            store_channel_id(handle, channel_id)
+            return channel_id, "page"
+        sys.stderr.write("Warning: no channel_id found on %s\n" % channel_url)
+
+    channel_id = channel_id_via_ytdlp(channel_url)
+    if channel_id:
+        store_channel_id(handle, channel_id)
+        return channel_id, "yt-dlp"
+
+    sys.stderr.write("Warning: could not resolve a channel id for @%s\n" % handle)
+    return None, None
+
+
+PUBLISHED_RE = re.compile(r"<published>([^<]*)</published>")
+
+
+def iso_to_epoch_ms(timestamp):
+    """Parse an Atom <published> value into epoch milliseconds, or None."""
+    text = trim(timestamp)
+    if not text:
+        return None
+    # Python 3.9's fromisoformat rejects 'Z' and sub-second precision varies,
+    # so normalise both before parsing.
+    normalised = text
+    if normalised.endswith("Z"):
+        normalised = normalised[:-1] + "+00:00"
+    from datetime import datetime, timezone
+
+    for candidate in (normalised, re.sub(r"\.\d+", "", normalised)):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    return None
+
+
+def feed_newest_ms_from_body(feed, what):
+    """Newest <published> in an Atom feed body, in epoch ms, or 0 for none.
+
+    The entries are not reliably date-sorted, so every one is scanned.
+    """
+    if "<feed" not in feed or "</feed>" not in feed:
+        sys.stderr.write("Warning: malformed video feed for %s\n" % what)
+        return 0
+    newest = 0
+    for raw in PUBLISHED_RE.findall(feed):
+        epoch_ms = iso_to_epoch_ms(raw)
+        if epoch_ms is None:
+            sys.stderr.write(
+                "Warning: unparsable <published> value '%s' for %s\n" % (raw, what)
+            )
+            continue
+        newest = max(newest, epoch_ms)
+    return newest
+
+
+def feed_url_for(channel_id):
+    return "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % channel_id
+
+
+def feed_newest_ms(channel_id):
+    """Newest public video in a channel's Atom feed, in epoch ms.
+
+    Returns -1 when the feed could not be read or held nothing usable, which
+    must stay distinguishable from a real timestamp. This feed omits
+    members-only videos, so no extra filtering is needed and no cookies are
+    sent.
+    """
+    feed = fetch_url(
+        feed_url_for(channel_id), "video feed for %s" % channel_id, send_consent=False
+    )
+    if feed is None:
+        return -1
+    newest = feed_newest_ms_from_body(feed, channel_id)
+    return newest if newest > 0 else -1
+
+
+def ytdlp_newest_public_ms(channel_id):
+    """Fallback for when the Atom feed is unavailable.
+
+    Resolves the five newest entries of the channel's UU… uploads playlist and
+    keeps only those explicitly marked public, so a members-only or unlisted
+    upload can never advance the checkpoint. Returns -1 when the probe failed
+    and 0 when the channel genuinely has no public video.
+    """
+    exe = ytdlp_path()
+    if exe is None:
+        sys.stderr.write("Warning: yt-dlp is not available for the uploads fallback\n")
+        return -1
+    uploads = "UU" + channel_id[2:]
+    rc, out = run_ytdlp_metadata(
+        [
+            exe,
+            "--ignore-config",
+            "--no-warnings",
+            "--socket-timeout",
+            YTDLP_TIMEOUT_SEC,
+            "--retries",
+            YTDLP_ATTEMPTS,
+            "--extractor-retries",
+            YTDLP_ATTEMPTS,
+            "--playlist-items",
+            "1:5",
+            "--skip-download",
+            "--print",
+            "%(timestamp)s\t%(availability)s",
+            "https://www.youtube.com/playlist?list=%s" % uploads,
+        ]
+    )
+    if rc != 0:
+        sys.stderr.write(
+            "Warning: yt-dlp uploads probe failed for %s\n" % channel_id
+        )
+        return -1
+    newest = 0
+    saw_row = False
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        saw_row = True
+        timestamp, availability = trim(parts[0]), trim(parts[1])
+        if availability != "public":
+            continue
+        if not re.fullmatch(r"[0-9]+", timestamp):
+            continue
+        newest = max(newest, int(timestamp) * 1000)
+    if not saw_row:
+        return -1
+    return newest
+
+
+class FeedGate:
+    """Tracks feed failures across one run.
+
+    Once FEED_FAILURE_LIMIT channels have exhausted their retries, feed
+    fetching is abandoned for every remaining channel and they go straight to
+    the uploads fallback. Without this, a network-wide outage costs three
+    timed-out fetches per channel.
+    """
+
+    def __init__(self):
+        self.failures = 0
+        self.skip_feeds = False
+
+    def record_failure(self):
+        self.failures += 1
+        if self.failures >= FEED_FAILURE_LIMIT and not self.skip_feeds:
+            self.skip_feeds = True
+            sys.stderr.write(
+                "Warning: %s feed fetches failed; skipping feeds for the rest "
+                "of this run\n" % self.failures
+            )
+
+
+def newest_public_ms(channel, channel_url, gate=None):
+    """Newest public video for a channel-ids.txt entry, in epoch ms.
+
+    Returns -1 for "could not check" and 0 for "genuinely no public videos".
+    Collapsing those two would make a network blip read as an empty channel,
+    so they stay distinct all the way to the caller.
+    """
+    gate = gate or FeedGate()
+    channel_id, source = resolve_channel_id(channel, channel_url)
+    if not channel_id:
+        return -1
+
+    newest = public_newest_ms_for_channel_id(channel_id, gate)
+    # A cached id that yields nothing may be a handle that moved to a new
+    # channel. Drop it and resolve once more before believing the answer.
+    if newest < 0 and source == "cache":
+        sys.stderr.write(
+            "Warning: cached channel id for @%s looks stale; re-resolving\n" % channel
+        )
+        store_channel_id(channel, None)
+        channel_id, _ = resolve_channel_id(channel, channel_url, skip_cache=True)
+        if not channel_id:
+            return -1
+        newest = public_newest_ms_for_channel_id(channel_id, gate)
+    return newest
+
+
+def public_newest_ms_for_channel_id(channel_id, gate):
+    if not gate.skip_feeds:
+        newest = feed_newest_ms(channel_id)
+        if newest > 0:
+            return newest
+        gate.record_failure()
+    return ytdlp_newest_public_ms(channel_id)
+
+
+# ---------------------------------------------------------------------------
+# Opening channels in a browser
+# ---------------------------------------------------------------------------
+
+def open_url(url):
+    if sys.platform == "darwin":
+        return run_cmd(["open", "--", url])
+    if os.name == "nt":
+        try:
+            os.startfile(url)  # noqa: B606  (Windows only)
+            print("Opened: %s" % url)
+            return 0
+        except OSError as error:
+            sys.stderr.write("Error: could not open %s (%s)\n" % (url, error))
+            return 1
+    from shutil import which
+
+    if which("xdg-open"):
+        return run_cmd(["xdg-open", url])
+    sys.stderr.write("Error: no browser opener found (need open or xdg-open)\n")
+    return 1
+
+
+def run_open_mode(check):
+    """-o (check) and -O (open everything).
+
+    Returns 0 on success. A channel that could not be checked is never opened
+    and always makes the run exit non-zero, so a network failure is reported
+    rather than silently read as an empty channel.
+    """
+    channels = read_channels()
+    if channels is None:
+        return 1
+
+    checkpoint_ms = 0
+    if check:
+        checkpoint_ms = read_checkpoint_ms()
+        if checkpoint_ms is None:
+            return 1
+        print("Checkpoint: %s" % checkpoint_ms)
+
+    status = read_channel_check_status() if check else {}
+    gate = FeedGate()
+    batch_ms = now_ms()
+    failures = 0
+
+    for channel in channels:
+        channel_url = channel_url_for(channel)
+        if not check:
+            open_url(channel_url)
+            continue
+        newest = newest_public_ms(channel, channel_url, gate)
+        if newest < 0:
+            failures += 1
+            print("%s: CHECK FAILED (see warnings above; not opened)" % channel)
+            continue
+        record = status.setdefault(
+            channel, {"checked_ms": 0, "latest_video_ms": 0, "thumbnail": ""}
+        )
+        record["checked_ms"] = batch_ms
+        record["latest_video_ms"] = newest
+        if newest == 0:
+            print("%s: no public videos found (skipped)" % channel)
+        elif newest > checkpoint_ms:
+            print("%s: new public video (%s > %s)" % (channel, newest, checkpoint_ms))
+            open_url(channel_url)
+        else:
+            print("%s: up to date (%s <= %s)" % (channel, newest, checkpoint_ms))
+
+    if check:
+        save_channel_check_status(status)
+
+    run_open_mode.failure_count = failures
+    run_open_mode.channel_count = len(channels)
+    if failures:
+        sys.stderr.write("Error: %s channel check(s) failed\n" % failures)
+        return 1
+    return 0
+
+
+run_open_mode.failure_count = 0
+run_open_mode.channel_count = 0
+
+
+def should_skip_checkpoint(failures, channel_count):
+    """Protect the checkpoint from advancing past channels that never got
+    checked. 'All failed' only counts when at least one channel was listed."""
+    return failures >= 3 or (channel_count > 0 and failures == channel_count)
+
+
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
@@ -729,7 +1241,6 @@ def set_open_mode(opts, mode):
 YOUTUBE_HANDLE_RE = re.compile(r"^https?://([^/]+\.)?youtube\.com/@([^/?#]+)")
 
 NOT_IMPLEMENTED = {
-    "open": "-O",
     "html3": "--html3",
 }
 
@@ -760,11 +1271,27 @@ def main(argv):
         write_text_file(URL_FILE, [opts.url])
 
     if opts.open_mode is not None:
-        sys.stderr.write(
-            "Error: %s is not implemented in this build yet\n"
-            % NOT_IMPLEMENTED[opts.open_mode]
-        )
-        return 2
+        if opts.open_mode in NOT_IMPLEMENTED:
+            sys.stderr.write(
+                "Error: %s is not implemented in this build yet\n"
+                % NOT_IMPLEMENTED[opts.open_mode]
+            )
+            return 2
+        TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        rc = run_open_mode(check=False)
+        # -c runs after -O, so "open everything, then mark it all seen" works.
+        # The checkpoint is held back when too much of the run failed, so it
+        # can never advance past channels that were never really checked.
+        if opts.set_checkpoint:
+            if should_skip_checkpoint(
+                run_open_mode.failure_count, run_open_mode.channel_count
+            ):
+                sys.stderr.write(
+                    "Error: too many channel checks failed; checkpoint not updated\n"
+                )
+                return 1
+            set_checkpoint_at(now_ms())
+        return rc
 
     if opts.set_checkpoint:
         set_checkpoint_at(now_ms())
