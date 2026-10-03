@@ -52,8 +52,8 @@ re-exporting.
 ## Usage
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
-./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
+./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
 
 # Full usage summary from either wrapper:
 ./yy.zsh --help
@@ -65,6 +65,7 @@ re-exporting.
 | *(no args)* | Re-download the URL in `current_url.txt` |
 | `-t <url>` | Download this URL once, without persisting it |
 | `-U` | Self-update the binary *and* this wrapper from `master`, then exit |
+| `--py` | Switch this directory to the [Python build](#python-build), then exit. Reversible with `--no-py` |
 | `-p <path>` | Download into `<path>` instead of the automatic/default path |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
@@ -75,7 +76,7 @@ re-exporting.
 | `-c` | With `-o`, `--html`, `--html2`, or `--html3`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 | `-h`, `--help` | Print the usage summary and exit |
 
-Precedence: `-h`/`--help`, then `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
+Precedence: `-h`/`--help`, then `--py`, then `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
 `-O`, `--html`, `--html2`, and `--html3` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
@@ -207,11 +208,54 @@ retry. The small `-o` fallback also has a 30-second wall-clock deadline. The
 complete `/videos` traversal used by `--html` has no wall-clock deadline because
 large channels can require many continuation pages.
 
+## Python build
+
+`yy.zsh` and `yy.ps1` are two hand-maintained ports of the same tool, which is
+why they can drift. `py/` holds a replacement: one implementation, `yy.py`
+(Python 3.9+, standard library only, no install step), behind a thin launcher
+for each shell that only locates an interpreter and hands off.
+
+It is opt-in and reversible. From a shell-build directory:
+
+```
+./yy.zsh --py      # or: ./yy.ps1 --py
+```
+
+That fetches `py/yy.py`, `py/yy.zsh` and `py/yy.ps1` from `master` and replaces
+`./yy.py`, `./yy.zsh` and `./yy.ps1`. **Both** wrappers are switched, so the
+directory is never half of each build. The previous copies are kept in `.tmp`.
+
+To go back, from the Python build:
+
+```
+./yy.zsh --no-py   # or: ./yy.ps1 --no-py
+```
+
+`--no-py` is handled by the launcher, not by `yy.py`, so it still works when
+`yy.py` is broken or no Python is installed — which is when you are most
+likely to want it. `yy.py` is left on disk, unused.
+
+Both directions keep a `.bak` in `.tmp` and refuse to install a payload that
+does not start with the expected shebang, so a captive portal or an error page
+cannot overwrite a working wrapper.
+
+Differences from the shell build, as of now:
+
+- `--html3` is implemented; **`--html` and `--html2` are not.** If you use
+  those, stay on the shell build.
+- Everything else — downloads, `-o`/`-O`/`-c`, `-U`, the state files — behaves
+  the same and shares the same files on disk, so you can switch back and forth
+  without losing checkpoints, caches or history.
+
+`-U` in the Python build refreshes `yy.py` *and* the launcher beside it, since
+the build is two pieces.
+
 ## Files
 
 | Path | Role |
 |---|---|
 | `yy.zsh` / `yy.ps1` | The wrappers. Behaviourally identical; keep them in sync. |
+| `py/` | The [Python build](#python-build): `yy.py` plus a thin launcher per shell. Opt in with `--py`, back out with `--no-py`. |
 | `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored *(gitignored)* |
 | `checkpoint.txt` | Epoch timestamp `-o` compares against; missing or empty means "no checkpoint" (0), so every video counts as new *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
