@@ -20,8 +20,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -164,6 +166,14 @@ MAX_THREADS = 16
 # Once this many channels have exhausted their feed retries in one run, stop
 # fetching feeds entirely and go straight to the uploads fallback.
 FEED_FAILURE_LIMIT = 3
+# A yt-dlp scan is forced at least this often, however quiet the public feed
+# looks, so a channel can never drift indefinitely on feed evidence alone.
+HTML_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000
+# yt-dlp stops with 101 when --break-match-filters trips, which is the normal
+# way a bounded scan ends and must not be read as a failure.
+YTDLP_BREAK_RC = 101
+# Availability values that must never be offered for download.
+NON_PUBLIC_AVAILABILITY = frozenset(("subscriber_only", "private", "premium_only"))
 
 SCRIPT_RAW_BASE = (
     "https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master/py"
@@ -840,6 +850,10 @@ def resolve_channel_id(handle, channel_url, skip_cache=False):
 
 PUBLISHED_RE = re.compile(r"<published>([^<]*)</published>")
 
+# The sentinel prefix matters: yt-dlp interleaves its own chatter on stdout,
+# so a bare "<digits>:<word>" line could otherwise be mistaken for a record.
+FALLBACK_ROW_RE = re.compile(r"^fallback:([0-9]+):public$")
+
 
 def iso_to_epoch_ms(timestamp):
     """Parse an Atom <published> value into epoch milliseconds, or None."""
@@ -929,35 +943,33 @@ def ytdlp_newest_public_ms(channel_id):
             YTDLP_ATTEMPTS,
             "--extractor-retries",
             YTDLP_ATTEMPTS,
+            "--skip-download",
             "--playlist-items",
             "1:5",
-            "--skip-download",
             "--print",
-            "%(timestamp)s\t%(availability)s",
+            "fallback:%(timestamp)s:%(availability)s",
             "https://www.youtube.com/playlist?list=%s" % uploads,
         ]
     )
+    newest = 0
+    for line in out.splitlines():
+        match = FALLBACK_ROW_RE.match(trim(line))
+        if match:
+            newest = max(newest, int(match.group(1)) * 1000)
+
+    if newest > 0:
+        return newest
+    # The exit code, not the absence of rows, is what separates "could not
+    # check" from "genuinely nothing public". A channel whose only uploads are
+    # members-only exits 0 with no public row and must read as 0, or it would
+    # be reported as a failed check forever.
     if rc != 0:
         sys.stderr.write(
-            "Warning: yt-dlp uploads probe failed for %s\n" % channel_id
+            "Warning: yt-dlp uploads fallback failed for %s (%s)\n"
+            % (channel_id, uploads)
         )
         return -1
-    newest = 0
-    saw_row = False
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        saw_row = True
-        timestamp, availability = trim(parts[0]), trim(parts[1])
-        if availability != "public":
-            continue
-        if not re.fullmatch(r"[0-9]+", timestamp):
-            continue
-        newest = max(newest, int(timestamp) * 1000)
-    if not saw_row:
-        return -1
-    return newest
+    return 0
 
 
 class FeedGate:
@@ -1110,6 +1122,471 @@ def should_skip_checkpoint(failures, channel_count):
 
 
 # ---------------------------------------------------------------------------
+# Scan engine
+#
+# Scans the /videos tab of each channel with the cookie-backed yt-dlp binary
+# and merges the result into the incremental cache. Everything here stops at
+# the merged entry list; rendering it into a page is a separate step.
+#
+# Approximate tab dates can precede the exact publication time, so the scan
+# starts at midnight UTC on the day *before* the checkpoint date and keeps the
+# overlap rather than resolving every watch page. Coverage over precision.
+# ---------------------------------------------------------------------------
+
+def day_start_sec(epoch_sec):
+    return epoch_sec - epoch_sec % 86400
+
+
+def scan_cutoff_for(checkpoint_ms):
+    cutoff = day_start_sec(checkpoint_ms // 1000) - 86400
+    return max(cutoff, 0)
+
+
+def normalise_entry_ms(value):
+    """yt-dlp prints %(timestamp)s in seconds; cached rows are already in ms."""
+    return value * 1000 if 0 < value < 100000000000 else value
+
+
+class ScanEntry:
+    __slots__ = ("id", "url", "title", "timestamp_ms", "availability")
+
+    def __init__(self, video_id, url, title, timestamp_ms, availability):
+        self.id = video_id
+        self.url = url
+        self.title = title
+        self.timestamp_ms = timestamp_ms
+        self.availability = availability
+
+    @classmethod
+    def from_cache(cls, row):
+        return cls(
+            row["id"],
+            row["url"],
+            row["title"],
+            normalise_entry_ms(row["timestamp_ms"]),
+            row["availability"],
+        )
+
+    def to_cache(self):
+        return {
+            "id": self.id,
+            "url": self.url,
+            "title": self.title,
+            "timestamp_ms": self.timestamp_ms,
+            "availability": self.availability,
+        }
+
+    @property
+    def is_public(self):
+        return self.availability not in NON_PUBLIC_AVAILABILITY
+
+
+def parse_scan_output(text):
+    """Parse the TAB-separated --print rows yt-dlp emitted.
+
+    Only lines carrying the scan: sentinel are records; yt-dlp interleaves its
+    own chatter on the same stream. The template must contain a real TAB, not
+    a literal backslash-t, or every row collapses into one field.
+    """
+    entries = []
+    for line in text.splitlines():
+        if not line.startswith("scan:"):
+            continue
+        fields = line[len("scan:") :].split("\t")
+        if len(fields) < 5:
+            continue
+        # Only the title can legitimately contain a TAB, and the record has a
+        # fixed shape, so anchor on both ends and treat the middle as the
+        # title. Splitting naively would misread the title's tail as the
+        # timestamp and silently drop the video.
+        video_id = trim(fields[0])
+        url = trim(fields[1])
+        title = "\t".join(fields[2:-2])
+        timestamp = trim(fields[-2])
+        availability = trim(fields[-1])
+        if not video_id or not re.fullmatch(r"[0-9]+", timestamp):
+            continue
+        entries.append(
+            ScanEntry(
+                video_id,
+                url,
+                sanitize_field(title),
+                normalise_entry_ms(int(timestamp)),
+                availability,
+            )
+        )
+    return entries
+
+
+SCAN_PRINT_TEMPLATE = (
+    "scan:%(id)s\t%(webpage_url)s\t%(title)s\t%(timestamp)s\t%(availability)s"
+)
+
+
+def scan_channel(exe, channel_url, cutoff_sec, cookie_file):
+    """Scan one channel's /videos tab. Returns (ok, entries).
+
+    --lazy-playlist with --break-match-filters stops walking the tab as soon
+    as an entry older than the cutoff appears, so a long-running channel costs
+    only the recent page rather than its whole history.
+    """
+    rc, out = run_ytdlp_metadata(
+        [
+            exe,
+            "--ignore-config",
+            "--no-warnings",
+            "--cookies",
+            cookie_file,
+            "--flat-playlist",
+            "--lazy-playlist",
+            "--extractor-args",
+            "youtubetab:approximate_date",
+            "--socket-timeout",
+            YTDLP_TIMEOUT_SEC,
+            "--retries",
+            YTDLP_ATTEMPTS,
+            "--extractor-retries",
+            YTDLP_ATTEMPTS,
+            "--skip-download",
+            "--break-match-filters",
+            "timestamp >= %s" % cutoff_sec,
+            "--print",
+            SCAN_PRINT_TEMPLATE,
+            channel_url,
+        ],
+        deadline_sec=0,
+    )
+    ok = rc in (0, YTDLP_BREAK_RC)
+    return ok, parse_scan_output(out)
+
+
+class CookieJarPool:
+    """Hands out one ephemeral copy of the cookie jar per worker slot.
+
+    Concurrent yt-dlp processes rewrite their cookie file as the session
+    refreshes, so sharing one jar across workers corrupts it. The copies are
+    always removed, including when the run is interrupted.
+    """
+
+    def __init__(self, source, slots):
+        self.paths = []
+        TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        for slot in range(slots):
+            target = TEMPORARY_DIRECTORY / ("cookies%d.txt" % slot)
+            try:
+                shutil.copyfile(str(source), str(target))
+            except OSError as error:
+                sys.stderr.write(
+                    "Warning: could not stage a cookie jar for slot %s (%s)\n"
+                    % (slot, error)
+                )
+                continue
+            self.paths.append(target)
+        self._free = list(self.paths)
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self.paths)
+
+    def acquire(self):
+        with self._lock:
+            return self._free.pop() if self._free else None
+
+    def release(self, path):
+        with self._lock:
+            self._free.append(path)
+
+    def cleanup(self):
+        for path in self.paths:
+            try:
+                os.remove(str(path))
+            except OSError:
+                pass
+        self.paths = []
+        self._free = []
+
+
+class ChannelPlan:
+    """One channel's scan decision: which id, from what cutoff, and whether a
+    yt-dlp scan is needed at all."""
+
+    def __init__(self, channel, channel_id, cutoff_sec, last_full_ms):
+        self.channel = channel
+        self.channel_id = channel_id
+        self.cutoff_sec = cutoff_sec
+        self.last_full_ms = last_full_ms
+        self.skip_scan = False
+        self.feed_newest_ms = 0
+
+
+def should_scan_html_channel(channel, status, refresh_all):
+    """Routine scans skip channels whose newest known video is unknown or
+    already 45 days old. REFRESH ALL bypasses the filter so those records can
+    be repaired."""
+    if refresh_all:
+        return True
+    record = status.get(channel)
+    if not record:
+        return False
+    latest = record.get("latest_video_ms", 0)
+    return latest > 0 and latest > now_ms() - STALE_CHANNEL_TTL_MS
+
+
+def plan_channels(channels, status, cache, checkpoint_ms, incremental, refresh_all):
+    """Resolve ids and per-channel cutoffs. Returns (plans, failures)."""
+    base_cutoff = scan_cutoff_for(checkpoint_ms)
+    plans = []
+    failures = []
+    for channel in channels:
+        # In incremental mode a channel with no cache record is always
+        # scanned, so a newly added handle can never be skipped as "stale".
+        newly_added = incremental and channel not in cache
+        if not newly_added and not should_scan_html_channel(
+            channel, status, refresh_all
+        ):
+            print(
+                "Skipping @%s (latest video is 1.5 months old or older, or unknown)"
+                % channel
+            )
+            continue
+
+        if UC_ID_RE.match(channel):
+            channel_id = channel
+        else:
+            channel_id, _ = resolve_channel_id(channel, channel_url_for(channel))
+            if not channel_id:
+                failures.append((channel, "could not resolve channel id"))
+                continue
+
+        cutoff_sec = base_cutoff
+        last_full_ms = 0
+        if incremental and channel in cache:
+            record = cache[channel]
+            last_full_ms = record.get("last_full_scan_ms", 0) or record.get(
+                "checked_ms", 0
+            )
+            if last_full_ms > 0:
+                candidate = day_start_sec(last_full_ms // 1000) - 86400
+                cutoff_sec = max(cutoff_sec, candidate)
+        plans.append(ChannelPlan(channel, channel_id, cutoff_sec, last_full_ms))
+    return plans, failures
+
+
+def apply_feed_gate(plans, cache, checkpoint_ms, batch_ms):
+    """Mark channels whose public feed proves nothing new has been published.
+
+    This is the whole point of incremental mode: an unchanged feed means the
+    expensive cookie-backed scan can be skipped and the cached cards reused.
+    A feed that is newer, empty, malformed or unfetchable deliberately leaves
+    the channel to be scanned, so the cheap check can only ever save work, not
+    cause a miss. A scan is still forced every HTML_FULL_SCAN_INTERVAL_MS.
+    """
+    candidates = {
+        plan.channel: plan
+        for plan in plans
+        if plan.channel in cache
+        and plan.last_full_ms > 0
+        and batch_ms - plan.last_full_ms < HTML_FULL_SCAN_INTERVAL_MS
+    }
+    if not candidates:
+        return
+
+    urls = {
+        channel: feed_url_for(plan.channel_id)
+        for channel, plan in candidates.items()
+    }
+    bodies = fetch_urls_concurrent(urls, "video feed", send_consent=False)
+
+    base_known_ms = scan_cutoff_for(checkpoint_ms) * 1000
+    for channel, plan in candidates.items():
+        body = bodies.get(channel)
+        if body is None:
+            continue
+        newest_feed_ms = feed_newest_ms_from_body(body, channel)
+        if newest_feed_ms <= 0:
+            continue
+        plan.feed_newest_ms = newest_feed_ms
+        record = cache[channel]
+        known_ms = max(base_known_ms, record.get("feed_newest_ms", 0))
+        for row in record.get("entries", []):
+            known_ms = max(known_ms, normalise_entry_ms(row.get("timestamp_ms", 0)))
+        if newest_feed_ms <= known_ms:
+            plan.skip_scan = True
+            print("@%s: public feed unchanged; reusing cached cards" % channel)
+
+
+def run_scan_pool(plans, exe, cookies_source, on_progress=None):
+    """Scan every channel that needs it, concurrently. Returns
+    {channel: (scanned_ok, entries)}; a skipped channel is absent."""
+    pending = [plan for plan in plans if not plan.skip_scan]
+    results = {}
+    if not pending:
+        return results
+
+    pool = CookieJarPool(cookies_source, min(MAX_THREADS, len(pending)))
+    if not len(pool):
+        sys.stderr.write("Error: could not stage any cookie jar for scanning\n")
+        return {plan.channel: (False, []) for plan in pending}
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def work(plan):
+            jar = pool.acquire()
+            if jar is None:
+                return plan, False, []
+            try:
+                print("Checking @%s..." % plan.channel)
+                ok, entries = scan_channel(
+                    exe, channel_url_for(plan.channel), plan.cutoff_sec, jar
+                )
+                return plan, ok, entries
+            finally:
+                pool.release(jar)
+
+        with ThreadPoolExecutor(max_workers=len(pool)) as executor:
+            futures = [executor.submit(work, plan) for plan in pending]
+            completed = 0
+            for future in as_completed(futures):
+                try:
+                    plan, ok, entries = future.result()
+                except Exception as error:
+                    sys.stderr.write("Warning: a channel scan failed: %s\n" % error)
+                    continue
+                results[plan.channel] = (ok, entries)
+                completed += 1
+                if on_progress:
+                    on_progress(completed, len(pending))
+    finally:
+        pool.cleanup()
+    return results
+
+
+def merge_channel_entries(cached_entries, scanned, keep_cutoff_ms):
+    """Merge freshly scanned rows over cached rows, newest first.
+
+    A scanned row always wins over the cached row for the same video, so a
+    retitled or newly-available video is corrected rather than frozen at
+    whatever the first scan saw.
+    """
+    merged = {}
+    order = []
+    for row in cached_entries:
+        entry = ScanEntry.from_cache(row)
+        if entry.id not in merged:
+            order.append(entry.id)
+        merged[entry.id] = entry
+    for entry in scanned:
+        if entry.id not in merged:
+            order.append(entry.id)
+        merged[entry.id] = entry
+    kept = [
+        merged[video_id]
+        for video_id in order
+        if merged[video_id].timestamp_ms >= keep_cutoff_ms
+    ]
+    kept.sort(key=lambda entry: entry.timestamp_ms, reverse=True)
+    return kept
+
+
+def scan_all_channels(
+    channels, checkpoint_ms, incremental, refresh_all, on_progress=None
+):
+    """Full scan cycle: plan, gate, scan, merge, persist.
+
+    Returns (per_channel_entries, failures) where per_channel_entries maps a
+    channel to its merged, newest-first entry list.
+    """
+    exe = ytdlp_path()
+    if exe is None:
+        sys.stderr.write("Error: yt-dlp binary not found next to this script\n")
+        return None, []
+    if not COOKIES_FILE.is_file():
+        sys.stderr.write(
+            "Error: %s does not exist; export YouTube cookies from a browser first\n"
+            % display_path(COOKIES_FILE)
+        )
+        return None, []
+
+    batch_ms = now_ms()
+    status = read_channel_check_status()
+    cache = read_html_video_cache() if incremental else {}
+
+    plans, failures = plan_channels(
+        channels, status, cache, checkpoint_ms, incremental, refresh_all
+    )
+    if incremental:
+        apply_feed_gate(plans, cache, checkpoint_ms, batch_ms)
+
+    results = run_scan_pool(plans, exe, COOKIES_FILE, on_progress)
+
+    keep_cutoff_ms = scan_cutoff_for(checkpoint_ms) * 1000
+    per_channel = {}
+    for plan in plans:
+        channel = plan.channel
+        scanned_ok, scanned = results.get(channel, (True, []))
+        # A gated channel was never scanned, so it has no fresh rows but is
+        # not a failure either.
+        full_scan_ok = scanned_ok and not plan.skip_scan
+        cached_rows = cache.get(channel, {}).get("entries", []) if incremental else []
+
+        if not scanned_ok:
+            if incremental:
+                sys.stderr.write(
+                    "Warning: could not incrementally scan the videos tab for "
+                    "@%s; using cached entries\n" % channel
+                )
+                failures.append(
+                    (channel, "could not scan videos tab; using cached entries")
+                )
+            else:
+                sys.stderr.write(
+                    "Warning: could not scan the videos tab for @%s\n" % channel
+                )
+                failures.append((channel, "could not scan videos tab"))
+                continue
+
+        entries = merge_channel_entries(cached_rows, scanned, keep_cutoff_ms)
+        per_channel[channel] = entries
+
+        newest = max((e.timestamp_ms for e in entries if e.is_public), default=0)
+        print(
+            "@%s: %s visible video(s) in the checkpoint overlap"
+            % (channel, sum(1 for e in entries if e.is_public))
+        )
+
+        if incremental:
+            prior = cache.get(channel, {})
+            cache[channel] = {
+                "channel_id": plan.channel_id,
+                "checked_ms": batch_ms if scanned_ok else prior.get("checked_ms", 0),
+                "last_full_scan_ms": (
+                    batch_ms if full_scan_ok else plan.last_full_ms
+                ),
+                "feed_newest_ms": (
+                    plan.feed_newest_ms
+                    if (scanned_ok and plan.feed_newest_ms)
+                    else prior.get("feed_newest_ms", 0)
+                ),
+                "entries": [entry.to_cache() for entry in entries],
+            }
+
+        # preserve=1: a scan that found nothing must not erase a channel's
+        # known age, or the staleness filter would drop it on the next run.
+        record = status.setdefault(
+            channel, {"checked_ms": 0, "latest_video_ms": 0, "thumbnail": ""}
+        )
+        record["checked_ms"] = batch_ms
+        if newest:
+            record["latest_video_ms"] = newest
+
+    if incremental:
+        save_html_video_cache(cache)
+    save_channel_check_status(status)
+    return per_channel, failures
+
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 
@@ -1117,7 +1594,7 @@ USAGE = """\
 yy.py - convenience wrapper around ./yt-dlp
 
 Usage:
-  yy [<url>] [-t <temp_url>] [-p <path>] [-U] [-O | --html3]
+  yy [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html3]
      [--html3-incognito] [-c]
   yy -h | --help
 
@@ -1132,8 +1609,12 @@ Options:
   -U                  Update ./yt-dlp and refresh this script from the head of
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
+  -o                  For each channel in ./channel-ids.txt, open its /videos
+                      tab only if it has a public video published after
+                      ./checkpoint.txt. Exits without downloading, and exits
+                      non-zero if any channel could not be checked.
   -O                  Open every channel in ./channel-ids.txt unconditionally,
-                      then exit without downloading.
+                      with no check, then exit without downloading.
   --html3             Generate a local 6-column video grid with y1/y2
                       selections and serve it on http://127.0.0.1:8080,
                       opening a loading shell immediately and streaming one
@@ -1142,19 +1623,21 @@ Options:
   --html3-incognito   With --html3, open the page in a Chrome/Chromium
                       incognito window instead of the default browser.
   -c                  Overwrite ./checkpoint.txt with the current epoch-ms
-                      timestamp, then exit without downloading. Runs after -O,
-                      so "-O -c" means "open the channels, then mark
-                      everything as seen".
+                      timestamp, then exit without downloading. Runs after
+                      -o/-O, so "-o -c" means "open whatever is new, then mark
+                      everything as seen". The checkpoint is held back if at
+                      least three checks failed, or if every check failed.
   -h, --help          Show this help and exit.
 
--O and --html3 are mutually exclusive.
-Flag precedence: -h, then -U, then -O/--html3, then -c, then download.
+-o, -O and --html3 are mutually exclusive.
+Flag precedence: -h, then -U, then -o/-O/--html3, then -c, then download.
 
 Examples:
   yy 'https://example.com/video'
   yy -t 'https://example.com/one-off'
   yy -p ./my-videos -t 'https://example.com/one-off'
   yy -U
+  yy -o -c
   yy -O -c
   yy --html3
   yy --html3 --html3-incognito
@@ -1206,6 +1689,8 @@ def parse_args(argv):
             opts.output_path_passed = True
         elif arg == "-U":
             opts.do_update = True
+        elif arg == "-o":
+            set_open_mode(opts, "check")
         elif arg == "-O":
             set_open_mode(opts, "open")
         elif arg == "--html3":
@@ -1230,7 +1715,7 @@ class UsageError(Exception):
 
 def set_open_mode(opts, mode):
     if opts.open_mode is not None and opts.open_mode != mode:
-        raise UsageError("-O and --html3 are mutually exclusive")
+        raise UsageError("-o, -O, and --html3 cannot be combined")
     opts.open_mode = mode
 
 
@@ -1278,7 +1763,7 @@ def main(argv):
             )
             return 2
         TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        rc = run_open_mode(check=False)
+        rc = run_open_mode(check=(opts.open_mode == "check"))
         # -c runs after -O, so "open everything, then mark it all seen" works.
         # The checkpoint is held back when too much of the run failed, so it
         # can never advance past channels that were never really checked.
