@@ -16,7 +16,8 @@
 #   skip any download
 # - uses --html to generate a local 6-column video grid with y1/y2 selections
 # - uses --html2 for the same page with persistent incremental scan caching
-# - uses --html3 to open an independent loading shell and stream channel fragments from a worker
+# - uses --html3 to open an independent loading shell in Chrome Incognito on
+#   Windows and stream channel fragments from a worker
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
 #   ones, then mark everything as seen")
@@ -267,6 +268,32 @@ function Open-Url {
             Start-Process $TargetUrl | Out-Null
         }
     }
+}
+
+# HTML3 is a local, interactive page. On Windows, open it in Chrome's
+# Incognito profile so it can be kept separate from ordinary browsing. Chrome
+# reuses an existing Incognito window when one is already open.
+function Open-Html3Url {
+    param([string]$TargetUrl)
+
+    if ((Get-PlatformName) -ne 'windows') {
+        Open-Url $TargetUrl
+        return
+    }
+
+    $chromeCandidates = @(
+        (Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    if ($chromeCandidates.Count -eq 0) {
+        Write-Warning 'Google Chrome was not found; opening HTML3 in the default browser.'
+        Open-Url $TargetUrl
+        return
+    }
+
+    Write-RunLine @($chromeCandidates[0], '--incognito', $TargetUrl)
+    Start-Process -FilePath $chromeCandidates[0] -ArgumentList @('--incognito', $TargetUrl) | Out-Null
 }
 
 # Convert an ISO-8601 timestamp (e.g. 2026-08-01T16:30:12+00:00) to epoch ms.
@@ -1909,7 +1936,8 @@ function Invoke-HtmlCallbackServer {
     try {
         [Console]::add_CancelKeyPress($cancelHandler)
         if ($Html3) { $html3Worker = Start-Html3Worker -Token $Token }
-        Open-Url 'http://127.0.0.1:8080/'
+        if ($Html3) { Open-Html3Url 'http://127.0.0.1:8080/' }
+        else { Open-Url 'http://127.0.0.1:8080/' }
         Write-Host 'Waiting for DOWNLOAD SELECTED on http://127.0.0.1:8080/ (Ctrl+C or STOP SERVER exits)'
         while ($listener.IsListening -and -not $script:htmlStopRequested) {
             $pending = $listener.BeginGetContext($null, $null)
