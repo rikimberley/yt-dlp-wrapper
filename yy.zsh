@@ -2511,7 +2511,7 @@ start_selected_video_hooks() {
   fi
   read_downloaded_videos >/dev/null
   local -A downloaded_set
-  local key hook
+  local key hook hook_name
   for key in "${downloaded_keys[@]}"; do downloaded_set[$key]=1; done
   for pass in y2 y1; do
     for idx in "${order[@]}"; do
@@ -2527,12 +2527,16 @@ start_selected_video_hooks() {
           "${sel_channel[$idx]}" "${sel_video[$idx]}" "${sel_target[$idx]}"
         continue
       fi
-      # y1 and y2 both run this wrapper's own download path. The labels are
-      # kept because the page, the completion history and the y2-before-y1
-      # ordering are all keyed on them.
-      hook=$script_self
-      if [[ ! -x "$hook" ]]; then
-        hook_error="This wrapper (${hook}) is not executable"
+      # y1 and y2 run the local yy1/yy2 hooks found on PATH, matching yy.ps1's
+      # yy1.ps1/yy2.ps1 lookup. The hooks are what make the two labels mean
+      # different destinations; point them at this wrapper to get identical
+      # behaviour. Aliases and shell functions are deliberately not accepted:
+      # this script is not interactive and never sources a shell rc, so a hook
+      # has to be a real executable on PATH.
+      hook_name="y${sel_target[$idx]}"
+      hook=${commands[$hook_name]}
+      if [[ -z "$hook" || ! -x "$hook" ]]; then
+        hook_error="Local ${hook_name} hook was not found on PATH"
         return 1
       fi
       (( ++job_counter ))

@@ -132,10 +132,14 @@ loopback listener; the wrapper validates the structured selections and starts a
 download job without making
 the page wait for downloads to finish; it reports queued, running, completed,
 and failed job counts plus recent yy/yt-dlp output in the page and the wrapper
-console. `yy.zsh` runs its own download path for both targets —
-`./yy.zsh -p "./<channel-entry>" -t "<url>"` in the wrapper's own directory —
-while `yy.ps1` calls the separate local `yy1.ps1` / `yy2.ps1` hooks found on
-`PATH` with the same `-p` / `-t` arguments. Jobs run sequentially: all y2 selections first, then y1 selections.
+console. Both wrappers hand a selection to an external hook found on `PATH`
+and invoke it with the same `-p` / `-t` arguments: `yy.zsh` looks for `yy1`
+and `yy2`, `yy.ps1` looks for `yy1.ps1` and `yy2.ps1`. The hooks are what give
+the two labels different meanings — point them at this wrapper (optionally
+with different `-p` defaults) to decide where each one downloads. They must be
+real executables on `PATH`; a shell alias will not be found, because the
+wrapper runs non-interactively and never reads your shell startup files. A
+missing hook fails that download request. Jobs run sequentially: all y2 selections first, then y1 selections.
 Download output keeps lifecycle messages, warnings, errors, and completion
 lines, while repetitive yt-dlp percentage updates are reduced to one snapshot
 per 10 percentage points for each transferred format. The browser displays the
