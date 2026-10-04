@@ -196,6 +196,14 @@ YTDLP_ENCODING_ARGS = ("--encoding", "utf-8")
 # stamped lower is force-rescanned once, which is the only way to clear
 # damage that leaves no trace in the data itself.
 SCAN_ENCODING_VERSION = 1
+# In-memory marker set while reading the cache to say "these rows are
+# known-bad, re-fetch the whole window". Deliberately not a persisted field:
+# zeroing last_full_scan_ms was tried first and silently did nothing, because
+# plan_channels falls back to `or checked_ms`, which is recent -- so the
+# channel still entered the feed gate and a quiet channel reused its damaged
+# cards forever. Keyed with a leading underscore so it cannot collide with a
+# real cache field.
+FORCE_FULL_SCAN_KEY = "_force_full_scan"
 
 # Availability values that must never be offered for download.
 NON_PUBLIC_AVAILABILITY = frozenset(("subscriber_only", "private", "premium_only"))
@@ -624,15 +632,11 @@ def read_html_video_cache():
                 # *deletes* every non-ASCII character rather than leaving a
                 # U+FFFD behind, so the damage is invisible and the check
                 # below would miss it entirely. Force one rescan instead.
-                cache[channel]["last_full_scan_ms"] = 0
+                cache[channel][FORCE_FULL_SCAN_KEY] = True
             if any(REPLACEMENT_CHAR in entry["title"] for entry in entries):
                 # This row was decoded from the wrong code page and is already
-                # mojibaked. Clearing the full-scan stamp drops the channel out
-                # of the feed gate, which would otherwise reuse the damaged
-                # cards for the full 45 days; the forced rescan then overwrites
-                # each title, since a scanned row always beats its cached
-                # counterpart.
-                cache[channel]["last_full_scan_ms"] = 0
+                # mojibaked, so it has to be re-fetched rather than reused.
+                cache[channel][FORCE_FULL_SCAN_KEY] = True
     cutoff_ms = now_ms() - STALE_CHANNEL_TTL_MS
     kept = {
         channel: record
@@ -645,7 +649,19 @@ def read_html_video_cache():
 
 
 def save_html_video_cache(cache):
-    write_json_file(HTML_VIDEO_CACHE_FILE, cache)
+    # FORCE_FULL_SCAN_KEY is an in-memory signal only. Persisting it would
+    # pin the channel to a full scan on every subsequent run.
+    write_json_file(
+        HTML_VIDEO_CACHE_FILE,
+        {
+            channel: {
+                key: value
+                for key, value in record.items()
+                if key != FORCE_FULL_SCAN_KEY
+            }
+            for channel, record in cache.items()
+        },
+    )
 
 
 # --- downloaded-videos.json ------------------------------------------------
@@ -1572,11 +1588,14 @@ class ChannelPlan:
     """One channel's scan decision: which id, from what cutoff, and whether a
     yt-dlp scan is needed at all."""
 
-    def __init__(self, channel, channel_id, cutoff_sec, last_full_ms):
+    def __init__(self, channel, channel_id, cutoff_sec, last_full_ms, force_full=False):
         self.channel = channel
         self.channel_id = channel_id
         self.cutoff_sec = cutoff_sec
         self.last_full_ms = last_full_ms
+        # Set when the cached rows are known-bad and must be re-fetched over
+        # the whole retention window, whatever the public feed says.
+        self.force_full = force_full
         self.skip_scan = False
         self.feed_newest_ms = 0
 
@@ -1622,15 +1641,23 @@ def plan_channels(channels, status, cache, checkpoint_ms, incremental, refresh_a
 
         cutoff_sec = base_cutoff
         last_full_ms = 0
+        force_full = False
         if incremental and channel in cache:
             record = cache[channel]
-            last_full_ms = record.get("last_full_scan_ms", 0) or record.get(
-                "checked_ms", 0
-            )
-            if last_full_ms > 0:
-                candidate = day_start_sec(last_full_ms // 1000) - 86400
-                cutoff_sec = max(cutoff_sec, candidate)
-        plans.append(ChannelPlan(channel, channel_id, cutoff_sec, last_full_ms))
+            force_full = bool(record.get(FORCE_FULL_SCAN_KEY))
+            # A forced record keeps base_cutoff (the whole retention window)
+            # and last_full_ms 0, so the feed gate below cannot reach it and
+            # every cached row is re-fetched rather than just the newest day.
+            if not force_full:
+                last_full_ms = record.get("last_full_scan_ms", 0) or record.get(
+                    "checked_ms", 0
+                )
+                if last_full_ms > 0:
+                    candidate = day_start_sec(last_full_ms // 1000) - 86400
+                    cutoff_sec = max(cutoff_sec, candidate)
+        plans.append(
+            ChannelPlan(channel, channel_id, cutoff_sec, last_full_ms, force_full)
+        )
     return plans, failures
 
 
@@ -1647,6 +1674,7 @@ def apply_feed_gate(plans, cache, checkpoint_ms, batch_ms):
         plan.channel: plan
         for plan in plans
         if plan.channel in cache
+        and not plan.force_full
         and plan.last_full_ms > 0
         and batch_ms - plan.last_full_ms < HTML_FULL_SCAN_INTERVAL_MS
     }

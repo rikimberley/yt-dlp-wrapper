@@ -110,6 +110,12 @@ $htmlFullScanIntervalMs = 24L * 60L * 60L * 1000L
 # that leaves no trace in the data itself. Keep in step with
 # SCAN_ENCODING_VERSION in py/yy.py.
 $scanEncodingVersionCurrent = 1
+# In-memory marker meaning "these cached rows are known-bad, re-fetch the whole
+# window". Deliberately not persisted. Zeroing last_full_scan_ms was tried
+# first and silently did nothing, because the planner falls back to
+# `checked_ms` when the stamp is 0 -- so the channel still entered the feed
+# gate and a quiet channel reused its damaged cards forever.
+$forceFullScanProperty = '_force_full_scan'
 $feedFetchFailures = 0
 $skipFeedFetches = $false
 $feedFetchFailed = $false
@@ -1149,15 +1155,12 @@ function Read-HtmlVideoCache {
                     [string]$record.scan_encoding_version, [ref]$scanEncodingVersion)
             }
             if ($null -ne $record -and $scanEncodingVersion -lt $scanEncodingVersionCurrent) {
-                $record | Add-Member -NotePropertyName 'last_full_scan_ms' `
-                    -NotePropertyValue 0 -Force
-                $changed = $true
+                $record | Add-Member -NotePropertyName $forceFullScanProperty `
+                    -NotePropertyValue $true -Force
             }
             # A real title never contains U+FFFD, so one here proves the row was
-            # decoded from the wrong code page. Clearing the full-scan stamp
-            # drops the channel out of the feed gate, which would otherwise
-            # reuse the damaged cards for the full 45 days; the forced rescan
-            # then overwrites each title.
+            # decoded from the wrong code page and must be re-fetched rather
+            # than reused.
             if ($null -ne $record -and $null -ne $record.PSObject.Properties['entries']) {
                 foreach ($entry in @($record.entries)) {
                     if ($null -eq $entry -or
@@ -1166,9 +1169,8 @@ function Read-HtmlVideoCache {
                         # -Force so this works whether or not the property
                         # already exists; a plain assignment throws on a
                         # PSCustomObject that lacks it.
-                        $record | Add-Member -NotePropertyName 'last_full_scan_ms' `
-                            -NotePropertyValue 0 -Force
-                        $changed = $true
+                        $record | Add-Member -NotePropertyName $forceFullScanProperty `
+                            -NotePropertyValue $true -Force
                         break
                     }
                 }
@@ -1183,9 +1185,21 @@ function Read-HtmlVideoCache {
 
 function Save-HtmlVideoCache {
     param([hashtable]$Cache)
+    # $forceFullScanProperty is an in-memory signal only. Persisting it would
+    # pin the channel to a full scan on every subsequent run.
+    $clean = @{}
+    foreach ($key in $Cache.Keys) {
+        $record = $Cache[$key]
+        if ($null -ne $record -and
+            $null -ne $record.PSObject.Properties[$forceFullScanProperty]) {
+            $record = $record.PSObject.Copy()
+            $record.PSObject.Properties.Remove($forceFullScanProperty)
+        }
+        $clean[$key] = $record
+    }
     $temp = Join-Path $temporaryDirectory ((Split-Path -Leaf $htmlVideoCacheFile) + '.new.' + $PID)
     try {
-        [System.IO.File]::WriteAllText($temp, ($Cache | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($temp, ($clean | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $temp -Destination $htmlVideoCacheFile -Force
     }
     finally { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
@@ -1505,6 +1519,7 @@ function New-VideoHtml {
     $htmlChannelIds = @{}
     $scanCutoffs = @{}
     $lastFullScans = @{}
+    $forceFullScans = @{}
     $restoredSelections = 0
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
@@ -1536,18 +1551,27 @@ function New-VideoHtml {
         }
         $channelCutoff = [long]$scanCutoffSec
         if ($Incremental -and $null -ne $videoCache[$channel]) {
-            [long]$lastFullScanMs = 0
-            if ($null -ne $videoCache[$channel].PSObject.Properties['last_full_scan_ms']) {
-                [void][long]::TryParse([string]$videoCache[$channel].last_full_scan_ms, [ref]$lastFullScanMs)
+            $forceFullScan = ($null -ne $videoCache[$channel].PSObject.Properties[$forceFullScanProperty] -and
+                [bool]$videoCache[$channel].$forceFullScanProperty)
+            $forceFullScans[$channel] = $forceFullScan
+            # A forced record keeps the full retention window and a zero
+            # last-full stamp, so the feed gate below cannot reach it and every
+            # cached row is re-fetched rather than just the newest day.
+            if (-not $forceFullScan) {
+                [long]$lastFullScanMs = 0
+                if ($null -ne $videoCache[$channel].PSObject.Properties['last_full_scan_ms']) {
+                    [void][long]::TryParse([string]$videoCache[$channel].last_full_scan_ms, [ref]$lastFullScanMs)
+                }
+                if ($lastFullScanMs -le 0) {
+                    [void][long]::TryParse([string]$videoCache[$channel].checked_ms, [ref]$lastFullScanMs)
+                }
+                $lastFullScans[$channel] = $lastFullScanMs
+                if ($lastFullScanMs -gt 0) {
+                    $lastFullScanSec = [Math]::Floor($lastFullScanMs / 1000)
+                    $channelCutoff = [Math]::Max($channelCutoff, $lastFullScanSec - ($lastFullScanSec % 86400) - 86400)
+                }
             }
-            if ($lastFullScanMs -le 0) {
-                [void][long]::TryParse([string]$videoCache[$channel].checked_ms, [ref]$lastFullScanMs)
-            }
-            $lastFullScans[$channel] = $lastFullScanMs
-            if ($lastFullScanMs -gt 0) {
-                $lastFullScanSec = [Math]::Floor($lastFullScanMs / 1000)
-                $channelCutoff = [Math]::Max($channelCutoff, $lastFullScanSec - ($lastFullScanSec % 86400) - 86400)
-            }
+            else { $lastFullScans[$channel] = 0 }
         }
         $scanCutoffs[$channel] = $channelCutoff
         [void]$channels.Add($channel)
@@ -1559,7 +1583,8 @@ function New-VideoHtml {
         foreach ($channel in $channels) {
             $priorRecord = $videoCache[[string]$channel]
             [long]$lastFullScanMs = if ($lastFullScans.ContainsKey([string]$channel)) { $lastFullScans[[string]$channel] } else { 0 }
-            if ($null -ne $priorRecord -and $lastFullScanMs -gt 0 -and ($checkBatchMs - $lastFullScanMs) -lt $htmlFullScanIntervalMs) {
+            $forceFullScan = ($forceFullScans.ContainsKey([string]$channel) -and $forceFullScans[[string]$channel])
+            if ($null -ne $priorRecord -and -not $forceFullScan -and $lastFullScanMs -gt 0 -and ($checkBatchMs - $lastFullScanMs) -lt $htmlFullScanIntervalMs) {
                 $feedCandidates[[string]$channel] = [string]$htmlChannelIds[[string]$channel]
             }
         }
