@@ -2773,6 +2773,7 @@ yy.py - convenience wrapper around ./yt-dlp
 Usage:
   yy [<url>] [-t <temp_url>] [-p <path>] [-U] [--no-py]
      [-o | -O | --html3] [--html3-incognito] [-c]
+  yy --sync | --sync-dry-run | --sync-override
   yy -h | --help
 
 Arguments:
@@ -2812,10 +2813,22 @@ Options:
                       -o/-O, so "-o -c" means "open whatever is new, then mark
                       everything as seen". The checkpoint is held back if at
                       least three checks failed, or if every check failed.
+  --sync              Merge this machine's state with the shared private
+                      repo over git+SSH, write the result back here, push it,
+                      then exit. Covers checkpoint.txt, channel-ids.txt,
+                      channel-id-cache.txt, downloaded-videos.json,
+                      channel-check-status.json and current_url.json.
+                      cookies.txt is never synced.
+  --sync-dry-run      Show what --sync would change, writing and pushing
+                      nothing.
+  --sync-override     Replace the shared state with this machine's copy.
+                      Always previews the difference and asks first.
   -h, --help          Show this help and exit.
 
--o, -O and --html3 are mutually exclusive.
-Flag precedence: -h, then -U, then -o/-O/--html3, then -c, then download.
+-o, -O and --html3 are mutually exclusive, and so are the --sync modes.
+--sync cannot be combined with -o, -O or --html3; run it as its own command.
+Flag precedence: -h, then -U, then --sync, then -o/-O/--html3, then -c, then
+download.
 
 Examples:
   yy 'https://example.com/video'
@@ -2826,6 +2839,8 @@ Examples:
   yy -O -c
   yy --html3
   yy --html3 --html3-incognito
+  yy --sync
+  yy --sync-dry-run
 """
 
 
@@ -2851,6 +2866,7 @@ class Options:
         self.open_mode = None
         self.html3_incognito = False
         self.set_checkpoint = False
+        self.sync_mode = None
         self.show_help = False
 
 
@@ -2882,6 +2898,12 @@ def parse_args(argv):
             set_open_mode(opts, "html3")
         elif arg == "--html3-incognito":
             opts.html3_incognito = True
+        elif arg == "--sync":
+            set_sync_mode(opts, "sync")
+        elif arg == "--sync-dry-run":
+            set_sync_mode(opts, "dry-run")
+        elif arg == "--sync-override":
+            set_sync_mode(opts, "override")
         elif arg == "-c":
             opts.set_checkpoint = True
         elif arg.startswith("-") and arg != "-":
@@ -2902,6 +2924,691 @@ def set_open_mode(opts, mode):
     if opts.open_mode is not None and opts.open_mode != mode:
         raise UsageError("-o, -O, and --html3 cannot be combined")
     opts.open_mode = mode
+
+
+def set_sync_mode(opts, mode):
+    if opts.sync_mode is not None and opts.sync_mode != mode:
+        raise UsageError(
+            "--sync, --sync-dry-run, and --sync-override cannot be combined"
+        )
+    opts.sync_mode = mode
+
+
+# ---------------------------------------------------------------------------
+# --sync: share state between this machine and the other one
+#
+# The two machines exchange state through a private git repo. Git is the
+# transport for one reason: a private repo cannot be read from the
+# unauthenticated raw.githubusercontent.com path that -U uses, so the fetch
+# has to be authenticated, and git+SSH is the only authenticated channel this
+# project already trusts.
+#
+# Every merge rule below is commutative and idempotent on purpose. A push can
+# lose a race, and the recovery is simply "pull again, merge again, push
+# again" -- which is only safe if merging twice is the same as merging once.
+# ---------------------------------------------------------------------------
+
+SYNC_REMOTE = os.environ.get(
+    "YY_SYNC_REMOTE", "git@github.com:rikimberley/yt-dlp-wrapper-state.git"
+)
+SYNC_BRANCH = os.environ.get("YY_SYNC_BRANCH", "master")
+SYNC_SSH_KEY = os.environ.get("YY_SYNC_SSH_KEY", "~/.ssh/rikimberley_github_ed25519")
+SYNC_USER_NAME = "rikimberley"
+SYNC_USER_EMAIL = "85369872+rikimberley@users.noreply.github.com"
+
+SYNC_CLONE_DIR = TEMPORARY_DIRECTORY / "state-sync"
+# The state as of the end of the last successful sync. Without it a removal is
+# indistinguishable from "the other machine has not added it yet".
+SYNC_BASE_DIR = TEMPORARY_DIRECTORY / "state-sync-base"
+SYNC_TOMBSTONE_NAME = "channel-ids-removed.txt"
+SYNC_PUSH_ATTEMPTS = 3
+
+
+class SyncError(Exception):
+    pass
+
+
+def sync_git_env():
+    """Environment for every git call against the state repo.
+
+    This clone has no local config of its own, so without -F /dev/null it
+    would inherit the machine's ssh config -- which on a corporate box ends in
+    a catch-all that offers the work key. Authenticating as the wrong account
+    is far worse than failing, so the key is pinned and the agent is disabled.
+    GIT_TERMINAL_PROMPT stops a failed auth from hanging on a password prompt.
+    """
+    env = dict(os.environ)
+    env["GIT_SSH_COMMAND"] = (
+        "ssh -F /dev/null -i %s -o IdentitiesOnly=yes -o IdentityAgent=none"
+        % shlex.quote(os.path.expanduser(SYNC_SSH_KEY))
+    )
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def run_git(args, cwd=None, check=True):
+    """Run git and return (returncode, stdout, stderr)."""
+    try:
+        proc = subprocess.Popen(
+            ["git"] + args,
+            cwd=str(cwd) if cwd else None,
+            env=sync_git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise SyncError("could not run git: %s" % error)
+    raw_out, raw_err = proc.communicate()
+    out = raw_out.decode("utf-8", "replace")
+    err = raw_err.decode("utf-8", "replace")
+    if check and proc.returncode != 0:
+        raise SyncError(
+            "git %s failed: %s" % (" ".join(args), trim(err) or trim(out))
+        )
+    return proc.returncode, out, err
+
+
+def sync_prepare_clone():
+    """Make .tmp/state-sync mirror the remote branch.
+
+    Returns True when the branch already has commits, False when the remote is
+    still empty and this is the first sync ever.
+    """
+    if not (SYNC_CLONE_DIR / ".git").is_dir():
+        if SYNC_CLONE_DIR.exists():
+            shutil.rmtree(str(SYNC_CLONE_DIR), ignore_errors=True)
+        SYNC_CLONE_DIR.mkdir(parents=True, exist_ok=True)
+        run_git(["init", "-q"], cwd=SYNC_CLONE_DIR)
+        # Not `init -b`: that needs git 2.28+, and this has to work on
+        # whatever git the Windows box happens to ship.
+        run_git(
+            ["symbolic-ref", "HEAD", "refs/heads/%s" % SYNC_BRANCH],
+            cwd=SYNC_CLONE_DIR,
+        )
+        run_git(["remote", "add", "origin", SYNC_REMOTE], cwd=SYNC_CLONE_DIR)
+    else:
+        run_git(["remote", "set-url", "origin", SYNC_REMOTE], cwd=SYNC_CLONE_DIR)
+
+    run_git(["config", "user.name", SYNC_USER_NAME], cwd=SYNC_CLONE_DIR)
+    run_git(["config", "user.email", SYNC_USER_EMAIL], cwd=SYNC_CLONE_DIR)
+
+    # ls-remote first, because it is the only call that cleanly separates "the
+    # remote is empty" from "authentication failed". A bare fetch reports both
+    # as a non-zero exit, and treating an auth failure as an empty remote
+    # would push local state over a repo we simply failed to read.
+    rc, out, err = run_git(["ls-remote", "origin"], cwd=SYNC_CLONE_DIR, check=False)
+    if rc != 0:
+        raise SyncError(
+            "cannot reach %s: %s" % (SYNC_REMOTE, trim(err) or trim(out))
+        )
+
+    ref = "refs/heads/%s" % SYNC_BRANCH
+    has_commits = any(line.endswith(ref) for line in out.splitlines())
+    if has_commits:
+        run_git(["fetch", "--quiet", "origin", SYNC_BRANCH], cwd=SYNC_CLONE_DIR)
+        run_git(["reset", "--quiet", "--hard", "FETCH_HEAD"], cwd=SYNC_CLONE_DIR)
+        run_git(["clean", "-qfd"], cwd=SYNC_CLONE_DIR)
+    return has_commits
+
+
+# --- lenient parsers -------------------------------------------------------
+#
+# These read an arbitrary path rather than the module-level constant, because
+# a merge has to read the same file from three places: here, the clone, and
+# the base snapshot. They are deliberately lenient -- the remote copy may have
+# been written by a different build -- and the strict validation still happens
+# when the normal readers next load the file.
+
+
+def sync_write_text(path, text):
+    """Write LF-terminated UTF-8.
+
+    Not Path.write_text(newline=...): that keyword only exists on Python 3.10+
+    and this has to run on whatever interpreter the Windows box has. Pinning
+    the newline matters either way -- the repo must hold LF, or every sync
+    from Windows would look like a whole-file change.
+    """
+    with open(str(path), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def sync_read_lines(path):
+    content = read_text_file(path)
+    if content is None:
+        return None
+    return content.splitlines()
+
+
+def sync_parse_channels(path):
+    lines = sync_read_lines(path)
+    if lines is None:
+        return None
+    channels = []
+    seen = set()
+    for line in lines:
+        entry = trim(line)
+        if not entry or entry.startswith("#"):
+            continue
+        entry = entry.lstrip("@")
+        if entry and entry not in seen:
+            seen.add(entry)
+            channels.append(entry)
+    return channels
+
+
+def sync_parse_tombstones(path):
+    """Return {handle: removed_ms}."""
+    lines = sync_read_lines(path) or []
+    tombstones = {}
+    for line in lines:
+        parts = line.split("\t")
+        handle = trim(parts[0]) if parts else ""
+        if not handle or handle.startswith("#"):
+            continue
+        tombstones[handle.lstrip("@")] = (
+            coerce_int(parts[1]) if len(parts) > 1 else 0
+        )
+    return tombstones
+
+
+def sync_format_tombstones(tombstones):
+    return "".join(
+        "%s\t%s\n" % (handle, tombstones[handle])
+        for handle in sorted(tombstones, key=lambda h: h.encode("utf-8"))
+    )
+
+
+def sync_parse_cache(path):
+    lines = sync_read_lines(path)
+    if lines is None:
+        return {}
+    cache = {}
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        handle = trim(parts[0])
+        channel_id = trim(parts[1])
+        if handle and UC_ID_RE.match(channel_id):
+            cache[handle] = channel_id
+    return cache
+
+
+def sync_format_cache(cache):
+    return "".join(
+        "%s\t%s\n" % (handle, cache[handle])
+        for handle in sorted(cache, key=lambda h: h.encode("utf-8"))
+    )
+
+
+def sync_parse_checkpoint(path):
+    raw = read_first_line(path)
+    digits = re.sub(r"[^0-9]", "", raw or "")
+    if not digits:
+        return 0
+    value = int(digits)
+    return value * 1000 if len(digits) < 12 else value
+
+
+def sync_parse_downloaded(path):
+    data = read_json_file(path)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        record = {
+            "channel_id": coerce_str(item.get("channel_id")),
+            "video_id": coerce_str(item.get("video_id")),
+            "target": coerce_str(item.get("target")),
+            "download_epoch": coerce_int(item.get("download_epoch"), -1),
+        }
+        if (
+            UC_ID_RE.match(record["channel_id"])
+            and VIDEO_ID_RE.match(record["video_id"])
+            and record["target"] in ("y1", "y2")
+            and record["download_epoch"] >= 0
+        ):
+            records.append(record)
+    return records
+
+
+def sync_parse_status(path):
+    data = read_json_file(path)
+    status = {}
+    if isinstance(data, dict):
+        for channel, record in data.items():
+            if channel and isinstance(record, dict):
+                status[channel] = {
+                    "checked_ms": coerce_int(record.get("checked_ms")),
+                    "latest_video_ms": coerce_int(record.get("latest_video_ms")),
+                    "thumbnail": coerce_str(record.get("thumbnail")),
+                }
+    return status
+
+
+# --- merge rules -----------------------------------------------------------
+
+
+def sync_merge_channels(local, remote, base, tombstones):
+    """Union, local order first, minus anything tombstoned.
+
+    A handle is tombstoned when it was in the base snapshot and is now gone
+    locally -- that is a deliberate unsubscribe. Without the snapshot a plain
+    union would re-add it from the other machine on the very next sync, so
+    unsubscribing could never stick.
+
+    A tombstone is cleared only when the handle is back locally *and* absent
+    from the base, which is what a genuine re-add looks like. Testing just
+    "present locally" would break the other machine: it still has the handle
+    simply because it has not seen the removal yet, and it would resurrect it.
+    """
+    local = local or []
+    remote = remote or []
+    tombstones = dict(tombstones)
+    removed = []
+    restored = []
+
+    if base is not None:
+        base_set = set(base)
+        local_set = set(local)
+        for handle in base:
+            if handle not in local_set and handle not in tombstones:
+                tombstones[handle] = now_ms()
+                removed.append(handle)
+        for handle in local:
+            if handle in tombstones and handle not in base_set:
+                del tombstones[handle]
+                restored.append(handle)
+    else:
+        # No snapshot: cannot tell a removal from "not added yet", so trust
+        # the existing tombstones and do a plain union.
+        for handle in local:
+            if handle in tombstones:
+                del tombstones[handle]
+                restored.append(handle)
+
+    merged = [h for h in local if h not in tombstones]
+    added = []
+    for handle in remote:
+        if handle not in merged and handle not in tombstones:
+            merged.append(handle)
+            added.append(handle)
+    return merged, tombstones, added, removed, restored
+
+
+def sync_merge_cache(local, remote):
+    """Union by handle. Local wins a conflict: it was resolved against a live
+    page on this machine, and the entry is only a cache either way."""
+    merged = dict(remote)
+    merged.update(local)
+    return merged
+
+
+def sync_merge_downloaded(local, remote):
+    """Union by (channel_id, video_id, target), keeping the earliest download,
+    then re-apply the 45-day expiry.
+
+    Pruning *after* the union is the whole point: expiry has to beat
+    resurrection, or an entry this machine has already aged out comes straight
+    back from the machine that has not pruned yet, and never dies.
+    """
+    merged = {}
+    for record in list(remote) + list(local):
+        key = downloaded_key(record)
+        existing = merged.get(key)
+        if existing is None or record["download_epoch"] < existing["download_epoch"]:
+            merged[key] = record
+    cutoff_sec = now_sec() - DOWNLOADED_VIDEO_TTL_SEC
+    kept = [r for r in merged.values() if r["download_epoch"] >= cutoff_sec]
+    kept.sort(key=downloaded_key)
+    return kept, len(merged) - len(kept)
+
+
+def sync_merge_status(local, remote):
+    """Per channel keep the newer check, the newer video, and any thumbnail;
+    then drop channels unchecked for 45 days, for the same reason as above."""
+    merged = {}
+    for channel in set(local) | set(remote):
+        a = local.get(channel) or {}
+        b = remote.get(channel) or {}
+        merged[channel] = {
+            "checked_ms": max(coerce_int(a.get("checked_ms")), coerce_int(b.get("checked_ms"))),
+            "latest_video_ms": max(
+                coerce_int(a.get("latest_video_ms")),
+                coerce_int(b.get("latest_video_ms")),
+            ),
+            "thumbnail": coerce_str(a.get("thumbnail")) or coerce_str(b.get("thumbnail")),
+        }
+    cutoff_ms = now_ms() - STALE_CHANNEL_TTL_MS
+    return {
+        channel: record
+        for channel, record in merged.items()
+        if not (0 < record["checked_ms"] < cutoff_ms)
+    }
+
+
+def sync_merge_current_url(local, remote):
+    """Larger update_ts wins. Returns (payload, took_remote)."""
+    if not isinstance(local, dict) or not trim(local.get("url")):
+        return (remote, True) if isinstance(remote, dict) else (None, False)
+    if not isinstance(remote, dict) or not trim(remote.get("url")):
+        return local, False
+    if coerce_int(remote.get("update_ts")) > coerce_int(local.get("update_ts")):
+        return remote, True
+    return local, False
+
+
+# --- the sync itself -------------------------------------------------------
+
+
+def sync_plan():
+    """Pull, merge everything, and return (files, notes).
+
+    files maps a repo-relative name to the text that should end up in both the
+    clone and this machine; notes is the human-readable summary.
+    """
+    had_commits = sync_prepare_clone()
+    notes = []
+    files = {}
+    if not had_commits:
+        notes.append("Remote branch %s is empty; seeding it." % SYNC_BRANCH)
+
+    clone = SYNC_CLONE_DIR
+
+    # checkpoint.txt -- newest wins
+    local_cp = sync_parse_checkpoint(CHECKPOINT_FILE)
+    remote_cp = sync_parse_checkpoint(clone / "checkpoint.txt")
+    merged_cp = max(local_cp, remote_cp)
+    files["checkpoint.txt"] = "%s\n" % merged_cp
+    if merged_cp != local_cp:
+        notes.append("checkpoint.txt: %s -> %s (remote newer)" % (local_cp, merged_cp))
+    elif merged_cp != remote_cp:
+        notes.append("checkpoint.txt: pushing %s (local newer)" % merged_cp)
+
+    # channel-ids.txt -- union with tombstones
+    local_ch = sync_parse_channels(CHANNELS_FILE)
+    remote_ch = sync_parse_channels(clone / "channel-ids.txt")
+    base_ch = sync_parse_channels(SYNC_BASE_DIR / "channel-ids.txt")
+    tombstones = sync_parse_tombstones(clone / SYNC_TOMBSTONE_NAME)
+    merged_ch, tombstones, added, removed, restored = sync_merge_channels(
+        local_ch, remote_ch, base_ch, tombstones
+    )
+    files["channel-ids.txt"] = "".join(h + "\n" for h in merged_ch)
+    files[SYNC_TOMBSTONE_NAME] = sync_format_tombstones(tombstones)
+    if added:
+        notes.append("channel-ids.txt: + %s" % ", ".join(added))
+    if removed:
+        notes.append("channel-ids.txt: tombstoned %s" % ", ".join(removed))
+    if restored:
+        notes.append("channel-ids.txt: un-tombstoned %s" % ", ".join(restored))
+    dropped = [h for h in (local_ch or []) if h not in merged_ch]
+    if dropped:
+        notes.append("channel-ids.txt: removing locally %s" % ", ".join(dropped))
+
+    # channel-id-cache.txt -- union by handle
+    local_cache = sync_parse_cache(CHANNEL_ID_CACHE_FILE)
+    remote_cache = sync_parse_cache(clone / "channel-id-cache.txt")
+    merged_cache = sync_merge_cache(local_cache, remote_cache)
+    files["channel-id-cache.txt"] = sync_format_cache(merged_cache)
+    gained = len(merged_cache) - len(local_cache)
+    if gained > 0:
+        notes.append("channel-id-cache.txt: +%s cached id(s)" % gained)
+
+    # downloaded-videos.json -- union, earliest wins, then expire
+    local_dl = sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE)
+    remote_dl = sync_parse_downloaded(clone / "downloaded-videos.json")
+    merged_dl, expired = sync_merge_downloaded(local_dl, remote_dl)
+    files["downloaded-videos.json"] = json.dumps(
+        merged_dl, ensure_ascii=False, indent=2
+    ) + "\n"
+    if len(merged_dl) != len(local_dl):
+        notes.append(
+            "downloaded-videos.json: %s -> %s record(s)" % (len(local_dl), len(merged_dl))
+        )
+    if expired:
+        notes.append("downloaded-videos.json: expired %s after merge" % expired)
+
+    # channel-check-status.json -- newest per channel, then expire
+    local_st = sync_parse_status(CHANNEL_STATUS_FILE)
+    remote_st = sync_parse_status(clone / "channel-check-status.json")
+    merged_st = sync_merge_status(local_st, remote_st)
+    files["channel-check-status.json"] = json.dumps(
+        merged_st, ensure_ascii=False, indent=2
+    ) + "\n"
+    if len(merged_st) != len(local_st):
+        notes.append(
+            "channel-check-status.json: %s -> %s channel(s)"
+            % (len(local_st), len(merged_st))
+        )
+
+    # current_url.json -- larger update_ts wins
+    local_url = read_json_file(URL_JSON_FILE)
+    remote_url = read_json_file(clone / "current_url.json")
+    if not isinstance(local_url, dict) and URL_FILE.exists():
+        # yy.zsh and yy.ps1 still write only the .txt, so there is no
+        # update_ts to compare and no safe way to decide a winner.
+        sys.stderr.write(
+            "Warning: %s has no %s yet; skipping the URL merge\n"
+            % (display_path(BASE_DIR), URL_JSON_FILE.name)
+        )
+    else:
+        merged_url, took_remote = sync_merge_current_url(local_url, remote_url)
+        if isinstance(merged_url, dict):
+            files["current_url.json"] = json.dumps(
+                merged_url, ensure_ascii=False, indent=2
+            ) + "\n"
+            if took_remote:
+                notes.append("current_url.json: taking the remote URL (newer)")
+
+    # The rules above only describe what *changed semantically*, so a purely
+    # local addition produced no note at all and a dry run could claim
+    # "already in sync" while still having something to push. Summarise both
+    # directions from the merged text itself, which cannot miss a case.
+    pushing = []
+    updating = []
+    for name in sorted(files):
+        if read_text_file(SYNC_CLONE_DIR / name) != files[name]:
+            pushing.append(name)
+        target = sync_local_target(name)
+        if target is not None and read_text_file(target) != files[name]:
+            updating.append(name)
+    if updating:
+        notes.append("updating here: %s" % ", ".join(updating))
+    if pushing:
+        notes.append("pushing: %s" % ", ".join(pushing))
+
+    return files, notes
+
+
+def sync_local_target(name):
+    return BASE_DIR / name if name != SYNC_TOMBSTONE_NAME else None
+
+
+def sync_apply(files):
+    """Write the merged result to this machine and into the clone."""
+    for name, text in sorted(files.items()):
+        sync_write_text(SYNC_CLONE_DIR / name, text)
+        target = sync_local_target(name)
+        if target is not None:
+            write_atomic(target, text)
+
+
+def sync_save_base(files):
+    """Snapshot what we just agreed on, so the next run can spot a removal."""
+    try:
+        SYNC_BASE_DIR.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            sync_write_text(SYNC_BASE_DIR / name, text)
+    except OSError as error:
+        sys.stderr.write("Warning: could not save the sync snapshot: %s\n" % error)
+
+
+def sync_commit_and_push(message):
+    """Commit the clone and push. Returns True when the remote now has it."""
+    run_git(["add", "-A"], cwd=SYNC_CLONE_DIR)
+    rc, out, _ = run_git(
+        ["status", "--porcelain"], cwd=SYNC_CLONE_DIR, check=False
+    )
+    if rc == 0 and not trim(out):
+        print("Remote already matches; nothing to push.")
+        return True
+    run_git(["commit", "--quiet", "-m", message], cwd=SYNC_CLONE_DIR)
+    rc, out, err = run_git(
+        ["push", "--quiet", "origin", "HEAD:%s" % SYNC_BRANCH],
+        cwd=SYNC_CLONE_DIR,
+        check=False,
+    )
+    if rc == 0:
+        return True
+    sys.stderr.write("Warning: push rejected: %s\n" % (trim(err) or trim(out)))
+    return False
+
+
+def run_sync(dry_run=False, override=False):
+    try:
+        if override:
+            return sync_override()
+        for attempt in range(1, SYNC_PUSH_ATTEMPTS + 1):
+            files, notes = sync_plan()
+            print("")
+            if notes:
+                for note in notes:
+                    print("  %s" % note)
+            else:
+                print("  Everything is already in sync.")
+            print("")
+            if dry_run:
+                print("Dry run: nothing was written and nothing was pushed.")
+                return 0
+            sync_apply(files)
+            if sync_commit_and_push("Sync state from %s" % platform_label()):
+                sync_save_base(files)
+                print("State synced with %s." % SYNC_REMOTE)
+                return 0
+            if attempt < SYNC_PUSH_ATTEMPTS:
+                # The merge rules are commutative, so re-pulling and merging
+                # again is always safe -- that is what makes a retry correct
+                # rather than a way to clobber the other machine.
+                print("Re-pulling and merging again (attempt %s)..." % (attempt + 1))
+        sys.stderr.write(
+            "Warning: could not push after %s attempts; local state is merged "
+            "and the next sync will retry\n" % SYNC_PUSH_ATTEMPTS
+        )
+        return 0
+    except SyncError as error:
+        sys.stderr.write("Error: sync failed: %s\n" % error)
+        return 1
+
+
+def sync_override():
+    """Replace the remote wholesale with this machine's state.
+
+    Always previews first: this is the one path that can destroy the other
+    machine's state, so it shows exactly what would be lost and asks.
+    """
+    sync_prepare_clone()
+    local_channels = sync_parse_channels(CHANNELS_FILE) or []
+    remote_channels = sync_parse_channels(SYNC_CLONE_DIR / "channel-ids.txt") or []
+    # Tombstone whatever the override drops. Without this the override only
+    # cleans the remote: the other machine still has those handles locally, so
+    # its very next sync would union them straight back in and the override
+    # would quietly undo itself.
+    dropped = [h for h in remote_channels if h not in local_channels]
+    tombstones = dict.fromkeys(dropped, now_ms())
+    local_files = {
+        "checkpoint.txt": "%s\n" % sync_parse_checkpoint(CHECKPOINT_FILE),
+        "channel-ids.txt": "".join(h + "\n" for h in local_channels),
+        SYNC_TOMBSTONE_NAME: sync_format_tombstones(tombstones),
+        "channel-id-cache.txt": sync_format_cache(sync_parse_cache(CHANNEL_ID_CACHE_FILE)),
+        "downloaded-videos.json": json.dumps(
+            sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE), ensure_ascii=False, indent=2
+        ) + "\n",
+        "channel-check-status.json": json.dumps(
+            sync_parse_status(CHANNEL_STATUS_FILE), ensure_ascii=False, indent=2
+        ) + "\n",
+    }
+    local_url = read_json_file(URL_JSON_FILE)
+    if isinstance(local_url, dict):
+        local_files["current_url.json"] = json.dumps(
+            local_url, ensure_ascii=False, indent=2
+        ) + "\n"
+
+    print("")
+    print("OVERRIDE would replace the remote with this machine's state:")
+    print("")
+    changed = False
+    for name, text in sorted(local_files.items()):
+        if name == SYNC_TOMBSTONE_NAME:
+            continue  # reported in full below, as a removal rather than a diff
+        before = read_text_file(SYNC_CLONE_DIR / name)
+        if before == text:
+            continue
+        changed = True
+        print("  %s" % name)
+        for line in sync_diff_lines(before or "", text):
+            print("    %s" % line)
+    if dropped:
+        changed = True
+        print(
+            "  %s channel(s) would be marked removed so the other machine"
+            % len(dropped)
+        )
+        print("  drops them too: %s" % ", ".join(dropped))
+    if not changed:
+        print("  Nothing would change.")
+        return 0
+    print("")
+    if not sys.stdin.isatty():
+        sys.stderr.write(
+            "Error: --sync-override needs a terminal to confirm; refusing\n"
+        )
+        return 1
+    try:
+        answer = input("Replace the remote with the above? [y/N] ")
+    except EOFError:
+        answer = ""
+    if trim(answer).lower() not in ("y", "yes"):
+        print("Aborted; the remote was not touched.")
+        return 0
+
+    for name in local_files:
+        sync_write_text(SYNC_CLONE_DIR / name, local_files[name])
+    if sync_commit_and_push("Override state from %s" % platform_label()):
+        sync_save_base(local_files)
+        print("Remote replaced with this machine's state.")
+        return 0
+    sys.stderr.write("Error: override could not be pushed\n")
+    return 1
+
+
+def sync_diff_lines(before, after, limit=12):
+    """A tiny line diff -- enough to see what an override would destroy."""
+    old = before.splitlines()
+    new = after.splitlines()
+    old_set = set(old)
+    new_set = set(new)
+    lines = []
+    for line in old:
+        if line not in new_set:
+            lines.append("- %s" % line)
+    for line in new:
+        if line not in old_set:
+            lines.append("+ %s" % line)
+    if len(lines) > limit:
+        extra = len(lines) - limit
+        lines = lines[:limit] + ["... and %s more line(s)" % extra]
+    return lines or ["(reformatted only)"]
+
+
+def platform_label():
+    try:
+        return "%s (%s)" % (os.uname().nodename, sys.platform)
+    except AttributeError:
+        return os.environ.get("COMPUTERNAME", "windows")
 
 
 # ---------------------------------------------------------------------------
@@ -2928,6 +3635,18 @@ def main(argv):
 
     if opts.do_update:
         return run_update()
+
+    if opts.sync_mode is not None:
+        if opts.open_mode is not None:
+            sys.stderr.write(
+                "Error: --sync cannot be combined with -o, -O, or --html3\n"
+            )
+            return 1
+        TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        return run_sync(
+            dry_run=opts.sync_mode == "dry-run",
+            override=opts.sync_mode == "override",
+        )
 
     # A positional URL is persisted even when -t overrides what actually runs.
     if opts.url:

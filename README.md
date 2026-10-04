@@ -74,6 +74,9 @@ re-exporting.
 | `--html3` | Open an independent streaming page in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. |
 | `--html3-incognito` | **Requires `--html3`.** Open HTML3 in a Chrome/Chromium incognito window. `yy.ps1` reuses an existing Windows Chrome Incognito window; `yy.zsh` also accepts `/Applications/Google Chrome.app` or a Chromium binary on `PATH`. If none is found, fall back to the default browser with a warning. |
 | `-c` | With `-o`, `--html`, `--html2`, or `--html3`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
+| `--sync` | **Python build only.** Merge this machine's state with a private git repo, write the result back, push it, then exit |
+| `--sync-dry-run` | Show what `--sync` would change, writing and pushing nothing |
+| `--sync-override` | Replace the shared state with this machine's copy, after showing the difference and asking |
 | `-h`, `--help` | Print the usage summary and exit |
 
 Precedence: `-h`/`--help`, then `--py`, then `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
@@ -249,6 +252,44 @@ Differences from the shell build, as of now:
 
 `-U` in the Python build refreshes `yy.py` *and* the launcher beside it, since
 the build is two pieces.
+
+### Sharing state between machines
+
+`--sync` keeps two machines' state in step through a **separate private git
+repo** — not this one. It is Python-build only.
+
+```bash
+./yy.zsh --sync-dry-run   # show what would change, write and push nothing
+./yy.zsh --sync           # merge, write back, push
+```
+
+It syncs `checkpoint.txt`, `channel-ids.txt`, `channel-id-cache.txt`,
+`downloaded-videos.json`, `channel-check-status.json` and `current_url.json`.
+`html-video-cache.json` is skipped because it is a pure cache, and
+**`cookies.txt` is never synced** — it holds live session credentials.
+
+Point it at your own repo with `YY_SYNC_REMOTE`, and override the SSH key with
+`YY_SYNC_SSH_KEY` if it is not `~/.ssh/rikimberley_github_ed25519`. Git over
+SSH is the transport because a private repo cannot be read from the
+unauthenticated URL that `-U` uses.
+
+Every rule merges rather than overwrites, so neither machine can clobber the
+other: the checkpoint takes the newer timestamp, the download history unions
+and keeps the earliest copy of each entry, and the channel list unions. Because
+the rules are order-independent, a push that loses a race is simply re-pulled,
+re-merged and retried.
+
+Two cases need more than a union:
+
+- **Unsubscribing.** A plain union would re-add a removed channel from the
+  other machine forever, so a removal is recorded in `channel-ids-removed.txt`
+  and the handle stays gone until you deliberately add it back.
+- **Expiry.** The 45-day prune is re-applied *after* merging, so an entry this
+  machine has aged out cannot be resurrected by one that has not pruned yet.
+
+`--sync-override` replaces the shared state with this machine's copy. It always
+previews the difference and asks first, and it records the channels it drops so
+the other machine drops them too.
 
 ## Files
 
