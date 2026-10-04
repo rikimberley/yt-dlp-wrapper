@@ -121,7 +121,8 @@ def resolve_base_dir():
 
 BASE_DIR = resolve_base_dir()
 
-URL_FILE = BASE_DIR / "current_url.txt"
+URL_FILE = BASE_DIR / "current_url.txt"          # legacy, read-only fallback
+URL_JSON_FILE = BASE_DIR / "current_url.json"
 CHANNELS_FILE = BASE_DIR / "channel-ids.txt"
 CHANNEL_ID_CACHE_FILE = BASE_DIR / "channel-id-cache.txt"
 CHECKPOINT_FILE = BASE_DIR / "checkpoint.txt"
@@ -354,6 +355,88 @@ def write_atomic(path, text):
         except (OSError, NameError, UnboundLocalError):
             pass
         return False
+
+
+# --- backups ---------------------------------------------------------------
+
+def backup_to_tmp(path):
+    """Copy a file to .tmp/<name>.bak, keeping its name and extension.
+
+    Every backup this project takes lands in .tmp/ rather than beside the
+    original, so a saved copy is never mistaken for a live state file and the
+    git working tree stays clean. Missing sources are not an error -- there is
+    simply nothing to preserve.
+    """
+    source = Path(path)
+    if not source.exists():
+        return False
+    try:
+        TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            str(source), str(TEMPORARY_DIRECTORY / ("%s.bak" % source.name))
+        )
+        return True
+    except OSError as error:
+        sys.stderr.write(
+            "Warning: could not save a backup copy of %s: %s\n"
+            % (display_path(source), error)
+        )
+        return False
+
+
+# --- current_url.json ------------------------------------------------------
+
+def read_current_url():
+    """Return the persisted URL, preferring current_url.json.
+
+    The JSON file wins and current_url.txt is only a fallback, so a directory
+    that has already migrated never drops back to the stale text copy.
+    """
+    data = read_json_file(URL_JSON_FILE)
+    if isinstance(data, dict):
+        url = trim(data.get("url"))
+        if url:
+            warn_if_legacy_url_is_newer(data.get("update_ts"))
+            return url
+    return read_first_line(URL_FILE)
+
+
+def warn_if_legacy_url_is_newer(update_ts):
+    """Report a current_url.txt that is newer than the JSON's update_ts.
+
+    Only this build writes the JSON; yy.zsh and yy.ps1 still write the .txt.
+    So a newer .txt means the URL was last set from one of them and the JSON
+    value is about to be used instead. That is a deliberate consequence of
+    migrating one build at a time, but it must not be silent -- a wrong URL
+    would otherwise just download the wrong video with no explanation.
+    """
+    try:
+        stamp = int(update_ts)
+    except (TypeError, ValueError):
+        return
+    try:
+        legacy_ms = int(URL_FILE.stat().st_mtime * 1000)
+    except OSError:
+        return
+    if legacy_ms > stamp:
+        sys.stderr.write(
+            "Warning: %s is newer than %s; using the JSON value. The URL was "
+            "probably set from yy.zsh or yy.ps1, which still write only the "
+            ".txt file.\n" % (display_path(URL_FILE), display_path(URL_JSON_FILE))
+        )
+
+
+def write_current_url(url):
+    """Persist the URL as JSON, preserving the legacy .txt on first write.
+
+    current_url.txt is copied, not moved: yy.zsh and yy.ps1 have not migrated
+    and still read it, so removing it would break them outright.
+    """
+    if not URL_JSON_FILE.exists():
+        backup_to_tmp(URL_FILE)
+    return write_json_file(
+        URL_JSON_FILE, {"url": url, "update_ts": now_ms()}
+    )
 
 
 # --- channel-ids.txt -------------------------------------------------------
@@ -812,16 +895,7 @@ def update_self_file(name, sentinel):
             # Carry the execute bit across, or a refreshed yy.zsh stops being
             # runnable as ./yy.zsh.
             shutil.copymode(str(target), str(temp_path))
-            TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(
-                    str(target), str(TEMPORARY_DIRECTORY / ("%s.bak" % name))
-                )
-            except OSError as error:
-                sys.stderr.write(
-                    "Warning: could not save a backup copy of %s: %s\n"
-                    % (name, error)
-                )
+            backup_to_tmp(target)
         os.replace(str(temp_path), str(target))
     except OSError as error:
         sys.stderr.write("Warning: could not write %s: %s\n" % (name, error))
@@ -2702,7 +2776,7 @@ Usage:
   yy -h | --help
 
 Arguments:
-  <url>               Persist this URL to ./current_url.txt, then download it.
+  <url>               Persist this URL to ./current_url.json, then download it.
                       With no arguments, the stored URL is re-downloaded.
 
 Options:
@@ -2858,7 +2932,7 @@ def main(argv):
     # A positional URL is persisted even when -t overrides what actually runs.
     if opts.url:
         TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
-        write_text_file(URL_FILE, [opts.url])
+        write_current_url(opts.url)
 
     if opts.open_mode is not None:
         TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -2897,13 +2971,13 @@ def download(opts):
         if opts.url:
             run_url = opts.url
         else:
-            stored = read_first_line(URL_FILE)
+            stored = read_current_url()
             run_url = stored or None
 
     if not run_url:
         sys.stderr.write(
-            "Error: no URL provided, and %s does not exist or is empty\n"
-            % display_path(URL_FILE)
+            "Error: no URL provided, and neither %s nor %s has one\n"
+            % (display_path(URL_JSON_FILE), display_path(URL_FILE))
         )
         return 1
 
