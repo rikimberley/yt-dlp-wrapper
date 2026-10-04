@@ -126,7 +126,7 @@ of its stored latest-video time. Both refresh actions reload the status file
 first, so an external repair or backfill made while the server is running is not
 replaced by stale in-memory values. The status file is decoded as UTF-8,
 preserving non-ASCII channel handles on Windows PowerShell 5.1.
-`--html` serves the page at `http://127.0.0.1:8080/` and keeps
+`--html` serves the page at `http://127.0.0.1:8090/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
 loopback listener; the wrapper validates the structured selections and starts a
@@ -153,7 +153,7 @@ request counts as activity, not just the dedicated heartbeat, so browser
 background-tab timer throttling does not stop the server while status polling is
 still arriving. Time spent regenerating the page during a refresh does not count
 toward that timeout. Temporary status-request failures do not close the page.
-Port 8080 must be available. The callback never accepts arbitrary command text.
+Port 8090 must be available. The callback never accepts arbitrary command text.
 
 After a local hook completes successfully, the wrapper records its channel ID,
 video ID, y1/y2 target, and completion time in `downloaded-videos.json`. Existing
