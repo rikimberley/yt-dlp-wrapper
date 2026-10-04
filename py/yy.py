@@ -2771,8 +2771,31 @@ def run_html3(incognito):
     control = ServerControl()
     handler = build_html3_handler(token, state, jobs, control)
 
+    class QuietThreadingHTTPServer(ThreadingHTTPServer):
+        """Suppress the traceback for a client that simply went away.
+
+        The page polls status every second and heartbeats every two, so a
+        reload, a navigation or a closed tab routinely leaves a half-open
+        loopback connection. That reset surfaces inside
+        BaseHTTPRequestHandler.handle_one_request while it is still reading
+        the request line - before do_GET/do_POST run, so the try/except OSError
+        around wfile.write() cannot see it. socketserver then prints a full
+        traceback for what is entirely normal browser behaviour, which on
+        Windows reads alarmingly as ConnectionResetError [WinError 10054] and
+        buries the scan log it shares the console with.
+
+        Every connection-level error is a subclass of ConnectionError, so one
+        test covers reset, abort and broken pipe. Anything else still gets the
+        default traceback, so a real server bug stays visible.
+        """
+
+        def handle_error(self, request, client_address):
+            if isinstance(sys.exc_info()[1], ConnectionError):
+                return
+            super().handle_error(request, client_address)
+
     try:
-        server = ThreadingHTTPServer((HTML3_HOST, HTML3_PORT), handler)
+        server = QuietThreadingHTTPServer((HTML3_HOST, HTML3_PORT), handler)
     except OSError as error:
         sys.stderr.write(
             "Error: http://%s:%s is unavailable (%s)\n"

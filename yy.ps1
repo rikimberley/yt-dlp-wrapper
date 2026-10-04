@@ -2123,7 +2123,14 @@ function Invoke-HtmlCallbackServer {
         if ($Html3) { Open-Html3Url "http://127.0.0.1:$htmlListenPort/" -Incognito:$Html3Incognito }
         else { Open-Url "http://127.0.0.1:$htmlListenPort/" }
         Write-Host "Waiting for DOWNLOAD SELECTED on http://127.0.0.1:$htmlListenPort/ (Ctrl+C or STOP SERVER exits)"
+        # A browser that navigates away, reloads, or is closed resets the
+        # connection, so writing the response throws. That exception used to
+        # escape the accept loop into the finally below, which stopped the
+        # listener outright -- a page reload could abort a running download.
+        # Swallow only client-disconnect errors and resume accepting; anything
+        # else still propagates so real bugs stay visible.
         while ($listener.IsListening -and -not $script:htmlStopRequested) {
+          try {
             $pending = $listener.BeginGetContext($null, $null)
             try {
                 while (-not $pending.AsyncWaitHandle.WaitOne(1000)) {
@@ -2273,6 +2280,20 @@ function Invoke-HtmlCallbackServer {
                 Send-CallbackResponse $context 400 $_.Exception.Message
                 continue
             }
+          }
+          catch {
+              if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
+              $ex = $_.Exception
+              $clientGone = $false
+              while ($null -ne $ex) {
+                  if ($ex -is [System.Net.HttpListenerException] -or
+                      $ex -is [System.Net.Sockets.SocketException] -or
+                      $ex -is [System.IO.IOException] -or
+                      $ex -is [System.ObjectDisposedException]) { $clientGone = $true; break }
+                  $ex = $ex.InnerException
+              }
+              if (-not $clientGone) { throw }
+          }
         }
     }
     finally {
