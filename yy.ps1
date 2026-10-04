@@ -798,6 +798,43 @@ function ConvertTo-ProcessArgument {
     return '"' + (($Value -replace '(\\*)"', '$1$1\\"') -replace '(\\*)$', '$1$1') + '"'
 }
 
+# Read a child process's redirected stdout without manufacturing U+FFFD.
+#
+# yt-dlp's standalone build is frozen with PyInstaller, which pins the
+# interpreter to UTF-8 mode, so it writes UTF-8 on every platform. Reading with
+# -Encoding UTF8 is therefore right almost always - but when it is not, it is
+# lossy in the one way that matters: an invalid byte becomes U+FFFD, the
+# damaged title is cached in html-video-cache.json, and the page re-serves that
+# corruption as valid UTF-8 for the 45-day life of the record. Decoding
+# strictly first and falling back to the ANSI code page recovers the text
+# instead of destroying it.
+function Read-ChildOutputFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -eq 0) { return @() }
+        $strict = New-Object System.Text.UTF8Encoding($false, $true)
+        try { $text = $strict.GetString($bytes) }
+        catch {
+            # Not UTF-8; the local code page is the only other thing a child on
+            # this machine would plausibly have written.
+            $text = [System.Text.Encoding]::Default.GetString($bytes)
+        }
+        # Match Get-Content: a trailing newline does not yield a final empty
+        # element, but a genuine blank line in the middle is preserved.
+        $lines = [System.Collections.Generic.List[string]]($text -split "`r?`n")
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
+            $lines.RemoveAt($lines.Count - 1)
+        }
+        return @($lines)
+    }
+    catch {
+        [Console]::Error.WriteLine("Warning: could not read child output ${Path}: $($_.Exception.Message)")
+        return @()
+    }
+}
+
 # Run a logged-out yt-dlp metadata command. The default wall-clock deadline can
 # be disabled for callers that intentionally traverse a complete playlist.
 function Invoke-YtDlpMetadata {
@@ -856,7 +893,7 @@ function Invoke-YtDlpMetadata {
             }
         }
         $process.Refresh()
-        return @{ Output = @(Get-Content -LiteralPath $stdout -Encoding UTF8 -ErrorAction SilentlyContinue); ExitCode = $process.ExitCode }
+        return @{ Output = @(Read-ChildOutputFile -Path $stdout); ExitCode = $process.ExitCode }
     }
     finally {
         Remove-Item -LiteralPath $stdout,$stderr -Force -ErrorAction SilentlyContinue
@@ -1086,6 +1123,26 @@ function Read-HtmlVideoCache {
                 [void][long]::TryParse([string]$record.checked_ms, [ref]$checkedMs)
             }
             if ($checkedMs -gt 0 -and $checkedMs -lt $cutoffMs) { $changed = $true; continue }
+            # A real title never contains U+FFFD, so one here proves the row was
+            # decoded from the wrong code page. Clearing the full-scan stamp
+            # drops the channel out of the feed gate, which would otherwise
+            # reuse the damaged cards for the full 45 days; the forced rescan
+            # then overwrites each title.
+            if ($null -ne $record -and $null -ne $record.PSObject.Properties['entries']) {
+                foreach ($entry in @($record.entries)) {
+                    if ($null -eq $entry -or
+                        $null -eq $entry.PSObject.Properties['title']) { continue }
+                    if ([string]$entry.title -like "*$([char]0xFFFD)*") {
+                        # -Force so this works whether or not the property
+                        # already exists; a plain assignment throws on a
+                        # PSCustomObject that lacks it.
+                        $record | Add-Member -NotePropertyName 'last_full_scan_ms' `
+                            -NotePropertyValue 0 -Force
+                        $changed = $true
+                        break
+                    }
+                }
+            }
             $result[$property.Name] = $record
         }
         if ($changed) { Save-HtmlVideoCache $result }

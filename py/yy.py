@@ -16,7 +16,9 @@
 # already installed is most likely to satisfy it.
 # ---------------------------------------------------------------------------
 
+import codecs
 import json
+import locale
 import os
 import re
 import shlex
@@ -145,6 +147,10 @@ DEFAULT_OUTPUT_PATH = "./t"
 # Channel status and cache records untouched for this long are dropped, and
 # download history entries expire on the same schedule.
 STALE_CHANNEL_TTL_MS = 45 * 86400 * 1000
+# U+FFFD. A real title never contains one, so its presence in the cache is
+# proof the row was decoded from the wrong code page.
+REPLACEMENT_CHAR = "\ufffd"
+
 DOWNLOADED_VIDEO_TTL_SEC = 45 * 86400
 
 UC_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]+$")
@@ -590,6 +596,14 @@ def read_html_video_cache():
                 "feed_newest_ms": coerce_int(record.get("feed_newest_ms")),
                 "entries": entries,
             }
+            if any(REPLACEMENT_CHAR in entry["title"] for entry in entries):
+                # This row was decoded from the wrong code page and is already
+                # mojibaked. Clearing the full-scan stamp drops the channel out
+                # of the feed gate, which would otherwise reuse the damaged
+                # cards for the full 45 days; the forced rescan then overwrites
+                # each title, since a scanned row always beats its cached
+                # counterpart.
+                cache[channel]["last_full_scan_ms"] = 0
     cutoff_ms = now_ms() - STALE_CHANNEL_TTL_MS
     kept = {
         channel: record
@@ -711,6 +725,43 @@ def ytdlp_path():
     return None
 
 
+def decode_child_output(raw):
+    """Decode a child process's captured stdout without manufacturing U+FFFD.
+
+    yt-dlp's standalone build is frozen with PyInstaller, which pins the
+    interpreter to UTF-8 mode, so it writes UTF-8 on every platform and
+    ignores PYTHONIOENCODING entirely - that is why forcing that variable is
+    not a fix here. UTF-8 is therefore tried first and is the normal case.
+
+    The old code decoded with errors="replace" and nothing else, which is
+    lossy in the one way that matters: any byte that is not valid UTF-8 is
+    burned down to U+FFFD, the damaged title is written to
+    html-video-cache.json, and the page then re-serves that corruption as
+    perfectly valid UTF-8 for the 45-day life of the record. Decoding with the
+    local ANSI code page instead recovers the text, so a child that does emit
+    legacy bytes round-trips rather than being destroyed. Replacement
+    characters remain only as a last resort, so a genuinely undecodable byte
+    still cannot abort a scan.
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    fallback = locale.getpreferredencoding(False)
+    try:
+        is_utf8 = bool(fallback) and codecs.lookup(fallback).name == "utf-8"
+    except LookupError:
+        is_utf8 = True
+    if not is_utf8:
+        try:
+            return raw.decode(fallback)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return raw.decode("utf-8", "replace")
+
+
 def run_ytdlp_metadata(args, deadline_sec=YTDLP_DEADLINE_SEC, progress_label=None):
     """Run yt-dlp and capture stdout.
 
@@ -736,7 +787,7 @@ def run_ytdlp_metadata(args, deadline_sec=YTDLP_DEADLINE_SEC, progress_label=Non
     except OSError as error:
         sys.stderr.write("Warning: could not run yt-dlp (%s)\n" % error)
         return 1, ""
-    out = completed.stdout.decode("utf-8", "replace") if completed.stdout else ""
+    out = decode_child_output(completed.stdout)
     return completed.returncode, out
 
 
