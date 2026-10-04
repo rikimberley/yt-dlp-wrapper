@@ -76,6 +76,7 @@ re-exporting.
 | `--sync` | **Python build only.** Merge this machine's state with a private git repo, write the result back, push it, then exit |
 | `--sync-dry-run` | Show what `--sync` would change, writing and pushing nothing |
 | `--sync-override` | Replace the shared state with this machine's copy, after showing the difference and asking |
+| `--sync-override-local` | The mirror image: replace **this machine's** state with the shared copy, after showing the difference and asking. Fetches read-only — nothing is committed or pushed |
 | `-h`, `--help` | Print the usage summary and exit |
 
 Precedence: `-h`/`--help`, then `--py`, then `-U`, then `-o`/`-O`/`--html`, then `-c`, then download. `-o`,
@@ -245,8 +246,8 @@ cannot overwrite a working wrapper.
 
 Differences from the shell build, as of now:
 
-- `--sync`, `--sync-dry-run`, `--sync-override` and `--merge-download-action`
-  are Python-build only.
+- `--sync`, `--sync-dry-run`, `--sync-override`, `--sync-override-local` and
+  `--merge-download-action` are Python-build only.
 - Everything else — downloads, `-o`/`-O`/`-c`, `-U`, the state files — behaves
   the same and shares the same files on disk, so you can switch back and forth
   without losing checkpoints, caches or history.
@@ -293,9 +294,28 @@ Two cases need more than a union:
 - **Expiry.** The 45-day prune is re-applied *after* merging, so an entry this
   machine has aged out cannot be resurrected by one that has not pruned yet.
 
-`--sync-override` replaces the shared state with this machine's copy. It always
-previews the difference and asks first, and it records the channels it drops so
-the other machine drops them too.
+### Overriding
+
+`--sync` is a *union*, so by design it can never remove anything. The two
+override modes are the escape hatches, and they are mirror images:
+
+| | Destroys | Touches the remote? |
+|---|---|---|
+| `--sync-override` | the **other** machine's state | yes — commits and pushes |
+| `--sync-override-local` | **this** machine's state | no — fetches read-only |
+
+Both preview the exact difference and ask before doing anything.
+
+`--sync-override` also records the channels it drops, so the other machine
+drops them too — without that it would quietly undo itself on the next sync.
+
+`--sync-override-local` is the one to reach for when this machine's state is
+the wrong one. Note that reverting a bad commit in the state repo is *not*
+enough on its own: the local copy still holds those records, and the next
+`--sync` unions them straight back. Adopting the remote wholesale is the only
+way to actually drop them. It writes the same canonical, expiry-pruned form
+`--sync` computes, so the following sync reports "Everything is already in
+sync" rather than pushing a reformatting commit.
 
 ## Files
 

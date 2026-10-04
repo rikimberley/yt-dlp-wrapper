@@ -3095,7 +3095,7 @@ yy.py - convenience wrapper around ./yt-dlp
 Usage:
   yy [<url>] [-t <temp_url>] [-p <path>] [-U] [--no-py]
      [-o | -O | --html] [--incognito] [--merge-download-action] [-c]
-  yy --sync | --sync-dry-run | --sync-override
+  yy --sync | --sync-dry-run | --sync-override | --sync-override-local
   yy -h | --help
 
 Arguments:
@@ -3151,6 +3151,12 @@ Options:
                       nothing.
   --sync-override     Replace the shared state with this machine's copy.
                       Always previews the difference and asks first.
+  --sync-override-local
+                      The mirror image: replace this machine's state with the
+                      shared copy. Fetches read-only -- nothing is committed
+                      and nothing is pushed. Use it to drop local-only
+                      records, which a union --sync can never remove. Always
+                      previews the difference and asks first.
   -h, --help          Show this help and exit.
 
 -o, -O and --html are mutually exclusive, and so are the --sync modes.
@@ -3170,6 +3176,7 @@ Examples:
   yy --html --merge-download-action
   yy --sync
   yy --sync-dry-run
+  yy --sync-override-local
 """
 
 
@@ -3239,6 +3246,8 @@ def parse_args(argv):
             set_sync_mode(opts, "dry-run")
         elif arg == "--sync-override":
             set_sync_mode(opts, "override")
+        elif arg == "--sync-override-local":
+            set_sync_mode(opts, "override-local")
         elif arg == "-c":
             opts.set_checkpoint = True
         elif arg.startswith("-") and arg != "-":
@@ -3264,7 +3273,8 @@ def set_open_mode(opts, mode):
 def set_sync_mode(opts, mode):
     if opts.sync_mode is not None and opts.sync_mode != mode:
         raise UsageError(
-            "--sync, --sync-dry-run, and --sync-override cannot be combined"
+            "--sync, --sync-dry-run, --sync-override, and "
+            "--sync-override-local cannot be combined"
         )
     opts.sync_mode = mode
 
@@ -3832,8 +3842,10 @@ def sync_commit_and_push(message):
     return False
 
 
-def run_sync(dry_run=False, override=False):
+def run_sync(dry_run=False, override=False, override_local=False):
     try:
+        if override_local:
+            return sync_override_local()
         if override:
             return sync_override()
         for attempt in range(1, SYNC_PUSH_ATTEMPTS + 1):
@@ -3947,6 +3959,163 @@ def sync_override():
     return 1
 
 
+def sync_override_local():
+    """Replace this machine's state wholesale with the remote's.
+
+    The mirror image of --sync-override, and the reason it has to exist: an
+    ordinary --sync is a *union*, so it can never remove anything. Undoing a
+    bad local state by reverting the remote commit does not work -- the next
+    --sync just unions the local copy straight back in. Adopting the remote
+    wholesale is the only way to actually drop local-only records.
+
+    The remote is opened read-only: nothing is committed and nothing is
+    pushed. That is what makes this safe to run on a machine whose own state
+    is known to be wrong, and it is the key difference from --sync-override,
+    which destroys the *other* machine's state instead of this one's.
+    """
+    had_commits = sync_prepare_clone()
+    if not had_commits:
+        sys.stderr.write(
+            "Error: remote branch %s is empty; there is nothing to adopt\n"
+            % SYNC_BRANCH
+        )
+        return 1
+
+    # Round-trip through the same merge rules --sync uses, with the remote on
+    # both sides. They are idempotent, so self-merging is a no-op on content
+    # while still applying the canonical ordering and the 45-day expiry. That
+    # matters: writing the parsed-but-unsorted remote instead left the local
+    # files in a different order from what --sync computes, so the very next
+    # sync saw a diff and pushed a pointless commit.
+    remote_cp = sync_parse_checkpoint(sync_clone_path("checkpoint.txt"))
+    remote_ch = sync_parse_channels(sync_clone_path("channel-ids.txt")) or []
+    remote_cache = sync_merge_cache(
+        {}, sync_parse_cache(sync_clone_path("channel-id-cache.txt"))
+    )
+    remote_dl, _ = sync_merge_downloaded(
+        [], sync_parse_downloaded(sync_clone_path("downloaded-videos.json"))
+    )
+    remote_st = sync_merge_status(
+        {}, sync_parse_status(sync_clone_path("channel-check-status.json"))
+    )
+    remote_files = {
+        "checkpoint.txt": "%s\n" % remote_cp,
+        "channel-ids.txt": "".join(handle + "\n" for handle in remote_ch),
+        SYNC_TOMBSTONE_NAME: sync_format_tombstones(
+            sync_parse_tombstones(sync_clone_path(SYNC_TOMBSTONE_NAME))
+        ),
+        "channel-id-cache.txt": sync_format_cache(remote_cache),
+        "downloaded-videos.json": sync_dump_json(remote_dl),
+        "channel-check-status.json": sync_dump_json(remote_st),
+    }
+    remote_url = read_json_file(sync_clone_path("current_url.json"))
+    if isinstance(remote_url, dict):
+        remote_files["current_url.json"] = sync_dump_json(remote_url)
+
+    local_cp = sync_parse_checkpoint(CHECKPOINT_FILE)
+    local_ch = sync_parse_channels(CHANNELS_FILE) or []
+    local_dl = sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE)
+    local_st = sync_parse_status(CHANNEL_STATUS_FILE)
+    local_cache = sync_parse_cache(CHANNEL_ID_CACHE_FILE)
+
+    # Per-file detail. A raw line diff of a 600-record JSON is accurate and
+    # completely unreadable, so the JSON files get a structured summary
+    # instead; "what exactly do I lose" is the only question this prompt has
+    # to answer.
+    details = {}
+    if local_cp != remote_cp:
+        details["checkpoint.txt"] = [
+            "%s -> %s (remote is %s)"
+            % (local_cp, remote_cp, "older" if remote_cp < local_cp else "newer")
+        ]
+    local_keys = {downloaded_key(r) for r in local_dl}
+    remote_keys = {downloaded_key(r) for r in remote_dl}
+    lost_dl = sorted(local_keys - remote_keys)
+    gained_dl = sorted(remote_keys - local_keys)
+    if lost_dl or gained_dl:
+        lines = [
+            "%s -> %s record(s): losing %s, gaining %s"
+            % (len(local_dl), len(remote_dl), len(lost_dl), len(gained_dl))
+        ]
+        lines.extend(sync_sample_lines("losing", [k[1] for k in lost_dl]))
+        lines.extend(sync_sample_lines("gaining", [k[1] for k in gained_dl]))
+        details["downloaded-videos.json"] = lines
+    lost_st = sorted(set(local_st) - set(remote_st))
+    gained_st = sorted(set(remote_st) - set(local_st))
+    changed_st = sorted(
+        k for k in set(local_st) & set(remote_st) if local_st[k] != remote_st[k]
+    )
+    if lost_st or gained_st or changed_st:
+        lines = ["%s -> %s channel(s)" % (len(local_st), len(remote_st))]
+        lines.extend(sync_sample_lines("losing", lost_st))
+        lines.extend(sync_sample_lines("gaining", gained_st))
+        lines.extend(sync_sample_lines("re-dated", changed_st))
+        details["channel-check-status.json"] = lines
+
+    print("")
+    print("OVERRIDE LOCAL would replace this machine's state with the remote:")
+    print("")
+    changed = False
+    for name, text in sorted(remote_files.items()):
+        target = sync_local_target(name)
+        if target is None:
+            continue  # clone-only bookkeeping, nothing to overwrite here
+        before = read_text_file(target)
+        if before == text:
+            continue
+        changed = True
+        print("  %s" % name)
+        lines = details.get(name)
+        if lines is None:
+            lines = sync_diff_lines(before or "", text) or [
+                "reordered only; no content change"
+            ]
+        for line in lines:
+            print("    %s" % line)
+    if not changed:
+        print("  Nothing would change.")
+        return 0
+    print("")
+    print("  The remote is not modified: nothing is committed and nothing is pushed.")
+    print("")
+    if not sys.stdin.isatty():
+        # Block-buffered stdout would otherwise put this error above the
+        # preview it refers to.
+        sys.stdout.flush()
+        sys.stderr.write(
+            "Error: --sync-override-local needs a terminal to confirm; refusing\n"
+        )
+        return 1
+    try:
+        answer = input("Replace this machine's state with the above? [y/N] ")
+    except EOFError:
+        answer = ""
+    if trim(answer).lower() not in ("y", "yes"):
+        print("Aborted; local state was not touched.")
+        return 0
+
+    for name, text in remote_files.items():
+        target = sync_local_target(name)
+        if target is not None:
+            write_atomic(target, text)
+    # Without this the next --sync compares against a stale base, reads the
+    # adopted removals as "this machine deleted them", and tombstones handles
+    # the remote still wants.
+    sync_save_base(remote_files)
+    print("Local state replaced with the remote's.")
+    return 0
+
+
+def sync_sample_lines(label, items, limit=6):
+    """`losing 51: a, b, c ... and 45 more` -- a bounded, readable sample."""
+    if not items:
+        return []
+    shown = ", ".join(items[:limit])
+    if len(items) > limit:
+        shown += " ... and %s more" % (len(items) - limit)
+    return ["%s %s: %s" % (label, len(items), shown)]
+
+
 def sync_diff_lines(before, after, limit=12):
     """A tiny line diff -- enough to see what an override would destroy."""
     old = before.splitlines()
@@ -4022,6 +4191,7 @@ def main(argv):
         return run_sync(
             dry_run=opts.sync_mode == "dry-run",
             override=opts.sync_mode == "override",
+            override_local=opts.sync_mode == "override-local",
         )
 
     # A positional URL is persisted even when -t overrides what actually runs.
