@@ -70,6 +70,16 @@ UC*/
 AGENTS.md
 
 # ---------------------------------------------------------------------------
+# Agent tooling artifacts. Written by the corporate-managed Claude plugins on
+# the maintainer's machine, not by anything in this repo — a capture-session
+# hook logs here when it decides whether to upload a session. It declines for
+# this repo because the active GitHub login is personal, but the directory is
+# LinkedIn tooling state either way and must never reach a public personal
+# repo.
+# ---------------------------------------------------------------------------
+.claude/
+
+# ---------------------------------------------------------------------------
 # OS / editor noise
 # ---------------------------------------------------------------------------
 .DS_Store
