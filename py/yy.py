@@ -3608,10 +3608,15 @@ def sync_diff_lines(before, after, limit=12):
 
 
 def platform_label():
-    try:
-        return "%s (%s)" % (os.uname().nodename, sys.platform)
-    except AttributeError:
-        return os.environ.get("COMPUTERNAME", "windows")
+    """A coarse OS name for the commit message -- deliberately not the
+    hostname. This machine is corporate-managed and its hostname is internal
+    infrastructure detail, which must not be written into a GitHub repo even a
+    private one. The label only needs to say which side pushed."""
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return sys.platform
 
 
 # ---------------------------------------------------------------------------
