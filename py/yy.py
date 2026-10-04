@@ -212,6 +212,14 @@ SCRIPT_RAW_BASE = (
     "https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master/py"
 )
 
+# --no-py pulls from the repository *root*, not py/. The two builds live side
+# by side under the same names: master/py/yy.zsh is the launcher, master/yy.zsh
+# is the shell build. Using SCRIPT_RAW_BASE here would quietly re-fetch the
+# launchers and report success while changing nothing.
+SHELL_BUILD_RAW_BASE = (
+    "https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master"
+)
+
 
 # ---------------------------------------------------------------------------
 # Text file helpers
@@ -970,26 +978,24 @@ UPDATE_SENTINELS = (
     ("yy.ps1", "#!/usr/bin/env pwsh"),
 )
 
+# --no-py replaces exactly the two shell wrappers; yy.py is deliberately not in
+# this list, because the point is to stop using it, not to refresh it.
+NO_PY_TARGETS = tuple(
+    (name, sentinel) for name, sentinel in UPDATE_SENTINELS if name != "yy.py"
+)
 
-def update_self_file(name, sentinel):
-    """Refresh one file beside this script. Returns True when it is current."""
-    url = "%s/%s" % (SCRIPT_RAW_BASE, name)
-    body = fetch_url(url, "%s from master" % name, send_consent=False)
-    if body is None:
-        sys.stderr.write("Warning: could not refresh %s from master\n" % name)
-        return False
-    if not body.startswith(sentinel):
-        sys.stderr.write(
-            "Warning: refusing to overwrite %s: fetched body does not start "
-            "with %s\n" % (name, sentinel)
-        )
-        return False
+# Present in both launcher headers and in neither shell build. Keep the two
+# py/ headers carrying this exact phrase.
+LAUNCHER_MARKER = "Thin launcher for yy.py"
 
+
+def write_self_file(name, body):
+    """Atomically replace one file beside this script. Returns True on success.
+
+    Shared by -U and --no-py so there is exactly one implementation of the
+    staging rules below.
+    """
     target = SCRIPT_DIR / name
-    if read_text_file(target) == body:
-        print("%s is already up to date" % name)
-        return True
-
     # Stage in the *same directory* as the target: os.replace is only atomic
     # within one filesystem, and an interrupted write must never be able to
     # truncate the file that is running.
@@ -1002,6 +1008,14 @@ def update_self_file(name, sentinel):
             # runnable as ./yy.zsh.
             shutil.copymode(str(target), str(temp_path))
             backup_to_tmp(target)
+        elif name.endswith(".zsh"):
+            # --no-py can create a yy.zsh where none existed, and a fresh file
+            # is not executable. -U never reaches this branch; it skips files
+            # that are absent.
+            try:
+                os.chmod(str(temp_path), 0o755)
+            except OSError:
+                pass
         os.replace(str(temp_path), str(target))
     except OSError as error:
         sys.stderr.write("Warning: could not write %s: %s\n" % (name, error))
@@ -1010,9 +1024,95 @@ def update_self_file(name, sentinel):
         except OSError:
             pass
         return False
+    return True
+
+
+def fetch_self_file(name, sentinel, base=None):
+    """Fetch one wrapper from master and check its sentinel. None on failure."""
+    url = "%s/%s" % (base or SCRIPT_RAW_BASE, name)
+    body = fetch_url(url, "%s from master" % name, send_consent=False)
+    if body is None:
+        sys.stderr.write("Warning: could not refresh %s from master\n" % name)
+        return None
+    if not body.startswith(sentinel):
+        sys.stderr.write(
+            "Warning: refusing to overwrite %s: fetched body does not start "
+            "with %s\n" % (name, sentinel)
+        )
+        return None
+    return body
+
+
+def update_self_file(name, sentinel):
+    """Refresh one file beside this script. Returns True when it is current."""
+    body = fetch_self_file(name, sentinel)
+    if body is None:
+        return False
+
+    if read_text_file(SCRIPT_DIR / name) == body:
+        print("%s is already up to date" % name)
+        return True
+
+    if not write_self_file(name, body):
+        return False
 
     print("Updated %s from master (previous copy saved in .tmp)" % name)
     return True
+
+
+def run_no_py():
+    """--no-py: replace both launchers with the shell build from master.
+
+    This used to live in the launchers themselves, where it was more than half
+    of each file and was implemented twice -- two independent copies of the
+    fetch, sentinel check and atomic write. It is handled here instead so the
+    launchers are nothing but interpreter discovery plus a handoff.
+
+    Both wrappers are replaced, not just the one that was invoked: a shell-build
+    yy.zsh sitting next to a yy.ps1 launcher is two different builds sharing one
+    state directory, and whichever wrapper the next run picks would decide which
+    build it got.
+
+    Every payload is fetched and validated before anything is written, so a
+    failure mid-way cannot leave the directory holding one wrapper from each
+    build. The launchers could not do this -- each knew only about itself.
+    """
+    bodies = {}
+    for name, sentinel in NO_PY_TARGETS:
+        body = fetch_self_file(name, sentinel, base=SHELL_BUILD_RAW_BASE)
+        if body is not None and LAUNCHER_MARKER in body:
+            # The shebang sentinel cannot tell the two builds apart -- they
+            # share it -- so a wrong base URL would fetch the launcher, pass
+            # validation, and report success having changed nothing. This is
+            # the check that catches it.
+            sys.stderr.write(
+                "Warning: refusing to overwrite %s: fetched body is a launcher, "
+                "not the shell build\n" % name
+            )
+            body = None
+        if body is None:
+            sys.stderr.write(
+                "Error: --no-py aborted; nothing was written. The directory is "
+                "still the Python build.\n"
+            )
+            return 1
+        bodies[name] = body
+
+    ok = True
+    for name, _ in NO_PY_TARGETS:
+        if not write_self_file(name, bodies[name]):
+            ok = False
+    if not ok:
+        sys.stderr.write(
+            "Error: --no-py wrote only part of the shell build. Re-run it; what "
+            "already landed is kept.\n"
+        )
+        return 1
+
+    print("Switched to the shell build. Previous copies are in .tmp.")
+    if SCRIPT_PATH.exists():
+        print("yy.py is left in place but unused; the shell build never reads it.")
+    return 0
 
 
 def run_update():
@@ -3012,6 +3112,7 @@ class Options:
         self.output_path = DEFAULT_OUTPUT_PATH
         self.output_path_passed = False
         self.do_update = False
+        self.do_no_py = False
         self.open_mode = None
         self.html3_incognito = False
         self.set_checkpoint = False
@@ -3039,6 +3140,8 @@ def parse_args(argv):
             opts.output_path_passed = True
         elif arg == "-U":
             opts.do_update = True
+        elif arg == "--no-py":
+            opts.do_no_py = True
         elif arg == "-o":
             set_open_mode(opts, "check")
         elif arg == "-O":
@@ -3789,6 +3892,11 @@ def main(argv):
     if opts.html3_incognito and opts.open_mode != "html3":
         sys.stderr.write("Error: --html3-incognito requires --html3\n")
         return 1
+
+    # Ahead of -U deliberately: `yy -U --no-py` means "leave the Python build",
+    # and refreshing yy.py on the way out would be wasted work.
+    if opts.do_no_py:
+        return run_no_py()
 
     if opts.do_update:
         return run_update()
