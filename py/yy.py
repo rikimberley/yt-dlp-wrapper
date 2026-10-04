@@ -4067,9 +4067,8 @@ def sync_override_local():
         print("  %s" % name)
         lines = details.get(name)
         if lines is None:
-            lines = sync_diff_lines(before or "", text) or [
-                "reordered only; no content change"
-            ]
+            # sync_diff_lines supplies its own "(reformatted only)" fallback.
+            lines = sync_diff_lines(before or "", text)
         for line in lines:
             print("    %s" % line)
     if not changed:
