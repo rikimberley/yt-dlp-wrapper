@@ -42,15 +42,20 @@ channel-ids.txt
 
 # ---------------------------------------------------------------------------
 # Disposable runtime files: self-update staging and backups, generated pages,
-# HTML3 worker state/fragments, subprocess captures, and atomic-write files.
+# HTML worker state/fragments, subprocess captures, and atomic-write files.
+#
+# .tmp/ already covers all of these; the explicit names below are the belt to
+# its braces, for the case where a build writes one into the repository root
+# instead. The yy-html* globs deliberately also match the old yy-html3* names,
+# so a deployment that has not yet self-updated cannot leak one.
 # ---------------------------------------------------------------------------
 .tmp/
 *.new.*
 *.bak
 yy.html
-yy-html3.html
-yy-html3-*.json
-yy-html3-*/
+yy-html*.html
+yy-html*-*.json
+yy-html*/
 yt-dlp.*.stdout
 yt-dlp.*.stderr
 

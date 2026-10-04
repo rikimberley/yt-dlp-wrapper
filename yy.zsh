@@ -14,10 +14,10 @@
 #   (exits 1 if any channel could not be checked)
 # - uses -O to open every channel in ./channel-ids.txt unconditionally, and
 #   skip any download
-# - uses --html3 to generate a local 6-column video grid with y1/y2
+# - uses --html to generate a local 6-column video grid with y1/y2
 #   selections, opening an independent loading shell immediately and
 #   streaming channel fragments from a worker
-# - uses --incognito with --html3 to open that shell in a Chrome
+# - uses --incognito with --html to open that shell in a Chrome
 #   Incognito window
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
@@ -32,8 +32,8 @@
 #   ./yy.zsh -U
 #   ./yy.zsh -o
 #   ./yy.zsh -O
-#   ./yy.zsh --html3
-#   ./yy.zsh --html3 --incognito
+#   ./yy.zsh --html
+#   ./yy.zsh --html --incognito
 #   ./yy.zsh -c
 #   ./yy.zsh --help
 #   ./yy.zsh -o -c
@@ -69,7 +69,7 @@ cookies_file="./cookies.txt"
 channel_status_file="./channel-check-status.json"
 downloaded_videos_file="./downloaded-videos.json"
 html_video_cache_file="./html-video-cache.json"
-html3_file="$temporary_directory/yy-html3.html"
+html_file="$temporary_directory/yy-html.html"
 user_agent="Mozilla/5.0"
 accept_language="en-US,en;q=0.9"
 # Pre-accepted consent cookies: without them YouTube can answer a channel page
@@ -107,8 +107,8 @@ open_mode=""
 # zsh does not expand $'\t' inside an array subscript; use this when building keys.
 tab_char=$'\t'
 incognito=0
-html3_worker_token=""
-html3_worker_refresh_all=0
+html_worker_token=""
+html_worker_refresh_all=0
 set_checkpoint=0
 html_failure_count=0
 show_help=0
@@ -119,7 +119,7 @@ yy.zsh - convenience wrapper around ./yt-dlp
 
 Usage:
   ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
-           [-o | -O | --html3] [--incognito] [-c]
+           [-o | -O | --html] [--incognito] [-c]
   ./yy.zsh -h | --help
 
 Arguments:
@@ -146,14 +146,14 @@ Options:
                       downloading. Exits non-zero if a channel check failed.
   -O                  Open every channel in ./channel-ids.txt unconditionally,
                       then exit without downloading.
-  --html3             Generate a local 6-column video grid with y1/y2
+  --html             Generate a local 6-column video grid with y1/y2
                       selections and serve it on http://127.0.0.1:8090,
                       opening a loading shell immediately and streaming one
                       fragment per channel from a background worker. Scanning
                       is incremental: a persistent cache means later runs scan
                       only a one-day overlap per channel. Already-downloaded
                       video cards are dropped.
-  --incognito         With --html3, open the page in a Chrome/Chromium
+  --incognito         With --html, open the page in a Chrome/Chromium
                       incognito window instead of the default browser.
   -c                  Overwrite ./checkpoint.txt with the current epoch-ms
                       timestamp, then exit without downloading. Runs after
@@ -161,8 +161,8 @@ Options:
                       everything as seen".
   -h, --help          Show this help and exit.
 
--o, -O and --html3 are mutually exclusive.
-Flag precedence: -h, then --py, then -U, then -o/-O/--html3, then -c, then
+-o, -O and --html are mutually exclusive.
+Flag precedence: -h, then --py, then -U, then -o/-O/--html, then -c, then
 download.
 
 Examples:
@@ -171,8 +171,8 @@ Examples:
   ./yy.zsh -p ./my-videos -t 'https://example.com/one-off'
   ./yy.zsh -U
   ./yy.zsh -o -c
-  ./yy.zsh --html3
-  ./yy.zsh --html3 --incognito
+  ./yy.zsh --html
+  ./yy.zsh --html --incognito
 USAGE
 }
 
@@ -206,35 +206,35 @@ while (( $# > 0 )); do
       ;;
     -o|-O)
       if [[ -n "$open_mode" ]]; then
-        printf 'Error: -o, -O and --html3 cannot be combined\n' >&2
+        printf 'Error: -o, -O and --html cannot be combined\n' >&2
         exit 1
       fi
       if [[ "$1" == "-o" ]]; then open_mode="check"; else open_mode="open"; fi
       ;;
-    --html3)
+    --html)
       if [[ -n "$open_mode" ]]; then
-        printf 'Error: -o, -O and --html3 cannot be combined\n' >&2
+        printf 'Error: -o, -O and --html cannot be combined\n' >&2
         exit 1
       fi
-      open_mode="html3"
+      open_mode="html"
       ;;
     --incognito)
       incognito=1
       ;;
-    --html3-worker)
+    --html-worker)
       shift
       if (( $# == 0 )) || [[ -z "${1// /}" ]]; then
-        printf 'Error: --html3-worker requires a token argument\n' >&2
+        printf 'Error: --html-worker requires a token argument\n' >&2
         exit 1
       fi
       if [[ -n "$open_mode" ]]; then
-        printf 'Error: -o, -O and --html3 cannot be combined\n' >&2
+        printf 'Error: -o, -O and --html cannot be combined\n' >&2
         exit 1
       fi
-      open_mode="html3-worker"
-      html3_worker_token=$1
+      open_mode="html-worker"
+      html_worker_token=$1
       if (( $# > 1 )) && [[ "$2" == "--refresh-all" ]]; then
-        html3_worker_refresh_all=1
+        html_worker_refresh_all=1
         shift
       fi
       ;;
@@ -261,8 +261,8 @@ if (( show_help )); then
   exit 0
 fi
 
-if (( incognito )) && [[ "$open_mode" != "html3" ]]; then
-  printf 'Error: --incognito requires --html3\n' >&2
+if (( incognito )) && [[ "$open_mode" != "html" ]]; then
+  printf 'Error: --incognito requires --html\n' >&2
   exit 1
 fi
 
@@ -287,13 +287,13 @@ open_url() {
   fi
 }
 
-# Open the --html3 shell, in a Chrome Incognito window when asked.
+# Open the --html shell, in a Chrome Incognito window when asked.
 #
 # yy.ps1 restricts Incognito to Windows because that is the only platform it
 # knows how to locate chrome.exe on; here the equivalent lookup is the macOS
 # app bundle or a Chrome/Chromium binary on PATH. Anything unfound degrades to
 # the default browser with a warning rather than failing the run.
-open_html3_url() {
+open_html_url() {
   local target_url=$1 incognito=$2
   local chrome_app="/Applications/Google Chrome.app"
   local candidate
@@ -316,7 +316,7 @@ open_html3_url() {
     fi
   done
 
-  printf 'Warning: Google Chrome was not found; opening HTML3 in the default browser.\n' >&2
+  printf 'Warning: Google Chrome was not found; opening HTML in the default browser.\n' >&2
   open_url "$target_url"
 }
 
@@ -478,7 +478,7 @@ format_relative_ms() {
 # ---------------------------------------------------------------------------
 # JSON
 #
-# yy.ps1 persists its channel status, download history and --html3 scan cache
+# yy.ps1 persists its channel status, download history and --html scan cache
 # as JSON, so this port reads and writes the same shapes. zsh has no JSON
 # support, and a per-character parser written in zsh is far too slow for a
 # cache holding thousands of video entries, so the read path goes through awk
@@ -1440,7 +1440,7 @@ feed_newest_ms() {
   print -r -- "$newest ok"
 }
 
-# Fetch the Atom feeds for cached --html3 channels concurrently. A result is
+# Fetch the Atom feeds for cached --html channels concurrently. A result is
 # recorded only for a usable feed with at least one parseable <published>
 # value; anything else is deliberately absent so the caller falls back to the
 # cookie-backed yt-dlp scan.
@@ -1647,7 +1647,7 @@ run_open_mode() {
 }
 
 # ---------------------------------------------------------------------------
-# --html3 page generation
+# --html page generation
 # ---------------------------------------------------------------------------
 
 # Scan one channel in an isolated subshell. Each worker owns one channel and
@@ -1669,24 +1669,24 @@ html_scan_channel() {
 
 
 # ---------------------------------------------------------------------------
-# --html3
+# --html
 #
-# --html3 has its own shell, state document, and channel fragments: the
+# --html has its own shell, state document, and channel fragments: the
 # parent writes a loading page immediately, then a worker process
-# (`yy.zsh --html3-worker <token>`) performs the scan and streams one HTML
+# (`yy.zsh --html-worker <token>`) performs the scan and streams one HTML
 # fragment per channel back through the callback server.
 # ---------------------------------------------------------------------------
 
-typeset -ga html3_failed_channels html3_progress_updates
-typeset -g html3_fragment_text=""
-typeset -g html3_progress_completed=0 html3_progress_total=0
+typeset -ga html_failed_channels html_progress_updates
+typeset -g html_fragment_text=""
+typeset -g html_progress_completed=0 html_progress_total=0
 
-html3_progress_file() { print -r -- "$temporary_directory/yy-html3-$1.json"; }
-html3_fragments_dir() { print -r -- "$temporary_directory/yy-html3-$1"; }
-html3_worker_log()    { print -r -- "$temporary_directory/yy-html3-worker-$1.out"; }
+html_progress_file() { print -r -- "$temporary_directory/yy-html-$1.json"; }
+html_fragments_dir() { print -r -- "$temporary_directory/yy-html-$1"; }
+html_worker_log()    { print -r -- "$temporary_directory/yy-html-worker-$1.out"; }
 
 # "Checkpoint: MM/dd/yyyy, HH:mm:ss Pacific Time (<age>)", empty when unset.
-format_html3_checkpoint_text() {
+format_html_checkpoint_text() {
   local ms=${1:-0} stamp
   [[ "$ms" == <-> ]] || { print -r -- ''; return 0 }
   (( ms <= 0 )) && { print -r -- ''; return 0 }
@@ -1700,12 +1700,12 @@ format_html3_checkpoint_text() {
 # download loses its whole card instead of coming back with a restored
 # checkbox. Publishes through a global: a command substitution
 # would fork, and the progress log lines below would be swallowed with it.
-html3_channel_fragment() {
+html_channel_fragment() {
   local channel=$1 channel_id=$2 scan_out=$3 prior_rows=$4 cutoff_ms=$5
   local row key cards="" restored_targets=0 visible=0 entry_ms entry_id
   local -a fields parts order sortable
   local -A entry_row
-  html3_fragment_text=""
+  html_fragment_text=""
 
   for row in ${(f)prior_rows}; do
     [[ -n "$row" ]] || continue
@@ -1779,26 +1779,26 @@ html3_channel_fragment() {
     fi
   fi
   [[ -n "$cards" ]] || return 0
-  html3_fragment_text='<section class="channel" data-html3-channel="'$(html_escape "$channel")'"><div class="channel-title"><h2><a href="'$(html_escape "$(channel_url_for "$channel")")'" target="_blank" rel="noopener noreferrer">'$(html_escape "$channel")'</a></h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">'"$cards"'</div></section>'
+  html_fragment_text='<section class="channel" data-html-channel="'$(html_escape "$channel")'"><div class="channel-title"><h2><a href="'$(html_escape "$(channel_url_for "$channel")")'" target="_blank" rel="noopener noreferrer">'$(html_escape "$channel")'</a></h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">'"$cards"'</div></section>'
   return 0
 }
 
 # Render and publish one channel's fragment, then record it as a page update.
 # Called from inside generate_html, so html_channel_ids and downloaded_set are
 # visible through zsh's dynamic scoping.
-html3_emit_fragment() {
+html_emit_fragment() {
   local index=$1 channel=$2 scan_out=$3 fragments_path=$4 cutoff_sec=$5
-  html3_channel_fragment "$channel" "${html_channel_ids[$channel]:-}" "$scan_out" \
+  html_channel_fragment "$channel" "${html_channel_ids[$channel]:-}" "$scan_out" \
     "${cache_entries[$channel]:-}" $(( cutoff_sec * 1000 ))
-  print -rn -- "$html3_fragment_text" >| "$fragments_path/$index.html" 2>/dev/null || true
-  html3_progress_updates+=("${channel}"$'\t'"${index}")
+  print -rn -- "$html_fragment_text" >| "$fragments_path/$index.html" 2>/dev/null || true
+  html_progress_updates+=("${channel}"$'\t'"${index}")
   return 0
 }
 
-html3_updates_json() {
+html_updates_json() {
   local u first=1 out='['
   local -a fields
-  for u in "${html3_progress_updates[@]}"; do
+  for u in "${html_progress_updates[@]}"; do
     fields=("${(@s:	:)u}")
     (( first )) || out+=','
     first=0
@@ -1809,7 +1809,7 @@ html3_updates_json() {
 
 # Both state writers stage into <path>.new.<pid> and then *copy* over the
 # target. A rename would briefly unlink the file the page is polling.
-html3_write_state_file() {
+html_write_state_file() {
   local jpath=$1 body=$2 tmp="${1}.new.$$"
   print -rn -- "$body" >| "$tmp" 2>/dev/null || return 0
   cp -f -- "$tmp" "$jpath" 2>/dev/null || true
@@ -1817,31 +1817,31 @@ html3_write_state_file() {
   return 0
 }
 
-write_html3_progress() {
+write_html_progress() {
   local jpath=$1 completed=$2 total=$3
-  html3_progress_completed=$completed
-  html3_progress_total=$total
-  html3_write_state_file "$jpath" \
-    '{"status":"running","success":false,"message":"Loading channels: '"${completed} / ${total}"'","completed":'"$completed"',"total":'"$total"',"updates":'"$(html3_updates_json)"'}'
+  html_progress_completed=$completed
+  html_progress_total=$total
+  html_write_state_file "$jpath" \
+    '{"status":"running","success":false,"message":"Loading channels: '"${completed} / ${total}"'","completed":'"$completed"',"total":'"$total"',"updates":'"$(html_updates_json)"'}'
 }
 
-set_html3_worker_state() {
+set_html_worker_state() {
   local jpath=$1 state=$2 message=$3 err=${4:-} success=false
   local failures='[' first=1 entry
   local -a fields
   [[ "$state" == success ]] && success=true
-  for entry in "${html3_failed_channels[@]}"; do
+  for entry in "${html_failed_channels[@]}"; do
     fields=("${(@s:	:)entry}")
     (( first )) || failures+=','
     first=0
     failures+='{"channel":"'$(json_escape "${fields[1]}")'","stage":"'$(json_escape "${fields[2]:-}")'"}'
   done
   failures+=']'
-  html3_write_state_file "$jpath" \
-    '{"status":"'$(json_escape "$state")'","success":'"$success"',"message":"'$(json_escape "$message")'","error":"'$(json_escape "$err")'","failed_channels":'"$failures"',"completed":'"$html3_progress_completed"',"total":'"$html3_progress_total"',"updates":'"$(html3_updates_json)"'}'
+  html_write_state_file "$jpath" \
+    '{"status":"'$(json_escape "$state")'","success":'"$success"',"message":"'$(json_escape "$message")'","error":"'$(json_escape "$err")'","failed_channels":'"$failures"',"completed":'"$html_progress_completed"',"total":'"$html_progress_total"',"updates":'"$(html_updates_json)"'}'
 }
 
-# Prune .tmp entries that --html3 and yt-dlp leave behind. Self-update backups
+# Prune .tmp entries that --html and yt-dlp leave behind. Self-update backups
 # and anything unrelated are deliberately untouched.
 remove_stale_temporary_artifacts() {
   local entry name removed=0
@@ -1864,70 +1864,70 @@ remove_stale_temporary_artifacts() {
   return 0
 }
 
-# The --html3 loading shell. This is the already-post-processed form of
-# yy.ps1's Write-Html3LoadingPage here-string plus its replacement chain.
-write_html3_loading_page() {
-  local token=$1 message=$2 page tmp="${html3_file}.new.$$"
-  page=$(cat <<'HTML3PAGE'
+# The --html loading shell. This is the already-post-processed form of
+# yy.ps1's Write-HtmlLoadingPage here-string plus its replacement chain.
+write_html_loading_page() {
+  local token=$1 message=$2 page tmp="${html_file}.new.$$"
+  page=$(cat <<'HTMLPAGE'
 
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAB/lBMVEXdZJ6vV2CXWSfUpTbsY6K7jJHCO37n0rHHeFW+kB7DP4D/AP+9klr/AAC/NnzxcK2+QIWjMFiqVar/f/+4PYPoyWndrcONNz3/P7/28N3knb7LRYb+/f3jXJrsZKK5N3jaVJPEPYDBO33nYJ4AAAD+5nC5hRGueArux1GxRXfy5+mnKmfImCz99Zvoydbn1tLTplKWN1bw2ePVpzb62mnCQn7//KK8iimkahSzeS3PmLHp1a6XR0vGlBbZtHL/f3/r2Y6bVSzw5dbixZXQaJm6eJXuZaS3Vm28NnqaNWbaw6vKmVLmu0zddqfJiGn401jWt8T/VarGZ3G/P3+0WoN/AH+NJVTVpbfvZqTAOX21ZIisdFPBU3bmosHWubKnaizJp4ybLWuqVVXBPH+7Nnu0h2SaWxeTSy/cwpLWt4/mYZ6eYQ+waUvnYqLFhVjMmGrasEvou9Dcxsa4ilHiu2nPp3LFmY7Bjhu+OHu+Zmr0aKjx45OIHFXPjqx/AADijbQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALwSMuAAAAgHRSTlPp////kv+p////zQH/AZEV//8DAv////8E///+//7+/v/+/v4A//////////////////////////////////8C////////UP9L//////////8D/wT/Av//yMv//////////wNOJf//////Q///Jf/////////////I/7////8C/+cQjRsAAAVESURBVHjanZcHVxs5FIVF3fSySbbJtjTj8TQbFzyOewNsbDAl9BpgqYH0bHr76/skjRcb0CzJOz6M/KT7zdOVZI6QxqJ8XVus968ELhkr/fVF7WaZSxH780jT6hJ1MChh1LlMAOa1259kL5ubk/V8egZCDnik1aXFohfTSNpZZzUg7VftWD5bWipRee8xiFFZe+ZhF6088AAEnmlldK+8EpAYFQj654ZCc35pd2ClfA+BAUHWDopP5zMQpNNDoWkq64dPXUO3ETRkgUsPQ3Es7w+gP9Cxh96/UXkYMjf8HoRj1B/wB2GEH+Lck84NDYVCczQo6ff7A/0IBfyyCOLphwB4joPSIQGE/B4BFgAgjr3GeAEoWAAAc4P+LODjEAOEPv4sACzggOf4hwGYwksps4AB4pieZi8BwHRqM2qP4anxigCY45SnN+1XUxTT/wFQ+n3YB4HHfI8rYgrMBEjbLD28ibrrgK+d4cdTXO6zEfzJCxND07id5owxxmvHGQDe9HVGhU8hFKfR01x0DXcqzgBgoG2djh75zADOL6w9ay3kYBY5kqJyAJMu3H11+ro/P4O+wpsLJEWs2hrpfmMXADN9juDfmAc9MYFwHKfEG2NQuUoxlQMwf/MCxsvsSZouoeKUbAHA+C9fFEsBOMcttmiKNxbu7tuCkH85wgEqX4kYlgAwFR6nqMIBL8wH2y4gzmupLburgL0BhPbwkaMzTukxT42+zHetbVSyjBbfKrHnpjnKZaZjvuCTOEpOcOG7ddfYTeU8AAwi4n3/OAKQNx0nzlPxCAfsZ/qyW8KWdz1M8B8A2qmNK5PJJwIwIwAjLccx37KaIgIwmUwm0zfELOJ69ul4ikMQxuNXJlvmzIwZF5a5UwCSM8NSbzsAyazYpXakWCy+BwjGDLA+2WdCRMQMW60j4R2kAGBnk318K09GIPQ3YosbxaKuZ7d6OADfJ83C0/TLpNhx+SQfH3vSMk3IvMsm05z8hgEiGd7ePtmqFprkDhYAbFmkuZMoHAqL3sKqvd7Pxk2zL++LbaUjab6RtnUoO2JwpwpLzSaxLNwGMIRFyJdae6m3mdzsK/ns9WwknXaP5lE8nj4YYAdzCdSWULoAAVlyD3IsmzTNVgtO4UQmctWdN4vHiSX2kjVyquoAwFaw3O1vT4zmed2+Sd2tmh+UBAnDPo916LsBQBj2dcdIOq3vu+fSNx7GBIpEcgAmJOcW4WufRUPPVJ8us29fw5idmOFO/VkAToXJWm72dXR2IFGwXYKhH35pLuSWQajCDGqeAECQMA/ye68ofeSGUbhvQRZjBQqIhrE3oB13LKPq/iIcjROVpRQMFlnkkoAUyaYP1l+7vwFf4RdNHQN9rbsADwAmvcW0cbA+0TZ1mO+SHLk8oHD1fVE/6e0dmLVP13X5BwAJ/b2u60amd6lprdVqAzb8cyFn9J4AsgVnFhYxQwhbGTgAsDb48oAUqbICDKNKUi7xglGegIIAFFzAheEBUEnCYIBMQuwCCUCB/QGBzz8VQjIMcEIIS144DivoGv9+YRBmgmEcAkAW+Boa9AIUGKDgBRhEu4qqSnq5CdwCmV5VdtH8KhAkQXYyunFAiHSAsjqPtF0sB4SrunEYlgPwLtyZFj9ISyAwByMhr0BZXSzDpWsP7GKj+af7CYAMA1zUrxJF3YNLl/a31gC7JLGTOdmR9alKA8T84tlQFcmgcLUalnQpakNcPNnVd29QkSASCYlcGdxrX301KERrrKryiZwvXl1tcJkL0BZvat8atz5cFvDhVuObdn2RX///BQWVQ1G7ZU7MAAAAAElFTkSuQmCC"><style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;padding-bottom:0}h2{font-size:22px;margin:0}.channel-title h2 a{color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:disabled,input:disabled{opacity:.55;cursor:wait}.controls,.checks,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.controls button{padding:4px 9px}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.preview{aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks{margin-top:8px;color:var(--mut)}.video-age{font-size:11px;color:var(--mut);margin-top:3px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:0;display:none;font-size:34px;font-weight:700}.back-to-top.visible{display:flex;align-items:center;justify-content:center}#html3-progress{margin:0 0 16px}.html3-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html3-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}.channel-table tr.html3-channel-error td{background:#3C050F;border-bottom-color:#7a1828;color:#fff}.channel-table tr.html3-channel-error a{color:#fff}#channel-add{width:27em}h2{color:var(--acc)}.channel-title h2 a{text-decoration:underline;text-underline-offset:3px}button:hover{border-color:var(--acc);background:#1c2230}.video-link:hover{color:var(--acc)}.preview{position:relative}.preview img{transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.back-to-top{border:none;box-shadow:0 2px 8px rgba(0,0,0,.45)}.back-to-top:hover{background:#79c0ff}#html3-error-panel{position:fixed;z-index:10;top:18px;left:50%;transform:translateX(-50%);max-width:min(720px,calc(100vw - 32px));padding:16px 20px;border:2px solid #ff7b72;border-radius:8px;background:#1b1114;box-shadow:0 8px 28px rgba(0,0,0,.55);color:#ff7b72;font-size:18px}#html3-error-panel[hidden]{display:none}</style><style>.html3-progress-bar{position:relative;overflow:hidden}.html3-progress-bar.loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);animation:html3-progress-shimmer 1.2s linear infinite}@keyframes html3-progress-shimmer{to{transform:translateX(100%)}}</style></head><body><h1>YouTube Video Download</h1><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">__MESSAGE__</p></div><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">__CHECKPOINT__</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><div id="html3-error-panel" role="alert" aria-live="assertive" hidden><div id="html3-errors"></div></div><pre id="job-log" class="job-log"></pre><main><section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><p>Loading Channel IDs...</p></section></main><button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button><script>(()=>{const token="__TOKEN__",base="/html3/"+token,stateUrl=base+"/state",fragmentUrl=i=>base+"/fragment/"+i,channelsUrl=base+"/channels",api=n=>"/"+n+"/"+token,controls=[...document.querySelectorAll("button,input")],top=document.querySelector("#back-to-top"),status=document.querySelector("#status"),errors=document.querySelector("#html3-errors"),errorPanel=document.querySelector("#html3-error-panel"),log=document.querySelector("#job-log"),applied=new Set(),saved=new Set();let html3Failures=[];const html3FailureSummary=()=>html3Failures.length?"Completed with channel errors: "+html3Failures.map(x=>"@"+x.channel+" ("+x.stage+")").join(", "):"";const compactLogs=logs=>{const buckets=new Map(),percents=new Map();return logs.filter(line=>{if(/^\[y[12]\]\s*$/.test(line))return false;const m=line.match(/^(\[[^\]]+\])\s+\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);if(!m)return true;const target=m[1],percent=Number(m[2]),previous=percents.get(target);if(previous!==undefined&&percent<previous-1)buckets.set(target,-1);percents.set(target,percent);const bucket=Math.floor(percent/10),last=buckets.has(target)?buckets.get(target):-1,emit=bucket>last||percent>=100;if(emit)buckets.set(target,bucket);return emit})};const showJobs=async()=>{let again=false;try{const b=await (await fetch(api("status"),{cache:"no-store"})).json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";log.textContent=compactLogs(b.logs||[]).join("\n");log.scrollTop=log.scrollHeight;if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};const relativeCheckpoint=ms=>{const s=Math.max(0,Math.floor((Date.now()-Number(ms))/1000)),u=[[31536000,"year"],[2592000,"month"],[604800,"week"],[86400,"day"],[3600,"hour"],[60,"minute"]];if(s<60)return "just now";for(const[d,n]of u)if(s>=d){const x=Math.floor(s/d);return x+" "+n+(x===1?"":"s")+" ago"}},checkpointText=ms=>{if(!ms)return "";const d=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"}).format(new Date(Number(ms)));return "Checkpoint: "+d+" Pacific Time ("+relativeCheckpoint(ms)+")"};const key=x=>x.dataset.channelId+"|"+x.dataset.videoId+"|"+x.className,remember=()=>document.querySelectorAll("input.y1:checked,input.y2:checked").forEach(x=>saved.add(key(x))),setBusy=b=>document.querySelectorAll("button,input").forEach(x=>{if(x!==top)x.disabled=b});const apply=async u=>{if(!u||applied.has(u.channel))return;const r=await fetch(fragmentUrl(u.fragment),{cache:"no-store"});if(!r.ok)return;const text=await r.text(),old=[...document.querySelectorAll("section.channel")].find(x=>x.dataset.html3Channel===u.channel);applied.add(u.channel);if(!text){if(old)old.remove();return}remember();const t=document.createElement("template");t.innerHTML=text;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").insertBefore(fresh,document.querySelector("#channel-ids"));fresh.querySelectorAll("input.y1,input.y2").forEach(x=>{if(saved.has(key(x)))x.checked=true});fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)};const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>{try{const s=await (await fetch(stateUrl,{cache:"no-store"})).json(),bar=document.querySelector(".html3-progress-bar");bar.classList.toggle("loading",s.status==="running");if(s.status==="running")document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";if(s.total){const partial=s.status==="running"?.5:0;bar.style.width=Math.min(100,100*((s.completed||0)+partial)/s.total)+"%";}for(const u of (Array.isArray(s.updates)?s.updates:(s.updates?[s.updates]:[])))await apply(u);if(s.status==="success"){await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";html3Failures=Array.isArray(s.failed_channels)?s.failed_channels:(s.failed_channels?[s.failed_channels]:[]);errors.textContent=html3FailureSummary();errorPanel.hidden=!html3Failures.length;return}if(s.status==="error"){status.textContent=s.error||"Page generation failed.";return}}catch(e){status.textContent="Progress unavailable: "+e.message}setTimeout(poll,500)};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(!b)return;(b.closest(".channel")||document).querySelectorAll("input.y1,input.y2").forEach(x=>{if(b.dataset.action==="none")x.checked=false;else if(x.className===b.dataset.action)x.checked=true})});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch(api("checkpoint"),{method:"POST"})).json();status.textContent=b.message;document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?checkpointText(b.checkpoint_ms):""};const refresh=async all=>{remember();html3Failures=[];errors.textContent="";errorPanel.hidden=true;setBusy(true);const b=await (await fetch(api(all?"refresh-all":"refresh"),{method:"POST"})).json();status.textContent=b.message||"Refreshing";applied.clear();poll()};document.querySelector("#refresh").onclick=()=>refresh(false);document.querySelector("#refresh-all").onclick=()=>refresh(true);document.querySelector("#stop").onclick=async()=>{if(!window.confirm("Stop the local server? Active downloads will continue."))return;try{const b=await (await fetch(api("stop"),{method:"POST"})).json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};top.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});const toggle=()=>top.classList.toggle("visible",scrollY>200);addEventListener("scroll",toggle,{passive:true});top.disabled=false;document.addEventListener("click",e=>{if(!errorPanel.hidden&&!errorPanel.contains(e.target))errorPanel.hidden=true});setInterval(()=>fetch(api("heartbeat"),{method:"POST",keepalive:true}),2000);showJobs();setBusy(true);poll()})()</script></body></html>
-HTML3PAGE
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAB/lBMVEXdZJ6vV2CXWSfUpTbsY6K7jJHCO37n0rHHeFW+kB7DP4D/AP+9klr/AAC/NnzxcK2+QIWjMFiqVar/f/+4PYPoyWndrcONNz3/P7/28N3knb7LRYb+/f3jXJrsZKK5N3jaVJPEPYDBO33nYJ4AAAD+5nC5hRGueArux1GxRXfy5+mnKmfImCz99Zvoydbn1tLTplKWN1bw2ePVpzb62mnCQn7//KK8iimkahSzeS3PmLHp1a6XR0vGlBbZtHL/f3/r2Y6bVSzw5dbixZXQaJm6eJXuZaS3Vm28NnqaNWbaw6vKmVLmu0zddqfJiGn401jWt8T/VarGZ3G/P3+0WoN/AH+NJVTVpbfvZqTAOX21ZIisdFPBU3bmosHWubKnaizJp4ybLWuqVVXBPH+7Nnu0h2SaWxeTSy/cwpLWt4/mYZ6eYQ+waUvnYqLFhVjMmGrasEvou9Dcxsa4ilHiu2nPp3LFmY7Bjhu+OHu+Zmr0aKjx45OIHFXPjqx/AADijbQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALwSMuAAAAgHRSTlPp////kv+p////zQH/AZEV//8DAv////8E///+//7+/v/+/v4A//////////////////////////////////8C////////UP9L//////////8D/wT/Av//yMv//////////wNOJf//////Q///Jf/////////////I/7////8C/+cQjRsAAAVESURBVHjanZcHVxs5FIVF3fSySbbJtjTj8TQbFzyOewNsbDAl9BpgqYH0bHr76/skjRcb0CzJOz6M/KT7zdOVZI6QxqJ8XVus968ELhkr/fVF7WaZSxH780jT6hJ1MChh1LlMAOa1259kL5ubk/V8egZCDnik1aXFohfTSNpZZzUg7VftWD5bWipRee8xiFFZe+ZhF6088AAEnmlldK+8EpAYFQj654ZCc35pd2ClfA+BAUHWDopP5zMQpNNDoWkq64dPXUO3ETRkgUsPQ3Es7w+gP9Cxh96/UXkYMjf8HoRj1B/wB2GEH+Lck84NDYVCczQo6ff7A/0IBfyyCOLphwB4joPSIQGE/B4BFgAgjr3GeAEoWAAAc4P+LODjEAOEPv4sACzggOf4hwGYwksps4AB4pieZi8BwHRqM2qP4anxigCY45SnN+1XUxTT/wFQ+n3YB4HHfI8rYgrMBEjbLD28ibrrgK+d4cdTXO6zEfzJCxND07id5owxxmvHGQDe9HVGhU8hFKfR01x0DXcqzgBgoG2djh75zADOL6w9ay3kYBY5kqJyAJMu3H11+ro/P4O+wpsLJEWs2hrpfmMXADN9juDfmAc9MYFwHKfEG2NQuUoxlQMwf/MCxsvsSZouoeKUbAHA+C9fFEsBOMcttmiKNxbu7tuCkH85wgEqX4kYlgAwFR6nqMIBL8wH2y4gzmupLburgL0BhPbwkaMzTukxT42+zHetbVSyjBbfKrHnpjnKZaZjvuCTOEpOcOG7ddfYTeU8AAwi4n3/OAKQNx0nzlPxCAfsZ/qyW8KWdz1M8B8A2qmNK5PJJwIwIwAjLccx37KaIgIwmUwm0zfELOJ69ul4ikMQxuNXJlvmzIwZF5a5UwCSM8NSbzsAyazYpXakWCy+BwjGDLA+2WdCRMQMW60j4R2kAGBnk318K09GIPQ3YosbxaKuZ7d6OADfJ83C0/TLpNhx+SQfH3vSMk3IvMsm05z8hgEiGd7ePtmqFprkDhYAbFmkuZMoHAqL3sKqvd7Pxk2zL++LbaUjab6RtnUoO2JwpwpLzSaxLNwGMIRFyJdae6m3mdzsK/ns9WwknXaP5lE8nj4YYAdzCdSWULoAAVlyD3IsmzTNVgtO4UQmctWdN4vHiSX2kjVyquoAwFaw3O1vT4zmed2+Sd2tmh+UBAnDPo916LsBQBj2dcdIOq3vu+fSNx7GBIpEcgAmJOcW4WufRUPPVJ8us29fw5idmOFO/VkAToXJWm72dXR2IFGwXYKhH35pLuSWQajCDGqeAECQMA/ye68ofeSGUbhvQRZjBQqIhrE3oB13LKPq/iIcjROVpRQMFlnkkoAUyaYP1l+7vwFf4RdNHQN9rbsADwAmvcW0cbA+0TZ1mO+SHLk8oHD1fVE/6e0dmLVP13X5BwAJ/b2u60amd6lprdVqAzb8cyFn9J4AsgVnFhYxQwhbGTgAsDb48oAUqbICDKNKUi7xglGegIIAFFzAheEBUEnCYIBMQuwCCUCB/QGBzz8VQjIMcEIIS144DivoGv9+YRBmgmEcAkAW+Boa9AIUGKDgBRhEu4qqSnq5CdwCmV5VdtH8KhAkQXYyunFAiHSAsjqPtF0sB4SrunEYlgPwLtyZFj9ISyAwByMhr0BZXSzDpWsP7GKj+af7CYAMA1zUrxJF3YNLl/a31gC7JLGTOdmR9alKA8T84tlQFcmgcLUalnQpakNcPNnVd29QkSASCYlcGdxrX301KERrrKryiZwvXl1tcJkL0BZvat8atz5cFvDhVuObdn2RX///BQWVQ1G7ZU7MAAAAAElFTkSuQmCC"><style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;padding-bottom:0}h2{font-size:22px;margin:0}.channel-title h2 a{color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:disabled,input:disabled{opacity:.55;cursor:wait}.controls,.checks,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.controls button{padding:4px 9px}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.preview{aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks{margin-top:8px;color:var(--mut)}.video-age{font-size:11px;color:var(--mut);margin-top:3px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:0;display:none;font-size:34px;font-weight:700}.back-to-top.visible{display:flex;align-items:center;justify-content:center}#html-progress{margin:0 0 16px}.html-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}.channel-table tr.html-channel-error td{background:#3C050F;border-bottom-color:#7a1828;color:#fff}.channel-table tr.html-channel-error a{color:#fff}#channel-add{width:27em}h2{color:var(--acc)}.channel-title h2 a{text-decoration:underline;text-underline-offset:3px}button:hover{border-color:var(--acc);background:#1c2230}.video-link:hover{color:var(--acc)}.preview{position:relative}.preview img{transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.back-to-top{border:none;box-shadow:0 2px 8px rgba(0,0,0,.45)}.back-to-top:hover{background:#79c0ff}#html-error-panel{position:fixed;z-index:10;top:18px;left:50%;transform:translateX(-50%);max-width:min(720px,calc(100vw - 32px));padding:16px 20px;border:2px solid #ff7b72;border-radius:8px;background:#1b1114;box-shadow:0 8px 28px rgba(0,0,0,.55);color:#ff7b72;font-size:18px}#html-error-panel[hidden]{display:none}</style><style>.html-progress-bar{position:relative;overflow:hidden}.html-progress-bar.loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);animation:html-progress-shimmer 1.2s linear infinite}@keyframes html-progress-shimmer{to{transform:translateX(100%)}}</style></head><body><h1>YouTube Video Download</h1><div id="html-progress" role="status" aria-live="polite"><div class="html-progress-track"><div class="html-progress-bar"></div></div><p id="html-progress-status">__MESSAGE__</p></div><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">__CHECKPOINT__</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><div id="html-error-panel" role="alert" aria-live="assertive" hidden><div id="html-errors"></div></div><pre id="job-log" class="job-log"></pre><main><section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><p>Loading Channel IDs...</p></section></main><button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button><script>(()=>{const token="__TOKEN__",base="/html/"+token,stateUrl=base+"/state",fragmentUrl=i=>base+"/fragment/"+i,channelsUrl=base+"/channels",api=n=>"/"+n+"/"+token,controls=[...document.querySelectorAll("button,input")],top=document.querySelector("#back-to-top"),status=document.querySelector("#status"),errors=document.querySelector("#html-errors"),errorPanel=document.querySelector("#html-error-panel"),log=document.querySelector("#job-log"),applied=new Set(),saved=new Set();let htmlFailures=[];const htmlFailureSummary=()=>htmlFailures.length?"Completed with channel errors: "+htmlFailures.map(x=>"@"+x.channel+" ("+x.stage+")").join(", "):"";const compactLogs=logs=>{const buckets=new Map(),percents=new Map();return logs.filter(line=>{if(/^\[y[12]\]\s*$/.test(line))return false;const m=line.match(/^(\[[^\]]+\])\s+\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);if(!m)return true;const target=m[1],percent=Number(m[2]),previous=percents.get(target);if(previous!==undefined&&percent<previous-1)buckets.set(target,-1);percents.set(target,percent);const bucket=Math.floor(percent/10),last=buckets.has(target)?buckets.get(target):-1,emit=bucket>last||percent>=100;if(emit)buckets.set(target,bucket);return emit})};const showJobs=async()=>{let again=false;try{const b=await (await fetch(api("status"),{cache:"no-store"})).json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";log.textContent=compactLogs(b.logs||[]).join("\n");log.scrollTop=log.scrollHeight;if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};const relativeCheckpoint=ms=>{const s=Math.max(0,Math.floor((Date.now()-Number(ms))/1000)),u=[[31536000,"year"],[2592000,"month"],[604800,"week"],[86400,"day"],[3600,"hour"],[60,"minute"]];if(s<60)return "just now";for(const[d,n]of u)if(s>=d){const x=Math.floor(s/d);return x+" "+n+(x===1?"":"s")+" ago"}},checkpointText=ms=>{if(!ms)return "";const d=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"}).format(new Date(Number(ms)));return "Checkpoint: "+d+" Pacific Time ("+relativeCheckpoint(ms)+")"};const key=x=>x.dataset.channelId+"|"+x.dataset.videoId+"|"+x.className,remember=()=>document.querySelectorAll("input.y1:checked,input.y2:checked").forEach(x=>saved.add(key(x))),setBusy=b=>document.querySelectorAll("button,input").forEach(x=>{if(x!==top)x.disabled=b});const apply=async u=>{if(!u||applied.has(u.channel))return;const r=await fetch(fragmentUrl(u.fragment),{cache:"no-store"});if(!r.ok)return;const text=await r.text(),old=[...document.querySelectorAll("section.channel")].find(x=>x.dataset.htmlChannel===u.channel);applied.add(u.channel);if(!text){if(old)old.remove();return}remember();const t=document.createElement("template");t.innerHTML=text;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").insertBefore(fresh,document.querySelector("#channel-ids"));fresh.querySelectorAll("input.y1,input.y2").forEach(x=>{if(saved.has(key(x)))x.checked=true});fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)};const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>{try{const s=await (await fetch(stateUrl,{cache:"no-store"})).json(),bar=document.querySelector(".html-progress-bar");bar.classList.toggle("loading",s.status==="running");if(s.status==="running")document.querySelector("#html-progress-status").textContent=s.message||"Loading channels...";if(s.total){const partial=s.status==="running"?.5:0;bar.style.width=Math.min(100,100*((s.completed||0)+partial)/s.total)+"%";}for(const u of (Array.isArray(s.updates)?s.updates:(s.updates?[s.updates]:[])))await apply(u);if(s.status==="success"){await applyChannelIds();setBusy(false);document.querySelector("#html-progress-status").textContent="";htmlFailures=Array.isArray(s.failed_channels)?s.failed_channels:(s.failed_channels?[s.failed_channels]:[]);errors.textContent=htmlFailureSummary();errorPanel.hidden=!htmlFailures.length;return}if(s.status==="error"){status.textContent=s.error||"Page generation failed.";return}}catch(e){status.textContent="Progress unavailable: "+e.message}setTimeout(poll,500)};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(!b)return;(b.closest(".channel")||document).querySelectorAll("input.y1,input.y2").forEach(x=>{if(b.dataset.action==="none")x.checked=false;else if(x.className===b.dataset.action)x.checked=true})});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch(api("checkpoint"),{method:"POST"})).json();status.textContent=b.message;document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?checkpointText(b.checkpoint_ms):""};const refresh=async all=>{remember();htmlFailures=[];errors.textContent="";errorPanel.hidden=true;setBusy(true);const b=await (await fetch(api(all?"refresh-all":"refresh"),{method:"POST"})).json();status.textContent=b.message||"Refreshing";applied.clear();poll()};document.querySelector("#refresh").onclick=()=>refresh(false);document.querySelector("#refresh-all").onclick=()=>refresh(true);document.querySelector("#stop").onclick=async()=>{if(!window.confirm("Stop the local server? Active downloads will continue."))return;try{const b=await (await fetch(api("stop"),{method:"POST"})).json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};top.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});const toggle=()=>top.classList.toggle("visible",scrollY>200);addEventListener("scroll",toggle,{passive:true});top.disabled=false;document.addEventListener("click",e=>{if(!errorPanel.hidden&&!errorPanel.contains(e.target))errorPanel.hidden=true});setInterval(()=>fetch(api("heartbeat"),{method:"POST",keepalive:true}),2000);showJobs();setBusy(true);poll()})()</script></body></html>
+HTMLPAGE
   )
   page=${page//__TOKEN__/$token}
   page=${page//__MESSAGE__/$(html_escape "$message")}
-  page=${page//__CHECKPOINT__/$(html_escape "$(format_html3_checkpoint_text "$(read_checkpoint_ms 2>/dev/null || print -r -- 0)")")}
-  print -r -- "$page" >| "$tmp" || { printf 'Error: could not write %s\n' "$html3_file" >&2; return 1; }
-  mv -f -- "$tmp" "$html3_file" || { printf 'Error: could not write %s\n' "$html3_file" >&2; return 1; }
+  page=${page//__CHECKPOINT__/$(html_escape "$(format_html_checkpoint_text "$(read_checkpoint_ms 2>/dev/null || print -r -- 0)")")}
+  print -r -- "$page" >| "$tmp" || { printf 'Error: could not write %s\n' "$html_file" >&2; return 1; }
+  mv -f -- "$tmp" "$html_file" || { printf 'Error: could not write %s\n' "$html_file" >&2; return 1; }
   return 0
 }
 
 # Run this very script as the scanning worker. zsh needs no encoded-command
 # dance: stdout and stderr are merged into one log the server tails.
-typeset -g html3_worker_pid=0 html3_worker_lines=0
+typeset -g html_worker_pid=0 html_worker_lines=0
 
-start_html3_worker() {
+start_html_worker() {
   local token=$1 refresh_all=${2:-0} log
-  log=$(html3_worker_log "$token")
+  log=$(html_worker_log "$token")
   # Reset the state before the child starts so a refresh cannot expose the
   # previous run's explicit success result during process startup.
-  html3_progress_updates=()
-  write_html3_progress "$(html3_progress_file "$token")" 0 0
+  html_progress_updates=()
+  write_html_progress "$(html_progress_file "$token")" 0 0
   : >| "$log" 2>/dev/null || true
-  html3_worker_lines=0
+  html_worker_lines=0
   if (( refresh_all )); then
-    "$script_self" --html3-worker "$token" --refresh-all >"$log" 2>&1 &
+    "$script_self" --html-worker "$token" --refresh-all >"$log" 2>&1 &
   else
-    "$script_self" --html3-worker "$token" >"$log" 2>&1 &
+    "$script_self" --html-worker "$token" >"$log" 2>&1 &
   fi
-  html3_worker_pid=$!
+  html_worker_pid=$!
   return 0
 }
 
-html3_worker_running() {
-  (( html3_worker_pid > 0 )) || return 1
-  kill -0 "$html3_worker_pid" 2>/dev/null
+html_worker_running() {
+  (( html_worker_pid > 0 )) || return 1
+  kill -0 "$html_worker_pid" 2>/dev/null
 }
 
 # Relay whatever the worker has printed since the last call, so the server
 # console still shows the scan it delegated.
-write_html3_worker_logs() {
+write_html_worker_logs() {
   local token=$1 log total line i=0
-  log=$(html3_worker_log "$token")
+  log=$(html_worker_log "$token")
   [[ -f "$log" ]] || return 0
   total=$(wc -l < "$log" 2>/dev/null) || return 0
   total=${total// /}
   [[ "$total" == <-> ]] || return 0
-  (( total > html3_worker_lines )) || return 0
+  (( total > html_worker_lines )) || return 0
   while IFS= read -r line; do
     (( ++i ))
-    (( i > html3_worker_lines )) && print -r -- "$line"
+    (( i > html_worker_lines )) && print -r -- "$line"
   done < "$log"
-  html3_worker_lines=$total
+  html_worker_lines=$total
   return 0
 }
 
 # Scan each /videos tab and publish the qualifying account-visible entries as
-# page fragments for the --html3 worker to serve.
+# page fragments for the --html worker to serve.
 # $1 enables REFRESH ALL (scan even stale channels); $2 is the progress file
 # and $3 the fragment directory. Each channel is published under $3 as soon as
 # its scan settles. The incremental cache is always on.
@@ -1946,8 +1946,8 @@ generate_html() {
   local -a channels scan_cutoffs
   local -A seen_channels html_channel_ids skip_ytdlp observed_feed_newest last_full_scans downloaded_set
   html_failure_count=0
-  html3_failed_channels=()
-  html3_progress_updates=()
+  html_failed_channels=()
+  html_progress_updates=()
 
   exe=$(ytdlp_path) || {
     printf 'Error: yt-dlp binary not found next to this script\n' >&2
@@ -1997,7 +1997,7 @@ generate_html() {
     else
       if ! resolve_channel_id "$channel" "$(channel_url_for "$channel")"; then
         (( ++failures ))
-        html3_failed_channels+=("${channel}"$'\t'"could not resolve channel id")
+        html_failed_channels+=("${channel}"$'\t'"could not resolve channel id")
         continue
       fi
       html_channel_ids[$channel]=$resolved_channel_id
@@ -2079,7 +2079,7 @@ generate_html() {
   trap 'html_scan_cleanup' EXIT INT TERM
 
   next_index=1
-  write_html3_progress "$progress_path" 0 ${#channels}
+  write_html_progress "$progress_path" 0 ${#channels}
   while (( next_index <= ${#channels} || ${#worker_pid} > 0 )); do
     while (( next_index <= ${#channels} && ${#free_slots} > 0 )); do
       channel=${channels[$next_index]}
@@ -2087,9 +2087,9 @@ generate_html() {
         print -rn -- "" >| "$result_dir/$next_index.out"
         print -r -- 0 >| "$result_dir/$next_index.status"
         print -r -- 1 >| "$result_dir/$next_index.feedonly"
-        html3_emit_fragment "$next_index" "$channel" "" "$fragments_path" "$scan_cutoff_sec"
+        html_emit_fragment "$next_index" "$channel" "" "$fragments_path" "$scan_cutoff_sec"
         (( ++completed_scans ))
-        write_html3_progress "$progress_path" "$completed_scans" ${#channels}
+        write_html_progress "$progress_path" "$completed_scans" ${#channels}
         (( ++next_index ))
         continue
       fi
@@ -2112,7 +2112,7 @@ generate_html() {
             reaped_index=${worker_index[$w]}
             reaped_out=""
             [[ -f "$result_dir/$reaped_index.out" ]] && reaped_out=$(<"$result_dir/$reaped_index.out")
-            html3_emit_fragment "$reaped_index" "${channels[$reaped_index]}" "$reaped_out" \
+            html_emit_fragment "$reaped_index" "${channels[$reaped_index]}" "$reaped_out" \
               "$fragments_path" "$scan_cutoff_sec"
             (( ++completed_scans ))
             free_slots+=("${worker_slot[$w]}")
@@ -2124,7 +2124,7 @@ generate_html() {
         done
         (( done_any )) || sleep 1
       done
-      write_html3_progress "$progress_path" "$completed_scans" ${#channels}
+      write_html_progress "$progress_path" "$completed_scans" ${#channels}
     fi
   done
 
@@ -2175,7 +2175,7 @@ generate_html() {
     else
       printf 'Warning: could not scan the videos tab for @%s; using cached entries\n' "$channel" >&2
       (( ++failures ))
-      html3_failed_channels+=("${channel}"$'\t'"could not scan videos tab; using cached entries")
+      html_failed_channels+=("${channel}"$'\t'"could not scan videos tab; using cached entries")
     fi
     local cache_checked=0 cache_full=0 cache_feed=0
     if (( scan_ok )); then cache_checked=$check_batch_ms
@@ -2214,7 +2214,7 @@ generate_html() {
     if (( ! scan_ok )); then
       printf 'Warning: could not scan the videos tab for @%s\n' "$channel" >&2
       (( ++failures ))
-      html3_failed_channels+=("${channel}"$'\t'"could not scan videos tab")
+      html_failed_channels+=("${channel}"$'\t'"could not scan videos tab")
       continue
     fi
 
@@ -2269,11 +2269,11 @@ generate_html() {
     done
   fi
   local -a table_rows sortable
-  local -A html3_failed_keys
-  for row in "${html3_failed_channels[@]}"; do
+  local -A html_failed_keys
+  for row in "${html_failed_channels[@]}"; do
     failed_key=${row%%$'\t'*}
     failed_key=${failed_key#@}
-    [[ -n "$failed_key" ]] && html3_failed_keys[$failed_key]=1
+    [[ -n "$failed_key" ]] && html_failed_keys[$failed_key]=1
   done
   for index in {1..${#managed_keys}}; do
     key=${managed_keys[$index]}
@@ -2285,7 +2285,7 @@ generate_html() {
     index=${row##*$'\t'}
     key=${managed_keys[$index]}
     local checked_text='never' latest_text='unknown' avatar='' row_class=''
-    (( ${+html3_failed_keys[$key]} )) && row_class=' class="html3-channel-error"'
+    (( ${+html_failed_keys[$key]} )) && row_class=' class="html-channel-error"'
     (( ${status_checked_ms[$key]:-0} > 0 )) && checked_text=$(format_relative_ms "${status_checked_ms[$key]}")
     (( ${status_latest_video_ms[$key]:-0} > 0 )) && latest_text=$(format_relative_ms "${status_latest_video_ms[$key]}")
     if [[ -n "${status_thumbnail[$key]}" ]]; then
@@ -2670,7 +2670,7 @@ invoke_html_callback_server() {
   # Declared here, not in the request switch: a bare `local name` for a
   # variable that already exists in the same scope makes zsh *print* it.
   local state_file=""
-  local page_file=$html3_file
+  local page_file=$html_file
   # A browser that abandons a status or heartbeat request would otherwise
   # SIGPIPE this script mid-write.
   trap '' PIPE
@@ -2690,8 +2690,8 @@ invoke_html_callback_server() {
   html_server_stop=0
   trap 'html_server_stop=1' INT TERM
   last_heartbeat=$(now_sec)
-  start_html3_worker "$html_token" 0
-  open_html3_url "http://${html_listen_host}:${html_listen_port}/" "$incognito" || true
+  start_html_worker "$html_token" 0
+  open_html_url "http://${html_listen_host}:${html_listen_port}/" "$incognito" || true
   printf 'Waiting for DOWNLOAD SELECTED on http://%s:%s/ (Ctrl+C or STOP SERVER exits)\n' \
     "$html_listen_host" "$html_listen_port"
   while (( ! html_server_stop && ! stop )); do
@@ -2699,7 +2699,7 @@ invoke_html_callback_server() {
       # Keep queued jobs moving even while the page is idle. This also
       # refreshes $job_active_count for the timeout test below.
       get_download_job_status
-      write_html3_worker_logs "$html_token"
+      write_html_worker_logs "$html_token"
       now=$(now_sec)
       # Never abandon a download that is still running or queued just because
       # the browser throttled its timers while the tab was in the background.
@@ -2724,9 +2724,9 @@ invoke_html_callback_server() {
       "GET /")
         http_send_file "$conn_fd" "$page_file"
         ;;
-      "GET /html3/${html_token}/state")
-        write_html3_worker_logs "$html_token"
-        state_file=$(html3_progress_file "$html_token")
+      "GET /html/${html_token}/state")
+        write_html_worker_logs "$html_token"
+        state_file=$(html_progress_file "$html_token")
         if [[ -f "$state_file" ]]; then
           http_send "$conn_fd" 200 OK 'application/json' "$(<"$state_file")"
         else
@@ -2734,11 +2734,11 @@ invoke_html_callback_server() {
             '{"status":"running","success":false,"message":"Loading channels...","completed":0,"total":0,"updates":[]}'
         fi
         ;;
-      "GET /html3/${html_token}/channels")
-        http_send_file "$conn_fd" "$(html3_fragments_dir "$html_token")/channels.html"
+      "GET /html/${html_token}/channels")
+        http_send_file "$conn_fd" "$(html_fragments_dir "$html_token")/channels.html"
         ;;
-      "GET /html3/${html_token}/fragment/"<->)
-        http_send_file "$conn_fd" "$(html3_fragments_dir "$html_token")/${req_path##*/}.html"
+      "GET /html/${html_token}/fragment/"<->)
+        http_send_file "$conn_fd" "$(html_fragments_dir "$html_token")/${req_path##*/}.html"
         ;;
       "GET /status/${html_token}")
         get_download_job_status
@@ -2770,12 +2770,12 @@ invoke_html_callback_server() {
         fi
         # The scan runs in a worker process, so the refresh is asynchronous:
         # reply immediately and let the page resume polling /state.
-        if html3_worker_running; then
+        if html_worker_running; then
           http_send_message "$conn_fd" 409 Conflict 'A page update is already running.'
         else
-          write_html3_loading_page "$html_token" 'Loading channels...' \
+          write_html_loading_page "$html_token" 'Loading channels...' \
             || printf 'Warning: could not rewrite the loading page.\n' >&2
-          start_html3_worker "$html_token" "$refresh_all"
+          start_html_worker "$html_token" "$refresh_all"
           http_send_message "$conn_fd" 202 Accepted 'Refreshing page.'
         fi
         last_heartbeat=$(now_sec)
@@ -2812,7 +2812,7 @@ invoke_html_callback_server() {
 }
 
 # ---------------------------------------------------------------------------
-# Main flow: -U, then -o/-O/--html3, then -c, then download.
+# Main flow: -U, then -o/-O/--html, then -c, then download.
 # ---------------------------------------------------------------------------
 
 if [[ -n "$current_url" ]]; then
@@ -2877,48 +2877,48 @@ checkpoint_after_checks_ms=0
 read_channel_check_status
 remove_stale_channel_check_status
 
-if [[ "$open_mode" == "html3-worker" ]]; then
-  worker_progress_path=$(html3_progress_file "$html3_worker_token")
-  worker_fragments_path=$(html3_fragments_dir "$html3_worker_token")
+if [[ "$open_mode" == "html-worker" ]]; then
+  worker_progress_path=$(html_progress_file "$html_worker_token")
+  worker_fragments_path=$(html_fragments_dir "$html_worker_token")
   rm -rf -- "$worker_fragments_path" 2>/dev/null || true
   if ! mkdir -p -- "$worker_fragments_path"; then
-    printf 'HTML3 worker failed: could not create %s\n' "$worker_fragments_path" >&2
+    printf 'HTML worker failed: could not create %s\n' "$worker_fragments_path" >&2
     exit 1
   fi
-  html3_progress_updates=()
-  write_html3_progress "$worker_progress_path" 0 0
-  if generate_html "$html3_worker_refresh_all" \
+  html_progress_updates=()
+  write_html_progress "$worker_progress_path" 0 0
+  if generate_html "$html_worker_refresh_all" \
       "$worker_progress_path" "$worker_fragments_path"; then
-    for failed_entry in "${html3_failed_channels[@]}"; do
-      printf 'HTML3 skipped failed channel @%s: %s\n' "${failed_entry%%$'\t'*}" "${failed_entry#*$'\t'}"
+    for failed_entry in "${html_failed_channels[@]}"; do
+      printf 'HTML skipped failed channel @%s: %s\n' "${failed_entry%%$'\t'*}" "${failed_entry#*$'\t'}"
     done
-    if (( ${#html3_failed_channels} > 0 )); then
+    if (( ${#html_failed_channels} > 0 )); then
       failed_summary=""
-      for failed_entry in "${html3_failed_channels[@]}"; do
+      for failed_entry in "${html_failed_channels[@]}"; do
         [[ -n "$failed_summary" ]] && failed_summary+=", "
         failed_summary+="@${failed_entry%%$'\t'*} (${failed_entry#*$'\t'})"
       done
-      printf 'HTML3 completed with channel errors: %s\n' "$failed_summary"
+      printf 'HTML completed with channel errors: %s\n' "$failed_summary"
     else
-      printf 'HTML3 completed with no channel errors.\n'
+      printf 'HTML completed with no channel errors.\n'
     fi
-    set_html3_worker_state "$worker_progress_path" success ''
+    set_html_worker_state "$worker_progress_path" success ''
     exit 0
   fi
-  set_html3_worker_state "$worker_progress_path" error 'Page generation failed.' \
-    'Could not generate the HTML3 page.'
-  printf 'HTML3 worker failed: could not generate the HTML3 page.\n' >&2
+  set_html_worker_state "$worker_progress_path" error 'Page generation failed.' \
+    'Could not generate the HTML page.'
+  printf 'HTML worker failed: could not generate the HTML page.\n' >&2
   exit 1
 fi
 
 if [[ -n "$open_mode" ]]; then
-  if [[ "$open_mode" == "html3" ]]; then
+  if [[ "$open_mode" == "html" ]]; then
     html_token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
     [[ -n "$html_token" ]] || html_token=$(( RANDOM * RANDOM ))
     # The shell is written first and the scan runs in a worker, so the page
     # is reachable immediately instead of after a full channel sweep.
     remove_stale_temporary_artifacts
-    if ! write_html3_loading_page "$html_token" 'Loading channels...'; then
+    if ! write_html_loading_page "$html_token" 'Loading channels...'; then
       open_failure_count=1
     fi
     if (( open_failure_count == 0 )); then

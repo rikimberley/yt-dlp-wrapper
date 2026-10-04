@@ -14,10 +14,10 @@
 #   (exits 1 if any channel could not be checked)
 # - uses -O to open every channel in ./channel-ids.txt unconditionally, and
 #   skip any download
-# - uses --html3 to open an independent loading shell and stream channel
+# - uses --html to open an independent loading shell and stream channel
 #   fragments from a worker into a local 6-column video grid with y1/y2
 #   selections, served on http://127.0.0.1:8090
-# - uses --incognito with --html3 to open that shell in Chrome Incognito
+# - uses --incognito with --html to open that shell in Chrome Incognito
 #   on Windows
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
@@ -32,8 +32,8 @@
 #   ./yy.ps1 -U
 #   ./yy.ps1 -o
 #   ./yy.ps1 -O
-#   ./yy.ps1 --html3
-#   ./yy.ps1 --html3 --incognito
+#   ./yy.ps1 --html
+#   ./yy.ps1 --html --incognito
 #   ./yy.ps1 -c
 #   ./yy.ps1 --help
 #   ./yy.ps1 -o -c
@@ -119,7 +119,7 @@ $feedFetchFailed = $false
 $feedFailureCountedForChannel = $false
 # Head of master in the wrapper's own repo, used by -U to refresh this script.
 $scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master'
-# Loopback port for --html3. Keep in sync with yy.zsh and py/yy.py.
+# Loopback port for --html. Keep in sync with yy.zsh and py/yy.py.
 $htmlListenPort = 8090
 
 $Url = ''
@@ -131,8 +131,8 @@ $SwitchToPy = $false
 $OpenMode = ''
 $SetCheckpoint = $false
 $htmlFailureCount = 0
-$Html3WorkerToken = ''
-$Html3WorkerRefreshAll = $false
+$HtmlWorkerToken = ''
+$HtmlWorkerRefreshAll = $false
 $Incognito = $false
 $ShowHelp = $false
 
@@ -142,7 +142,7 @@ yy.ps1 - convenience wrapper around ./yt-dlp
 
 Usage:
   ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
-           [-o | -O | --html3] [--incognito] [-c]
+           [-o | -O | --html] [--incognito] [-c]
   ./yy.ps1 -h | --help
 
 Arguments:
@@ -169,14 +169,14 @@ Options:
                       downloading. Exits non-zero if a channel check failed.
   -O                  Open every channel in ./channel-ids.txt unconditionally,
                       then exit without downloading.
-  --html3             Generate a local 6-column video grid with y1/y2
+  --html             Generate a local 6-column video grid with y1/y2
                       selections and serve it on http://127.0.0.1:8090. A
                       loading shell opens immediately and a background worker
                       streams one fragment per channel into it. The scan is
                       incremental: a persistent cache means later runs scan
                       only a one-day overlap per channel. Already-downloaded
                       video cards are dropped.
-  --incognito         With --html3, open the page in a Chrome/Chromium
+  --incognito         With --html, open the page in a Chrome/Chromium
                       incognito window instead of the default browser.
   -c                  Overwrite ./checkpoint.txt with the current epoch-ms
                       timestamp, then exit without downloading. Runs after
@@ -184,8 +184,8 @@ Options:
                       everything as seen".
   -h, --help          Show this help and exit.
 
--o, -O and --html3 are mutually exclusive.
-Flag precedence: -h, then --py, then -U, then -o/-O/--html3, then -c, then
+-o, -O and --html are mutually exclusive.
+Flag precedence: -h, then --py, then -U, then -o/-O/--html, then -c, then
 download.
 
 Examples:
@@ -194,8 +194,8 @@ Examples:
   ./yy.ps1 -p ./my-videos -t 'https://example.com/one-off'
   ./yy.ps1 -U
   ./yy.ps1 -o -c
-  ./yy.ps1 --html3
-  ./yy.ps1 --html3 --incognito
+  ./yy.ps1 --html
+  ./yy.ps1 --html --incognito
 '@
     Write-Host $usage
 }
@@ -230,27 +230,27 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
         if ($OpenMode -ne '') {
-            [Console]::Error.WriteLine('Error: -o, -O and --html3 cannot be combined')
+            [Console]::Error.WriteLine('Error: -o, -O and --html cannot be combined')
             exit 1
         }
         $OpenMode = if ($a -ceq '-o') { 'check' } else { 'open' }
     }
-    elseif ($a -ceq '--html3') {
+    elseif ($a -ceq '--html') {
         if ($OpenMode -ne '') {
-            [Console]::Error.WriteLine('Error: -o, -O and --html3 cannot be combined')
+            [Console]::Error.WriteLine('Error: -o, -O and --html cannot be combined')
             exit 1
         }
-        $OpenMode = 'html3'
+        $OpenMode = 'html'
     }
-    elseif ($a -ceq '--html3-worker') {
+    elseif ($a -ceq '--html-worker') {
         $i++
         if ($i -ge $args.Count -or [string]::IsNullOrWhiteSpace([string]$args[$i])) {
-            [Console]::Error.WriteLine('Error: internal html3 worker requires a token')
+            [Console]::Error.WriteLine('Error: internal html worker requires a token')
             exit 1
         }
-        $OpenMode = 'html3-worker'
-        $Html3WorkerToken = [string]$args[$i]
-        if (($i + 1) -lt $args.Count -and [string]$args[$i + 1] -ceq '--refresh-all') { $Html3WorkerRefreshAll = $true; $i++ }
+        $OpenMode = 'html-worker'
+        $HtmlWorkerToken = [string]$args[$i]
+        if (($i + 1) -lt $args.Count -and [string]$args[$i + 1] -ceq '--refresh-all') { $HtmlWorkerRefreshAll = $true; $i++ }
     }
     elseif ($a -ceq '--incognito') {
         $Incognito = $true
@@ -276,8 +276,8 @@ if ($ShowHelp) {
     exit 0
 }
 
-if ($Incognito -and $OpenMode -ne 'html3') {
-    [Console]::Error.WriteLine('Error: --incognito requires --html3')
+if ($Incognito -and $OpenMode -ne 'html') {
+    [Console]::Error.WriteLine('Error: --incognito requires --html')
     exit 1
 }
 
@@ -393,10 +393,10 @@ function Open-Url {
     }
 }
 
-# HTML3 normally opens in the default browser. With -Incognito, Windows opens
+# HTML normally opens in the default browser. With -Incognito, Windows opens
 # it in Chrome's Incognito profile, reusing an existing Incognito window when
 # one is already open.
-function Open-Html3Url {
+function Open-HtmlUrl {
     param([string]$TargetUrl, [switch]$Incognito)
 
     if (-not $Incognito -or (Get-PlatformName) -ne 'windows') {
@@ -410,7 +410,7 @@ function Open-Html3Url {
         (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     if ($chromeCandidates.Count -eq 0) {
-        Write-Warning 'Google Chrome was not found; opening HTML3 in the default browser.'
+        Write-Warning 'Google Chrome was not found; opening HTML in the default browser.'
         Open-Url $TargetUrl
         return
     }
@@ -1343,7 +1343,7 @@ function Get-ChannelThumbnailsConcurrent {
     return $result
 }
 
-# Fetch the Atom feeds for cached --html3 channels concurrently. A result is
+# Fetch the Atom feeds for cached --html channels concurrently. A result is
 # returned only for a usable feed with at least one parseable <published> value.
 # Anything else is deliberately absent from the result so the caller falls back
 # to yt-dlp. Once three feeds exhaust their retries, pending feeds are abandoned
@@ -1439,10 +1439,10 @@ function Test-ShouldScanHtmlChannel {
     return $latestVideoMs -gt $staleVideoCutoffMs
 }
 
-# Render one standalone HTML3 channel fragment from its just-finished scan plus
+# Render one standalone HTML channel fragment from its just-finished scan plus
 # any prior incremental cache.  Previously downloaded selections are omitted so
 # they do not reappear in the preview; an empty fragment removes its channel.
-function Get-Html3ChannelFragment {
+function Get-HtmlChannelFragment {
     param([string]$Channel, [string]$ChannelId, $ScanOutput, $PriorRecord, [hashtable]$Downloaded, [long]$CutoffMs)
 
     $entries = @{}
@@ -1482,14 +1482,14 @@ function Get-Html3ChannelFragment {
     }
     if ($cards.Length -eq 0) { return '' }
     $heading = [System.Net.WebUtility]::HtmlEncode((Get-ChannelUrl $Channel))
-    return '<section class="channel" data-html3-channel="' + [System.Net.WebUtility]::HtmlEncode($Channel) + '"><div class="channel-title"><h2><a href="' + $heading + '" target="_blank" rel="noopener noreferrer">' + [System.Net.WebUtility]::HtmlEncode($Channel) + '</a></h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">' + $cards.ToString() + '</div></section>'
+    return '<section class="channel" data-html-channel="' + [System.Net.WebUtility]::HtmlEncode($Channel) + '"><div class="channel-title"><h2><a href="' + $heading + '" target="_blank" rel="noopener noreferrer">' + [System.Net.WebUtility]::HtmlEncode($Channel) + '</a></h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">' + $cards.ToString() + '</div></section>'
 }
 
 # Build a local page from qualifying account-visible entries on each /videos tab.
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
-    param([hashtable]$ChannelStatus, [switch]$RefreshAll, [string]$ProgressPath, [string]$Html3FragmentsPath)
+    param([hashtable]$ChannelStatus, [switch]$RefreshAll, [string]$ProgressPath, [string]$HtmlFragmentsPath)
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
@@ -1503,7 +1503,7 @@ function New-VideoHtml {
     $scanCutoffSec = [Math]::Max(0, $checkpointDayStartSec - 86400)
     $checkpointAge = Format-RelativeVideoTime $checkpointMs
     $failures = 0
-    $script:html3FailedChannels = New-Object System.Collections.ArrayList
+    $script:htmlFailedChannels = New-Object System.Collections.ArrayList
     $checkBatchMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $downloaded = @{}
     foreach ($item in @(Read-DownloadedVideos)) {
@@ -1537,7 +1537,7 @@ function New-VideoHtml {
             $resolved = Resolve-ChannelId -Handle $channel -ChannelUrl (Get-ChannelUrl $channel) -Cache $channelIdCache
             if ($resolved.Id -eq '') {
                 $failures++
-                [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not resolve channel id'})
+                [void]$script:htmlFailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not resolve channel id'})
                 continue
             }
             $htmlChannelIds[$channel] = $resolved.Id
@@ -1601,8 +1601,8 @@ function New-VideoHtml {
         }
     }
     $scanResults = New-Object object[] $channels.Count
-    $html3Updates = New-Object System.Collections.ArrayList
-    Write-Html3Progress -Path $ProgressPath -Completed 0 -Total $channels.Count
+    $htmlUpdates = New-Object System.Collections.ArrayList
+    Write-HtmlProgress -Path $ProgressPath -Completed 0 -Total $channels.Count
     $completedScans = 0
     $workers = New-Object System.Collections.ArrayList
     $scanCookieFiles = New-Object System.Collections.ArrayList
@@ -1621,12 +1621,12 @@ function New-VideoHtml {
                 $channel = [string]$channels[$nextIndex]
                 if ($skipYtDlp.ContainsKey($channel)) {
                     $scanResults[$nextIndex] = @{ Output=@(); ExitCode=0; FeedOnly=$true }
-                    $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @() -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
+                    $fragment = Get-HtmlChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @() -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
                     $fragmentName = "$nextIndex.html"
-                    [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
-                    [void]$html3Updates.Add(@{ channel=$channel; fragment=$nextIndex })
+                    [System.IO.File]::WriteAllText((Join-Path $HtmlFragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
+                    [void]$htmlUpdates.Add(@{ channel=$channel; fragment=$nextIndex })
                     $completedScans++
-                    Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates)
+                    Write-HtmlProgress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($htmlUpdates)
                     $freeSlots.Enqueue($slot)
                     $nextIndex++
                     continue
@@ -1652,14 +1652,14 @@ function New-VideoHtml {
                     if (-not $worker.Done) { continue }
                     $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
                     $channel = [string]$channels[$worker.Index]
-                    $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @($worker.Output) -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
+                    $fragment = Get-HtmlChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @($worker.Output) -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
                     $fragmentName = "$($worker.Index).html"
-                    [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
-                    [void]$html3Updates.Add(@{ channel=$channel; fragment=$worker.Index })
+                    [System.IO.File]::WriteAllText((Join-Path $HtmlFragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
+                    [void]$htmlUpdates.Add(@{ channel=$channel; fragment=$worker.Index })
                     $freeSlots.Enqueue($worker.Slot)
                     $workers.RemoveAt($workerIndex)
                     $completedScans++
-                    Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates)
+                    Write-HtmlProgress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($htmlUpdates)
                 }
             }
         }
@@ -1705,7 +1705,7 @@ function New-VideoHtml {
         else {
             [Console]::Error.WriteLine("Warning: could not incrementally scan the videos tab for @$channel; using cached entries")
             $failures++
-            [void]$script:html3FailedChannels.Add([pscustomobject]@{
+            [void]$script:htmlFailedChannels.Add([pscustomobject]@{
                 channel = $channel
                 stage = 'could not scan videos tab; using cached entries'
             })
@@ -1742,7 +1742,7 @@ function New-VideoHtml {
         if ($scan.ExitCode -notin @(0, 101)) {
             [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel")
             $failures++
-            [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not scan videos tab'})
+            [void]$script:htmlFailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not scan videos tab'})
             continue
         }
         $rows = New-Object System.Collections.ArrayList
@@ -1780,9 +1780,9 @@ function New-VideoHtml {
     Save-HtmlVideoCache $videoCache
     $channelIdsStart = $sb.Length
     [void]$sb.AppendLine('<section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><div class="controls"><input id="channel-add" placeholder="@channel or UC channel id"><button id="channel-add-button" type="button">add</button></div><table class="channel-table"><thead><tr><th>Profile</th><th>Channel</th><th>Last checked</th><th>Latest video</th><th></th></tr></thead><tbody>')
-    $html3FailedChannelKeys = @{}
-    foreach ($failure in @($script:html3FailedChannels)) {
-        if ($null -ne $failure -and [string]$failure.channel -ne '') { $html3FailedChannelKeys[([string]$failure.channel).TrimStart('@')] = $true }
+    $htmlFailedChannelKeys = @{}
+    foreach ($failure in @($script:htmlFailedChannels)) {
+        if ($null -ne $failure -and [string]$failure.channel -ne '') { $htmlFailedChannelKeys[([string]$failure.channel).TrimStart('@')] = $true }
     }
     $managedChannels = @()
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
@@ -1814,13 +1814,13 @@ function New-VideoHtml {
             }
         }
         $avatar = if ($entry.Thumbnail) { '<img src="' + [System.Net.WebUtility]::HtmlEncode($entry.Thumbnail) + '" alt="" width="42" height="42" style="border-radius:50%;object-fit:cover">' } else { '' }
-        $rowClass = if ($html3FailedChannelKeys.ContainsKey($entry.Key)) { ' class="html3-channel-error"' } else { '' }
+        $rowClass = if ($htmlFailedChannelKeys.ContainsKey($entry.Key)) { ' class="html-channel-error"' } else { '' }
         [void]$sb.AppendLine('<tr' + $rowClass + '><td>' + $avatar + '</td><td><a href="' + [System.Net.WebUtility]::HtmlEncode($channelUrl) + '" target="_blank" rel="noopener noreferrer">' + [System.Net.WebUtility]::HtmlEncode($entry.Channel) + '</a></td><td>' + [System.Net.WebUtility]::HtmlEncode($checkedText) + '</td><td>' + [System.Net.WebUtility]::HtmlEncode($latestText) + '</td><td><button class="channel-delete" data-channel="' + [System.Net.WebUtility]::HtmlEncode($entry.Channel) + '" type="button">delete</button></td></tr>')
     }
     Save-ChannelCheckStatus $ChannelStatus
     [void]$sb.AppendLine('</tbody></table></section>')
     $channelIdsHtml = $sb.ToString().Substring($channelIdsStart)
-    [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath 'channels.html'), $channelIdsHtml, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $HtmlFragmentsPath 'channels.html'), $channelIdsHtml, (New-Object System.Text.UTF8Encoding($false)))
     Save-ChannelCheckStatus $ChannelStatus
     $script:htmlFailureCount = $failures
     Write-Host "Restored $restoredSelections downloaded target selection(s) in HTML."
@@ -1981,8 +1981,8 @@ function Send-CallbackResponse {
     Send-CallbackJson $Context $StatusCode @{ message = $Message }
 }
 
-# --html3 has its own shell, state document, and channel fragments.
-function Format-Html3CheckpointText {
+# --html has its own shell, state document, and channel fragments.
+function Format-HtmlCheckpointText {
     param([long]$TimestampMs)
 
     if ($TimestampMs -le 0) { return '' }
@@ -1991,51 +1991,51 @@ function Format-Html3CheckpointText {
     return 'Checkpoint: ' + $local.ToString('MM/dd/yyyy, HH:mm:ss') + ' Pacific Time (' + (Format-RelativeVideoTime $TimestampMs) + ')'
 }
 
-function Write-Html3LoadingPage {
+function Write-HtmlLoadingPage {
     param([string]$Token, [string]$Message)
 
     $safeMessage = [System.Net.WebUtility]::HtmlEncode($Message)
-    $safeCheckpoint = [System.Net.WebUtility]::HtmlEncode((Format-Html3CheckpointText (Read-CheckpointMs)))
+    $safeCheckpoint = [System.Net.WebUtility]::HtmlEncode((Format-HtmlCheckpointText (Read-CheckpointMs)))
     $page = @'
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAB/lBMVEXdZJ6vV2CXWSfUpTbsY6K7jJHCO37n0rHHeFW+kB7DP4D/AP+9klr/AAC/NnzxcK2+QIWjMFiqVar/f/+4PYPoyWndrcONNz3/P7/28N3knb7LRYb+/f3jXJrsZKK5N3jaVJPEPYDBO33nYJ4AAAD+5nC5hRGueArux1GxRXfy5+mnKmfImCz99Zvoydbn1tLTplKWN1bw2ePVpzb62mnCQn7//KK8iimkahSzeS3PmLHp1a6XR0vGlBbZtHL/f3/r2Y6bVSzw5dbixZXQaJm6eJXuZaS3Vm28NnqaNWbaw6vKmVLmu0zddqfJiGn401jWt8T/VarGZ3G/P3+0WoN/AH+NJVTVpbfvZqTAOX21ZIisdFPBU3bmosHWubKnaizJp4ybLWuqVVXBPH+7Nnu0h2SaWxeTSy/cwpLWt4/mYZ6eYQ+waUvnYqLFhVjMmGrasEvou9Dcxsa4ilHiu2nPp3LFmY7Bjhu+OHu+Zmr0aKjx45OIHFXPjqx/AADijbQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALwSMuAAAAgHRSTlPp////kv+p////zQH/AZEV//8DAv////8E///+//7+/v/+/v4A//////////////////////////////////8C////////UP9L//////////8D/wT/Av//yMv//////////wNOJf//////Q///Jf/////////////I/7////8C/+cQjRsAAAVESURBVHjanZcHVxs5FIVF3fSySbbJtjTj8TQbFzyOewNsbDAl9BpgqYH0bHr76/skjRcb0CzJOz6M/KT7zdOVZI6QxqJ8XVus968ELhkr/fVF7WaZSxH780jT6hJ1MChh1LlMAOa1259kL5ubk/V8egZCDnik1aXFohfTSNpZZzUg7VftWD5bWipRee8xiFFZe+ZhF6088AAEnmlldK+8EpAYFQj654ZCc35pd2ClfA+BAUHWDopP5zMQpNNDoWkq64dPXUO3ETRkgUsPQ3Es7w+gP9Cxh96/UXkYMjf8HoRj1B/wB2GEH+Lck84NDYVCczQo6ff7A/0IBfyyCOLphwB4joPSIQGE/B4BFgAgjr3GeAEoWAAAc4P+LODjEAOEPv4sACzggOf4hwGYwksps4AB4pieZi8BwHRqM2qP4anxigCY45SnN+1XUxTT/wFQ+n3YB4HHfI8rYgrMBEjbLD28ibrrgK+d4cdTXO6zEfzJCxND07id5owxxmvHGQDe9HVGhU8hFKfR01x0DXcqzgBgoG2djh75zADOL6w9ay3kYBY5kqJyAJMu3H11+ro/P4O+wpsLJEWs2hrpfmMXADN9juDfmAc9MYFwHKfEG2NQuUoxlQMwf/MCxsvsSZouoeKUbAHA+C9fFEsBOMcttmiKNxbu7tuCkH85wgEqX4kYlgAwFR6nqMIBL8wH2y4gzmupLburgL0BhPbwkaMzTukxT42+zHetbVSyjBbfKrHnpjnKZaZjvuCTOEpOcOG7ddfYTeU8AAwi4n3/OAKQNx0nzlPxCAfsZ/qyW8KWdz1M8B8A2qmNK5PJJwIwIwAjLccx37KaIgIwmUwm0zfELOJ69ul4ikMQxuNXJlvmzIwZF5a5UwCSM8NSbzsAyazYpXakWCy+BwjGDLA+2WdCRMQMW60j4R2kAGBnk318K09GIPQ3YosbxaKuZ7d6OADfJ83C0/TLpNhx+SQfH3vSMk3IvMsm05z8hgEiGd7ePtmqFprkDhYAbFmkuZMoHAqL3sKqvd7Pxk2zL++LbaUjab6RtnUoO2JwpwpLzSaxLNwGMIRFyJdae6m3mdzsK/ns9WwknXaP5lE8nj4YYAdzCdSWULoAAVlyD3IsmzTNVgtO4UQmctWdN4vHiSX2kjVyquoAwFaw3O1vT4zmed2+Sd2tmh+UBAnDPo916LsBQBj2dcdIOq3vu+fSNx7GBIpEcgAmJOcW4WufRUPPVJ8us29fw5idmOFO/VkAToXJWm72dXR2IFGwXYKhH35pLuSWQajCDGqeAECQMA/ye68ofeSGUbhvQRZjBQqIhrE3oB13LKPq/iIcjROVpRQMFlnkkoAUyaYP1l+7vwFf4RdNHQN9rbsADwAmvcW0cbA+0TZ1mO+SHLk8oHD1fVE/6e0dmLVP13X5BwAJ/b2u60amd6lprdVqAzb8cyFn9J4AsgVnFhYxQwhbGTgAsDb48oAUqbICDKNKUi7xglGegIIAFFzAheEBUEnCYIBMQuwCCUCB/QGBzz8VQjIMcEIIS144DivoGv9+YRBmgmEcAkAW+Boa9AIUGKDgBRhEu4qqSnq5CdwCmV5VdtH8KhAkQXYyunFAiHSAsjqPtF0sB4SrunEYlgPwLtyZFj9ISyAwByMhr0BZXSzDpWsP7GKj+af7CYAMA1zUrxJF3YNLl/a31gC7JLGTOdmR9alKA8T84tlQFcmgcLUalnQpakNcPNnVd29QkSASCYlcGdxrX301KERrrKryiZwvXl1tcJkL0BZvat8atz5cFvDhVuObdn2RX///BQWVQ1G7ZU7MAAAAAElFTkSuQmCC"><style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0}.channel-title h2 a{color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:disabled,input:disabled{opacity:.55;cursor:wait}.controls,.checks,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.controls button{padding:4px 9px}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.preview{aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks{margin-top:8px;color:var(--mut)}.video-age{font-size:11px;color:var(--mut);margin-top:3px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:0;display:none;font-size:34px;font-weight:700}.back-to-top.visible{display:flex;align-items:center;justify-content:center}#html3-progress{margin:10px 0 16px}.html3-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html3-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body><h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value"></span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">__MESSAGE__</p></div><main></main><button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button><script>(()=>{const token="__TOKEN__",base="/html3/"+token,stateUrl=base+"state",fragmentUrl=i=>base+"fragment/"+i,api=n=>"/"+n+"/"+token,controls=[...document.querySelectorAll("button,input")],top=document.querySelector("#back-to-top"),status=document.querySelector("#status"),log=document.querySelector("#job-log"),applied=new Set(),saved=new Set();const key=x=>x.dataset.channelId+"|"+x.dataset.videoId+"|"+x.className,remember=()=>document.querySelectorAll("input.y1:checked,input.y2:checked").forEach(x=>saved.add(key(x))),setBusy=b=>controls.forEach(x=>{if(x!==top)x.disabled=b});const apply=async u=>{if(!u||applied.has(u.channel))return;const r=await fetch(fragmentUrl(u.fragment),{cache:"no-store"});if(!r.ok)return;const text=await r.text(),old=[...document.querySelectorAll("section.channel")].find(x=>x.dataset.html3Channel===u.channel);applied.add(u.channel);if(!text){if(old)old.remove();return}remember();const t=document.createElement("template");t.innerHTML=text;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").prepend(fresh);fresh.querySelectorAll("input.y1,input.y2").forEach(x=>{if(saved.has(key(x)))x.checked=true});fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)};const poll=async()=>{try{const s=await (await fetch(stateUrl,{cache:"no-store"})).json(),bar=document.querySelector(".html3-progress-bar");document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";if(s.total)bar.style.width=Math.min(100,100*(s.completed||0)/s.total)+"%";for(const u of s.updates||[])await apply(u);if(s.status==="success"){setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return}if(s.status==="error"){status.textContent=s.error||"Page generation failed.";return}}catch(e){status.textContent="Progress unavailable: "+e.message}setTimeout(poll,500)};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(!b)return;(b.closest(".channel")||document).querySelectorAll("input.y1,input.y2").forEach(x=>x.checked=b.dataset.action!=="none"&&x.className===b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started"};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch(api("checkpoint"),{method:"POST"})).json();status.textContent=b.message;document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?"Checkpoint: "+b.checkpoint_ms:""};const refresh=async all=>{remember();setBusy(true);const b=await (await fetch(api(all?"refresh-all":"refresh"),{method:"POST"})).json();status.textContent=b.message||"Refreshing";applied.clear();poll()};document.querySelector("#refresh").onclick=()=>refresh(false);document.querySelector("#refresh-all").onclick=()=>refresh(true);document.querySelector("#stop").onclick=async()=>{await fetch(api("stop"),{method:"POST"});window.close();location.replace("about:blank")};top.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});const toggle=()=>top.classList.toggle("visible",scrollY>200);addEventListener("scroll",toggle,{passive:true});top.disabled=false;setBusy(true);poll()})()</script></body></html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAB/lBMVEXdZJ6vV2CXWSfUpTbsY6K7jJHCO37n0rHHeFW+kB7DP4D/AP+9klr/AAC/NnzxcK2+QIWjMFiqVar/f/+4PYPoyWndrcONNz3/P7/28N3knb7LRYb+/f3jXJrsZKK5N3jaVJPEPYDBO33nYJ4AAAD+5nC5hRGueArux1GxRXfy5+mnKmfImCz99Zvoydbn1tLTplKWN1bw2ePVpzb62mnCQn7//KK8iimkahSzeS3PmLHp1a6XR0vGlBbZtHL/f3/r2Y6bVSzw5dbixZXQaJm6eJXuZaS3Vm28NnqaNWbaw6vKmVLmu0zddqfJiGn401jWt8T/VarGZ3G/P3+0WoN/AH+NJVTVpbfvZqTAOX21ZIisdFPBU3bmosHWubKnaizJp4ybLWuqVVXBPH+7Nnu0h2SaWxeTSy/cwpLWt4/mYZ6eYQ+waUvnYqLFhVjMmGrasEvou9Dcxsa4ilHiu2nPp3LFmY7Bjhu+OHu+Zmr0aKjx45OIHFXPjqx/AADijbQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALwSMuAAAAgHRSTlPp////kv+p////zQH/AZEV//8DAv////8E///+//7+/v/+/v4A//////////////////////////////////8C////////UP9L//////////8D/wT/Av//yMv//////////wNOJf//////Q///Jf/////////////I/7////8C/+cQjRsAAAVESURBVHjanZcHVxs5FIVF3fSySbbJtjTj8TQbFzyOewNsbDAl9BpgqYH0bHr76/skjRcb0CzJOz6M/KT7zdOVZI6QxqJ8XVus968ELhkr/fVF7WaZSxH780jT6hJ1MChh1LlMAOa1259kL5ubk/V8egZCDnik1aXFohfTSNpZZzUg7VftWD5bWipRee8xiFFZe+ZhF6088AAEnmlldK+8EpAYFQj654ZCc35pd2ClfA+BAUHWDopP5zMQpNNDoWkq64dPXUO3ETRkgUsPQ3Es7w+gP9Cxh96/UXkYMjf8HoRj1B/wB2GEH+Lck84NDYVCczQo6ff7A/0IBfyyCOLphwB4joPSIQGE/B4BFgAgjr3GeAEoWAAAc4P+LODjEAOEPv4sACzggOf4hwGYwksps4AB4pieZi8BwHRqM2qP4anxigCY45SnN+1XUxTT/wFQ+n3YB4HHfI8rYgrMBEjbLD28ibrrgK+d4cdTXO6zEfzJCxND07id5owxxmvHGQDe9HVGhU8hFKfR01x0DXcqzgBgoG2djh75zADOL6w9ay3kYBY5kqJyAJMu3H11+ro/P4O+wpsLJEWs2hrpfmMXADN9juDfmAc9MYFwHKfEG2NQuUoxlQMwf/MCxsvsSZouoeKUbAHA+C9fFEsBOMcttmiKNxbu7tuCkH85wgEqX4kYlgAwFR6nqMIBL8wH2y4gzmupLburgL0BhPbwkaMzTukxT42+zHetbVSyjBbfKrHnpjnKZaZjvuCTOEpOcOG7ddfYTeU8AAwi4n3/OAKQNx0nzlPxCAfsZ/qyW8KWdz1M8B8A2qmNK5PJJwIwIwAjLccx37KaIgIwmUwm0zfELOJ69ul4ikMQxuNXJlvmzIwZF5a5UwCSM8NSbzsAyazYpXakWCy+BwjGDLA+2WdCRMQMW60j4R2kAGBnk318K09GIPQ3YosbxaKuZ7d6OADfJ83C0/TLpNhx+SQfH3vSMk3IvMsm05z8hgEiGd7ePtmqFprkDhYAbFmkuZMoHAqL3sKqvd7Pxk2zL++LbaUjab6RtnUoO2JwpwpLzSaxLNwGMIRFyJdae6m3mdzsK/ns9WwknXaP5lE8nj4YYAdzCdSWULoAAVlyD3IsmzTNVgtO4UQmctWdN4vHiSX2kjVyquoAwFaw3O1vT4zmed2+Sd2tmh+UBAnDPo916LsBQBj2dcdIOq3vu+fSNx7GBIpEcgAmJOcW4WufRUPPVJ8us29fw5idmOFO/VkAToXJWm72dXR2IFGwXYKhH35pLuSWQajCDGqeAECQMA/ye68ofeSGUbhvQRZjBQqIhrE3oB13LKPq/iIcjROVpRQMFlnkkoAUyaYP1l+7vwFf4RdNHQN9rbsADwAmvcW0cbA+0TZ1mO+SHLk8oHD1fVE/6e0dmLVP13X5BwAJ/b2u60amd6lprdVqAzb8cyFn9J4AsgVnFhYxQwhbGTgAsDb48oAUqbICDKNKUi7xglGegIIAFFzAheEBUEnCYIBMQuwCCUCB/QGBzz8VQjIMcEIIS144DivoGv9+YRBmgmEcAkAW+Boa9AIUGKDgBRhEu4qqSnq5CdwCmV5VdtH8KhAkQXYyunFAiHSAsjqPtF0sB4SrunEYlgPwLtyZFj9ISyAwByMhr0BZXSzDpWsP7GKj+af7CYAMA1zUrxJF3YNLl/a31gC7JLGTOdmR9alKA8T84tlQFcmgcLUalnQpakNcPNnVd29QkSASCYlcGdxrX301KERrrKryiZwvXl1tcJkL0BZvat8atz5cFvDhVuObdn2RX///BQWVQ1G7ZU7MAAAAAElFTkSuQmCC"><style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0}.channel-title h2 a{color:var(--acc)}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:disabled,input:disabled{opacity:.55;cursor:wait}.controls,.checks,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.controls button{padding:4px 9px}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.preview{aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks{margin-top:8px;color:var(--mut)}.video-age{font-size:11px;color:var(--mut);margin-top:3px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:0;display:none;font-size:34px;font-weight:700}.back-to-top.visible{display:flex;align-items:center;justify-content:center}#html-progress{margin:10px 0 16px}.html-progress-track{height:8px;overflow:hidden;border-radius:4px;background:#30363d}.html-progress-bar{height:100%;width:0;background:#58a6ff;transition:width .25s ease}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body><h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value"></span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><div id="html-progress" role="status" aria-live="polite"><div class="html-progress-track"><div class="html-progress-bar"></div></div><p id="html-progress-status">__MESSAGE__</p></div><main></main><button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button><script>(()=>{const token="__TOKEN__",base="/html/"+token,stateUrl=base+"state",fragmentUrl=i=>base+"fragment/"+i,api=n=>"/"+n+"/"+token,controls=[...document.querySelectorAll("button,input")],top=document.querySelector("#back-to-top"),status=document.querySelector("#status"),log=document.querySelector("#job-log"),applied=new Set(),saved=new Set();const key=x=>x.dataset.channelId+"|"+x.dataset.videoId+"|"+x.className,remember=()=>document.querySelectorAll("input.y1:checked,input.y2:checked").forEach(x=>saved.add(key(x))),setBusy=b=>controls.forEach(x=>{if(x!==top)x.disabled=b});const apply=async u=>{if(!u||applied.has(u.channel))return;const r=await fetch(fragmentUrl(u.fragment),{cache:"no-store"});if(!r.ok)return;const text=await r.text(),old=[...document.querySelectorAll("section.channel")].find(x=>x.dataset.htmlChannel===u.channel);applied.add(u.channel);if(!text){if(old)old.remove();return}remember();const t=document.createElement("template");t.innerHTML=text;const fresh=t.content.firstElementChild;if(old)old.replaceWith(fresh);else document.querySelector("main").prepend(fresh);fresh.querySelectorAll("input.y1,input.y2").forEach(x=>{if(saved.has(key(x)))x.checked=true});fresh.querySelectorAll("button,input").forEach(x=>x.disabled=false)};const poll=async()=>{try{const s=await (await fetch(stateUrl,{cache:"no-store"})).json(),bar=document.querySelector(".html-progress-bar");document.querySelector("#html-progress-status").textContent=s.message||"Loading channels...";if(s.total)bar.style.width=Math.min(100,100*(s.completed||0)/s.total)+"%";for(const u of s.updates||[])await apply(u);if(s.status==="success"){setBusy(false);document.querySelector("#html-progress-status").textContent="Page ready.";return}if(s.status==="error"){status.textContent=s.error||"Page generation failed.";return}}catch(e){status.textContent="Progress unavailable: "+e.message}setTimeout(poll,500)};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(!b)return;(b.closest(".channel")||document).querySelectorAll("input.y1,input.y2").forEach(x=>x.checked=b.dataset.action!=="none"&&x.className===b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started"};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch(api("checkpoint"),{method:"POST"})).json();status.textContent=b.message;document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?"Checkpoint: "+b.checkpoint_ms:""};const refresh=async all=>{remember();setBusy(true);const b=await (await fetch(api(all?"refresh-all":"refresh"),{method:"POST"})).json();status.textContent=b.message||"Refreshing";applied.clear();poll()};document.querySelector("#refresh").onclick=()=>refresh(false);document.querySelector("#refresh-all").onclick=()=>refresh(true);document.querySelector("#stop").onclick=async()=>{await fetch(api("stop"),{method:"POST"});window.close();location.replace("about:blank")};top.onclick=()=>window.scrollTo({top:0,behavior:"smooth"});const toggle=()=>top.classList.toggle("visible",scrollY>200);addEventListener("scroll",toggle,{passive:true});top.disabled=false;setBusy(true);poll()})()</script></body></html>
 '@
     $page = $page.Replace('__TOKEN__', $Token).Replace('__MESSAGE__', $safeMessage)
     $page = $page.Replace('<span id="checkpoint-value"></span>', '<span id="checkpoint-value">__CHECKPOINT__</span>')
     $page = $page.Replace('stateUrl=base+"state",fragmentUrl=i=>base+"fragment/"+i', 'stateUrl=base+"/state",fragmentUrl=i=>base+"/fragment/"+i')
     $page = $page.Replace('border-bottom:3px solid var(--acc);padding-bottom:8px', 'padding-bottom:0')
-    $page = $page.Replace('</h1><p>Select', '</h1><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">__MESSAGE__</p></div><p>Select')
-    $duplicateProgress = '<pre id="job-log" class="job-log"></pre><div id="html3-progress" role="status" aria-live="polite"><div class="html3-progress-track"><div class="html3-progress-bar"></div></div><p id="html3-progress-status">' + $safeMessage + '</p></div>'
+    $page = $page.Replace('</h1><p>Select', '</h1><div id="html-progress" role="status" aria-live="polite"><div class="html-progress-track"><div class="html-progress-bar"></div></div><p id="html-progress-status">__MESSAGE__</p></div><p>Select')
+    $duplicateProgress = '<pre id="job-log" class="job-log"></pre><div id="html-progress" role="status" aria-live="polite"><div class="html-progress-track"><div class="html-progress-bar"></div></div><p id="html-progress-status">' + $safeMessage + '</p></div>'
     $page = $page.Replace($duplicateProgress, '<pre id="job-log" class="job-log"></pre>')
     $page = $page.Replace('<main></main>', '<main><section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><p>Loading Channel IDs...</p></section></main>')
-    $page = $page.Replace('<p id="status"></p>', '<p id="status"></p><div id="html3-error-panel" role="alert" aria-live="assertive" hidden><div id="html3-errors"></div></div>')
-    $page = $page.Replace('</style></head>', '<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}.channel-table tr.html3-channel-error td{background:#a64020;border-bottom-color:#d65a31;color:#fff}.channel-table tr.html3-channel-error a{color:#fff}#channel-add{width:27em}h2{color:var(--acc)}.channel-title h2 a{text-decoration:underline;text-underline-offset:3px}button:hover{border-color:var(--acc);background:#1c2230}.video-link:hover{color:var(--acc)}.preview{position:relative}.preview img{transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.back-to-top{border:none;box-shadow:0 2px 8px rgba(0,0,0,.45)}.back-to-top:hover{background:#79c0ff}#html3-error-panel{position:fixed;z-index:10;top:18px;left:50%;transform:translateX(-50%);max-width:min(720px,calc(100vw - 32px));padding:16px 20px;border:2px solid #ff7b72;border-radius:8px;background:#1b1114;box-shadow:0 8px 28px rgba(0,0,0,.55);color:#ff7b72;font-size:18px}#html3-error-panel[hidden]{display:none}</style></head>')
+    $page = $page.Replace('<p id="status"></p>', '<p id="status"></p><div id="html-error-panel" role="alert" aria-live="assertive" hidden><div id="html-errors"></div></div>')
+    $page = $page.Replace('</style></head>', '<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}.channel-table tr.html-channel-error td{background:#a64020;border-bottom-color:#d65a31;color:#fff}.channel-table tr.html-channel-error a{color:#fff}#channel-add{width:27em}h2{color:var(--acc)}.channel-title h2 a{text-decoration:underline;text-underline-offset:3px}button:hover{border-color:var(--acc);background:#1c2230}.video-link:hover{color:var(--acc)}.preview{position:relative}.preview img{transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.back-to-top{border:none;box-shadow:0 2px 8px rgba(0,0,0,.45)}.back-to-top:hover{background:#79c0ff}#html-error-panel{position:fixed;z-index:10;top:18px;left:50%;transform:translateX(-50%);max-width:min(720px,calc(100vw - 32px));padding:16px 20px;border:2px solid #ff7b72;border-radius:8px;background:#1b1114;box-shadow:0 8px 28px rgba(0,0,0,.55);color:#ff7b72;font-size:18px}#html-error-panel[hidden]{display:none}</style></head>')
     $page = $page.Replace('fragmentUrl=i=>base+"/fragment/"+i,api', 'fragmentUrl=i=>base+"/fragment/"+i,channelsUrl=base+"/channels",api')
     $page = $page.Replace('else document.querySelector("main").prepend(fresh)', 'else document.querySelector("main").insertBefore(fresh,document.querySelector("#channel-ids"))')
     $page = $page.Replace('background:#a64020;border-bottom-color:#d65a31', 'background:#3C050F;border-bottom-color:#7a1828')
     $page = $page.Replace('document.querySelector("#stop").onclick=async()=>{await fetch(api("stop"),{method:"POST"});window.close();location.replace("about:blank")}', 'document.querySelector("#stop").onclick=async()=>{if(!window.confirm("Stop the local server? Active downloads will continue."))return;try{const b=await (await fetch(api("stop"),{method:"POST"})).json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)}')
-    $page = $page.Replace('status=document.querySelector("#status"),log=', 'status=document.querySelector("#status"),errors=document.querySelector("#html3-errors"),errorPanel=document.querySelector("#html3-error-panel"),log=')
-    $page = $page.Replace('const key=x=>', 'let html3Failures=[];const html3FailureSummary=()=>html3Failures.length?"Completed with channel errors: "+html3Failures.map(x=>"@"+x.channel+" ("+x.stage+")").join(", "):"";const compactLogs=logs=>{const buckets=new Map(),percents=new Map();return logs.filter(line=>{if(/^\[y[12]\]\s*$/.test(line))return false;const m=line.match(/^(\[[^\]]+\])\s+\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);if(!m)return true;const target=m[1],percent=Number(m[2]),previous=percents.get(target);if(previous!==undefined&&percent<previous-1)buckets.set(target,-1);percents.set(target,percent);const bucket=Math.floor(percent/10),last=buckets.has(target)?buckets.get(target):-1,emit=bucket>last||percent>=100;if(emit)buckets.set(target,bucket);return emit})};const showJobs=async()=>{let again=false;try{const b=await (await fetch(api("status"),{cache:"no-store"})).json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";log.textContent=compactLogs(b.logs||[]).join("\n");log.scrollTop=log.scrollHeight;if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};const key=x=>')
+    $page = $page.Replace('status=document.querySelector("#status"),log=', 'status=document.querySelector("#status"),errors=document.querySelector("#html-errors"),errorPanel=document.querySelector("#html-error-panel"),log=')
+    $page = $page.Replace('const key=x=>', 'let htmlFailures=[];const htmlFailureSummary=()=>htmlFailures.length?"Completed with channel errors: "+htmlFailures.map(x=>"@"+x.channel+" ("+x.stage+")").join(", "):"";const compactLogs=logs=>{const buckets=new Map(),percents=new Map();return logs.filter(line=>{if(/^\[y[12]\]\s*$/.test(line))return false;const m=line.match(/^(\[[^\]]+\])\s+\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/);if(!m)return true;const target=m[1],percent=Number(m[2]),previous=percents.get(target);if(previous!==undefined&&percent<previous-1)buckets.set(target,-1);percents.set(target,percent);const bucket=Math.floor(percent/10),last=buckets.has(target)?buckets.get(target):-1,emit=bucket>last||percent>=100;if(emit)buckets.set(target,bucket);return emit})};const showJobs=async()=>{let again=false;try{const b=await (await fetch(api("status"),{cache:"no-store"})).json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";log.textContent=compactLogs(b.logs||[]).join("\n");log.scrollTop=log.scrollHeight;if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};const key=x=>')
     $page = $page.Replace('setBusy=b=>controls.forEach(x=>{if(x!==top)x.disabled=b})', 'setBusy=b=>document.querySelectorAll("button,input").forEach(x=>{if(x!==top)x.disabled=b})')
     $page = $page.Replace('const key=x=>', 'const relativeCheckpoint=ms=>{const s=Math.max(0,Math.floor((Date.now()-Number(ms))/1000)),u=[[31536000,"year"],[2592000,"month"],[604800,"week"],[86400,"day"],[3600,"hour"],[60,"minute"]];if(s<60)return "just now";for(const[d,n]of u)if(s>=d){const x=Math.floor(s/d);return x+" "+n+(x===1?"":"s")+" ago"}},checkpointText=ms=>{if(!ms)return "";const d=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hourCycle:"h23"}).format(new Date(Number(ms)));return "Checkpoint: "+d+" Pacific Time ("+relativeCheckpoint(ms)+")"};const key=x=>')
     $page = $page.Replace('document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?"Checkpoint: "+b.checkpoint_ms:""', 'document.querySelector("#checkpoint-value").textContent=b.checkpoint_ms?checkpointText(b.checkpoint_ms):""')
     $page = $page.Replace(';const poll=async()=>', ';const applyChannelIds=async()=>{const r=await fetch(channelsUrl,{cache:"no-store"});if(!r.ok)return;const t=document.createElement("template");t.innerHTML=await r.text();const fresh=t.content.firstElementChild,old=document.querySelector("#channel-ids");if(fresh&&old)old.replaceWith(fresh)};const poll=async()=>')
     $page = $page.Replace('for(const u of s.updates||[])await apply(u);', 'for(const u of (Array.isArray(s.updates)?s.updates:(s.updates?[s.updates]:[])))await apply(u);')
-    $page = $page.Replace('document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";', 'bar.classList.toggle("loading",s.status==="running");if(s.status==="running")document.querySelector("#html3-progress-status").textContent=s.message||"Loading channels...";')
+    $page = $page.Replace('document.querySelector("#html-progress-status").textContent=s.message||"Loading channels...";', 'bar.classList.toggle("loading",s.status==="running");if(s.status==="running")document.querySelector("#html-progress-status").textContent=s.message||"Loading channels...";')
     $page = $page.Replace('if(s.total)bar.style.width=Math.min(100,100*(s.completed||0)/s.total)+"%";', 'if(s.total){const partial=s.status==="running"?.5:0;bar.style.width=Math.min(100,100*((s.completed||0)+partial)/s.total)+"%";}')
-    $page = $page.Replace('setBusy(false);document.querySelector("#html3-progress-status").textContent="Page ready.";return', 'await applyChannelIds();setBusy(false);document.querySelector("#html3-progress-status").textContent="";html3Failures=Array.isArray(s.failed_channels)?s.failed_channels:(s.failed_channels?[s.failed_channels]:[]);errors.textContent=html3FailureSummary();errorPanel.hidden=!html3Failures.length;return')
+    $page = $page.Replace('setBusy(false);document.querySelector("#html-progress-status").textContent="Page ready.";return', 'await applyChannelIds();setBusy(false);document.querySelector("#html-progress-status").textContent="";htmlFailures=Array.isArray(s.failed_channels)?s.failed_channels:(s.failed_channels?[s.failed_channels]:[]);errors.textContent=htmlFailureSummary();errorPanel.hidden=!htmlFailures.length;return')
     $page = $page.Replace('x.checked=b.dataset.action!=="none"&&x.className===b.dataset.action', '{if(b.dataset.action==="none")x.checked=false;else if(x.className===b.dataset.action)x.checked=true}')
     $page = $page.Replace('});document.querySelector("#download")', '});document.addEventListener("click",async e=>{const add=e.target.closest("#channel-add-button"),remove=e.target.closest(".channel-delete");if(!add&&!remove)return;const payload=add?{action:"add",channel:document.querySelector("#channel-add").value.trim()}:{action:"delete",channel:remove.dataset.channel};if(!payload.channel)return;const b=await (await fetch(api("channel"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})).json();status.textContent=b.message||"Channel IDs updated.";if(b.message)setTimeout(()=>refresh(false),0)});document.querySelector("#download")')
     $page = $page.Replace('if(!items.length){status.textContent="Select at least one video";return}const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started"', 'if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const b=await (await fetch(api("download"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})})).json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}')
-    $page = $page.Replace('const refresh=async all=>{remember();setBusy(true);', 'const refresh=async all=>{remember();html3Failures=[];errors.textContent="";errorPanel.hidden=true;setBusy(true);')
+    $page = $page.Replace('const refresh=async all=>{remember();setBusy(true);', 'const refresh=async all=>{remember();htmlFailures=[];errors.textContent="";errorPanel.hidden=true;setBusy(true);')
     $page = $page.Replace('top.disabled=false;setBusy(true);poll()', 'top.disabled=false;document.addEventListener("click",e=>{if(!errorPanel.hidden&&!errorPanel.contains(e.target))errorPanel.hidden=true});setInterval(()=>fetch(api("heartbeat"),{method:"POST",keepalive:true}),2000);showJobs();setBusy(true);poll()')
-    $page = $page.Replace('#html3-progress{margin:10px 0 16px}', '#html3-progress{margin:0 0 16px}')
-    $page = $page.Replace('</head>', '<style>.html3-progress-bar{position:relative;overflow:hidden}.html3-progress-bar.loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);animation:html3-progress-shimmer 1.2s linear infinite}@keyframes html3-progress-shimmer{to{transform:translateX(100%)}}</style></head>')
+    $page = $page.Replace('#html-progress{margin:10px 0 16px}', '#html-progress{margin:0 0 16px}')
+    $page = $page.Replace('</head>', '<style>.html-progress-bar{position:relative;overflow:hidden}.html-progress-bar.loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);animation:html-progress-shimmer 1.2s linear infinite}@keyframes html-progress-shimmer{to{transform:translateX(100%)}}</style></head>')
     $page = $page.Replace('__MESSAGE__', $safeMessage)
     $page = $page.Replace('__CHECKPOINT__', $safeCheckpoint)
-    [System.IO.File]::WriteAllText((Join-Path $temporaryDirectory 'yy-html3.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText((Join-Path $temporaryDirectory 'yy-html.html'), $page, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function Write-Html3Progress {
+function Write-HtmlProgress {
     param([string]$Path, [int]$Completed, [int]$Total, $Updates = @())
 
     $temporary = $Path + '.new.' + $PID
@@ -2046,7 +2046,7 @@ function Write-Html3Progress {
     finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
 }
 
-function Set-Html3WorkerState {
+function Set-HtmlWorkerState {
     param([string]$Path, [string]$Status, [string]$Message, [string]$Error = '', $FailedChannels = @())
 
     $current = $null
@@ -2072,27 +2072,27 @@ function Remove-StaleTemporaryArtifacts {
     if ($stale.Count -gt 0) { Write-Host "Pruned $($stale.Count) temporary HTML/yt-dlp artifact(s) older than 45 days." }
 }
 
-function Start-Html3Worker {
+function Start-HtmlWorker {
     param([string]$Token, [switch]$RefreshAll)
 
     # Reset the state before the child starts so a refresh cannot expose the
     # previous run's explicit success result during process startup.
-    Write-Html3Progress -Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token + '.json')) -Completed 0 -Total 0
+    Write-HtmlProgress -Path (Join-Path $temporaryDirectory ('yy-html-' + $Token + '.json')) -Completed 0 -Total 0
     $safeScriptPath = $PSCommandPath.Replace("'", "''")
     $safeToken = $Token.Replace("'", "''")
-    $command = "& '$safeScriptPath' '--html3-worker' '$safeToken'"
+    $command = "& '$safeScriptPath' '--html-worker' '$safeToken'"
     if ($RefreshAll) { $command += " '--refresh-all'" }
     # Merge every PowerShell stream before redirecting it.  In particular,
     # New-VideoHtml uses Write-Host, which otherwise disappears with the
     # hidden worker process.
     $command += ' *>&1; exit $LASTEXITCODE'
     $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($command))
-    $logBase = Join-Path $temporaryDirectory ('yy-html3-worker-' + $Token)
+    $logBase = Join-Path $temporaryDirectory ('yy-html-worker-' + $Token)
     $process = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @('-NoProfile', '-OutputFormat', 'Text', '-EncodedCommand', $encodedCommand) -RedirectStandardOutput ($logBase + '.out') -RedirectStandardError ($logBase + '.err') -PassThru
     return [pscustomobject]@{ Process=$process; OutputPath=($logBase + '.out'); ErrorPath=($logBase + '.err'); OutputLines=0; ErrorLines=0; Succeeded=$false }
 }
 
-function Write-Html3WorkerLogs {
+function Write-HtmlWorkerLogs {
     param($Worker)
 
     if ($null -eq $Worker) { return }
@@ -2119,7 +2119,7 @@ function Invoke-HtmlCallbackServer {
     $script:htmlStopRequested = $false
     $script:htmlActiveJobs = 0
     $script:htmlListener = $listener
-    $html3Worker = $null
+    $htmlWorker = $null
     $cancelHandler = [ConsoleCancelEventHandler]{
         param($sender, $event)
         $event.Cancel = $true
@@ -2133,8 +2133,8 @@ function Invoke-HtmlCallbackServer {
     }
     try {
         [Console]::add_CancelKeyPress($cancelHandler)
-        $html3Worker = Start-Html3Worker -Token $Token
-        Open-Html3Url "http://127.0.0.1:$htmlListenPort/" -Incognito:$Incognito
+        $htmlWorker = Start-HtmlWorker -Token $Token
+        Open-HtmlUrl "http://127.0.0.1:$htmlListenPort/" -Incognito:$Incognito
         else { Open-Url "http://127.0.0.1:$htmlListenPort/" }
         Write-Host "Waiting for DOWNLOAD SELECTED on http://127.0.0.1:$htmlListenPort/ (Ctrl+C or STOP SERVER exits)"
         # A browser that navigates away, reloads, or is closed resets the
@@ -2148,7 +2148,7 @@ function Invoke-HtmlCallbackServer {
             $pending = $listener.BeginGetContext($null, $null)
             try {
                 while (-not $pending.AsyncWaitHandle.WaitOne(1000)) {
-                    Write-Html3WorkerLogs $html3Worker
+                    Write-HtmlWorkerLogs $htmlWorker
                     if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
                     # Never abandon a download that is still running or queued
                     # just because the browser throttled its timers while the
@@ -2172,7 +2172,7 @@ function Invoke-HtmlCallbackServer {
                 throw
             }
             if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq '/') {
-                $pageName = 'yy-html3.html'
+                $pageName = 'yy-html.html'
                 $body = [System.IO.File]::ReadAllBytes((Join-Path $temporaryDirectory $pageName))
                 $context.Response.ContentType = 'text/html; charset=utf-8'
                 $context.Response.ContentLength64 = $body.Length
@@ -2184,9 +2184,9 @@ function Invoke-HtmlCallbackServer {
                 Send-CallbackJson $context 200 (Get-DownloadJobStatus $jobs $serverLogs)
                 continue
             }
-            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/state") {
-                Write-Html3WorkerLogs $html3Worker
-                $progressPath = Join-Path $temporaryDirectory ('yy-html3-' + $Token + '.json')
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html/$Token/state") {
+                Write-HtmlWorkerLogs $htmlWorker
+                $progressPath = Join-Path $temporaryDirectory ('yy-html-' + $Token + '.json')
                 if (Test-Path -LiteralPath $progressPath) {
                     try { Send-CallbackJson $context 200 (Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
                     catch { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
@@ -2194,8 +2194,8 @@ function Invoke-HtmlCallbackServer {
                 else { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
                 continue
             }
-            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\d+)$')) {
-                $fragmentPath = Join-Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token)) ($Matches[1] + '.html')
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html/' + [regex]::Escape($Token) + '/fragment/(\d+)$')) {
+                $fragmentPath = Join-Path (Join-Path $temporaryDirectory ('yy-html-' + $Token)) ($Matches[1] + '.html')
                 if (-not (Test-Path -LiteralPath $fragmentPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
                 $body = [System.IO.File]::ReadAllBytes($fragmentPath)
                 $context.Response.ContentType = 'text/html; charset=utf-8'
@@ -2204,8 +2204,8 @@ function Invoke-HtmlCallbackServer {
                 $context.Response.Close()
                 continue
             }
-            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/channels") {
-                $channelsPath = Join-Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token)) 'channels.html'
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html/$Token/channels") {
+                $channelsPath = Join-Path (Join-Path $temporaryDirectory ('yy-html-' + $Token)) 'channels.html'
                 if (-not (Test-Path -LiteralPath $channelsPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
                 $body = [System.IO.File]::ReadAllBytes($channelsPath)
                 $context.Response.ContentType = 'text/html; charset=utf-8'
@@ -2239,9 +2239,9 @@ function Invoke-HtmlCallbackServer {
             }
             if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -in @("/refresh/$Token", "/refresh-all/$Token")) {
                 $refreshAll = $context.Request.Url.AbsolutePath -eq "/refresh-all/$Token"
-                if ($null -ne $html3Worker -and -not $html3Worker.Process.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
-                Write-Html3LoadingPage -Token $Token -Message $(if ($refreshAll) { 'Refreshing all channels...' } else { 'Refreshing channels...' })
-                $html3Worker = Start-Html3Worker -Token $Token -RefreshAll:$refreshAll
+                if ($null -ne $htmlWorker -and -not $htmlWorker.Process.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
+                Write-HtmlLoadingPage -Token $Token -Message $(if ($refreshAll) { 'Refreshing all channels...' } else { 'Refreshing channels...' })
+                $htmlWorker = Start-HtmlWorker -Token $Token -RefreshAll:$refreshAll
                 Send-CallbackResponse $context 202 'Refreshing page.'
                 continue
             }
@@ -2293,9 +2293,9 @@ function Invoke-HtmlCallbackServer {
     finally {
         [Console]::remove_CancelKeyPress($cancelHandler)
         $script:htmlListener = $null
-        if ($null -ne $html3Worker) {
-            if (-not $html3Worker.Process.HasExited) { Stop-ProcessTree -ProcessId $html3Worker.Process.Id }
-            Write-Html3WorkerLogs $html3Worker
+        if ($null -ne $htmlWorker) {
+            if (-not $htmlWorker.Process.HasExited) { Stop-ProcessTree -ProcessId $htmlWorker.Process.Id }
+            Write-HtmlWorkerLogs $htmlWorker
         }
         if ($listener.IsListening) { $listener.Stop() }
         $listener.Close()
@@ -2450,40 +2450,40 @@ $openChannelCount = 0
 $checkpointAfterChecksMs = [long]0
 $channelCheckStatus = Read-ChannelCheckStatus
 Remove-StaleChannelCheckStatus $channelCheckStatus
-if ($OpenMode -eq 'html3-worker') {
+if ($OpenMode -eq 'html-worker') {
     $workerStatus = Read-ChannelCheckStatus
-    $workerProgressPath = Join-Path $temporaryDirectory ('yy-html3-' + $Html3WorkerToken + '.json')
-    $workerFragmentsPath = Join-Path $temporaryDirectory ('yy-html3-' + $Html3WorkerToken)
+    $workerProgressPath = Join-Path $temporaryDirectory ('yy-html-' + $HtmlWorkerToken + '.json')
+    $workerFragmentsPath = Join-Path $temporaryDirectory ('yy-html-' + $HtmlWorkerToken)
     try {
         if (Test-Path -LiteralPath $workerFragmentsPath) { Remove-Item -LiteralPath $workerFragmentsPath -Recurse -Force }
         New-Item -ItemType Directory -Path $workerFragmentsPath -Force | Out-Null
-        Write-Html3Progress -Path $workerProgressPath -Completed 0 -Total 0
-        if (-not (New-VideoHtml -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath)) { throw 'Could not generate the HTML3 page.' }
-        $failedChannels = @($script:html3FailedChannels)
+        Write-HtmlProgress -Path $workerProgressPath -Completed 0 -Total 0
+        if (-not (New-VideoHtml -ChannelStatus $workerStatus -RefreshAll:$HtmlWorkerRefreshAll -ProgressPath $workerProgressPath -HtmlFragmentsPath $workerFragmentsPath)) { throw 'Could not generate the HTML page.' }
+        $failedChannels = @($script:htmlFailedChannels)
         foreach ($failedChannel in $failedChannels) {
-            Write-Host "HTML3 skipped failed channel @$($failedChannel.channel): $($failedChannel.stage)"
+            Write-Host "HTML skipped failed channel @$($failedChannel.channel): $($failedChannel.stage)"
         }
         if ($failedChannels.Count -gt 0) {
-            Write-Host ('HTML3 completed with channel errors: ' + (($failedChannels | ForEach-Object { '@' + $_.channel + ' (' + $_.stage + ')' }) -join ', '))
+            Write-Host ('HTML completed with channel errors: ' + (($failedChannels | ForEach-Object { '@' + $_.channel + ' (' + $_.stage + ')' }) -join ', '))
         }
-        else { Write-Host 'HTML3 completed with no channel errors.' }
-        Set-Html3WorkerState -Path $workerProgressPath -Status 'success' -Message '' -FailedChannels $failedChannels
+        else { Write-Host 'HTML completed with no channel errors.' }
+        Set-HtmlWorkerState -Path $workerProgressPath -Status 'success' -Message '' -FailedChannels $failedChannels
         exit 0
     }
     catch {
-        Set-Html3WorkerState -Path $workerProgressPath -Status 'error' -Message 'Page generation failed.' -Error $_.Exception.Message
-        [Console]::Error.WriteLine("HTML3 worker failed: $($_.Exception.Message)")
+        Set-HtmlWorkerState -Path $workerProgressPath -Status 'error' -Message 'Page generation failed.' -Error $_.Exception.Message
+        [Console]::Error.WriteLine("HTML worker failed: $($_.Exception.Message)")
         exit 1
     }
 }
 if ($OpenMode -ne '') {
-    if ($OpenMode -eq 'html3') {
+    if ($OpenMode -eq 'html') {
         $token = [guid]::NewGuid().ToString('N')
         $callbackUrl = "http://127.0.0.1:$htmlListenPort/download/" + $token
         # The shell is written first and the scan runs in a worker, so the page
         # is reachable immediately instead of after a full channel sweep.
         Remove-StaleTemporaryArtifacts
-        Write-Html3LoadingPage -Token $token -Message 'Loading channels...'
+        Write-HtmlLoadingPage -Token $token -Message 'Loading channels...'
         if (-not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus)) { $openFailures = 1 }
         if ($openFailures -eq 0) { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
         if ($htmlFailureCount -gt 0) { $openFailures = 1 }
