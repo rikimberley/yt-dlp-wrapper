@@ -14,11 +14,10 @@
 #   (exits 1 if any channel could not be checked)
 # - uses -O to open every channel in ./channel-ids.txt unconditionally, and
 #   skip any download
-# - uses --html to generate a local 6-column video grid with y1/y2 selections
-# - uses --html2 for the same page with persistent incremental scan caching
 # - uses --html3 to open an independent loading shell and stream channel
-#   fragments from a worker
-# - uses --html3-incognito with --html3 to open that shell in Chrome Incognito
+#   fragments from a worker into a local 6-column video grid with y1/y2
+#   selections, served on http://127.0.0.1:8090
+# - uses --incognito with --html3 to open that shell in Chrome Incognito
 #   on Windows
 # - uses -c to overwrite ./checkpoint.txt with the current epoch-ms timestamp,
 #   and skip any download (runs after -o/-O, so `-o -c` means "open the new
@@ -33,10 +32,8 @@
 #   ./yy.ps1 -U
 #   ./yy.ps1 -o
 #   ./yy.ps1 -O
-#   ./yy.ps1 --html
-#   ./yy.ps1 --html2
 #   ./yy.ps1 --html3
-#   ./yy.ps1 --html3 --html3-incognito
+#   ./yy.ps1 --html3 --incognito
 #   ./yy.ps1 -c
 #   ./yy.ps1 --help
 #   ./yy.ps1 -o -c
@@ -122,7 +119,7 @@ $feedFetchFailed = $false
 $feedFailureCountedForChannel = $false
 # Head of master in the wrapper's own repo, used by -U to refresh this script.
 $scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master'
-# Loopback port for --html/--html2/--html3. Keep in sync with yy.zsh and py/yy.py.
+# Loopback port for --html3. Keep in sync with yy.zsh and py/yy.py.
 $htmlListenPort = 8090
 
 $Url = ''
@@ -132,12 +129,11 @@ $OutputPathPassed = $false
 $Update = $false
 $SwitchToPy = $false
 $OpenMode = ''
-$HtmlMode = $false
 $SetCheckpoint = $false
 $htmlFailureCount = 0
 $Html3WorkerToken = ''
 $Html3WorkerRefreshAll = $false
-$Html3Incognito = $false
+$Incognito = $false
 $ShowHelp = $false
 
 function Write-Usage {
@@ -146,7 +142,7 @@ yy.ps1 - convenience wrapper around ./yt-dlp
 
 Usage:
   ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
-           [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
+           [-o | -O | --html3] [--incognito] [-c]
   ./yy.ps1 -h | --help
 
 Arguments:
@@ -173,14 +169,14 @@ Options:
                       downloading. Exits non-zero if a channel check failed.
   -O                  Open every channel in ./channel-ids.txt unconditionally,
                       then exit without downloading.
-  --html              Generate a local 6-column video grid with y1/y2
-                      selections and serve it on http://127.0.0.1:8090.
-  --html2             As --html, with a persistent incremental scan cache, so
-                      later runs scan only a one-day overlap per channel.
-  --html3             As --html2, but open a loading shell immediately and
-                      stream one fragment per channel from a background worker.
-                      Already-downloaded video cards are dropped.
-  --html3-incognito   With --html3, open the page in a Chrome/Chromium
+  --html3             Generate a local 6-column video grid with y1/y2
+                      selections and serve it on http://127.0.0.1:8090. A
+                      loading shell opens immediately and a background worker
+                      streams one fragment per channel into it. The scan is
+                      incremental: a persistent cache means later runs scan
+                      only a one-day overlap per channel. Already-downloaded
+                      video cards are dropped.
+  --incognito         With --html3, open the page in a Chrome/Chromium
                       incognito window instead of the default browser.
   -c                  Overwrite ./checkpoint.txt with the current epoch-ms
                       timestamp, then exit without downloading. Runs after
@@ -188,8 +184,8 @@ Options:
                       everything as seen".
   -h, --help          Show this help and exit.
 
--o, -O, --html, --html2 and --html3 are mutually exclusive.
-Flag precedence: -h, then --py, then -U, then -o/-O/--html*, then -c, then
+-o, -O and --html3 are mutually exclusive.
+Flag precedence: -h, then --py, then -U, then -o/-O/--html3, then -c, then
 download.
 
 Examples:
@@ -198,8 +194,8 @@ Examples:
   ./yy.ps1 -p ./my-videos -t 'https://example.com/one-off'
   ./yy.ps1 -U
   ./yy.ps1 -o -c
-  ./yy.ps1 --html2
-  ./yy.ps1 --html3 --html3-incognito
+  ./yy.ps1 --html3
+  ./yy.ps1 --html3 --incognito
 '@
     Write-Host $usage
 }
@@ -233,19 +229,18 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         $SwitchToPy = $true
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
-        if ($OpenMode -ne '' -or $HtmlMode) {
-            [Console]::Error.WriteLine('Error: -o, -O, --html, --html2, and --html3 cannot be combined')
+        if ($OpenMode -ne '') {
+            [Console]::Error.WriteLine('Error: -o, -O and --html3 cannot be combined')
             exit 1
         }
         $OpenMode = if ($a -ceq '-o') { 'check' } else { 'open' }
     }
-    elseif ($a -ceq '--html' -or $a -ceq '--html2' -or $a -ceq '--html3') {
+    elseif ($a -ceq '--html3') {
         if ($OpenMode -ne '') {
-            [Console]::Error.WriteLine('Error: -o, -O, --html, --html2, and --html3 cannot be combined')
+            [Console]::Error.WriteLine('Error: -o, -O and --html3 cannot be combined')
             exit 1
         }
-        $OpenMode = if ($a -ceq '--html3') { 'html3' } elseif ($a -ceq '--html2') { 'html2' } else { 'html' }
-        $HtmlMode = $true
+        $OpenMode = 'html3'
     }
     elseif ($a -ceq '--html3-worker') {
         $i++
@@ -257,8 +252,8 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         $Html3WorkerToken = [string]$args[$i]
         if (($i + 1) -lt $args.Count -and [string]$args[$i + 1] -ceq '--refresh-all') { $Html3WorkerRefreshAll = $true; $i++ }
     }
-    elseif ($a -ceq '--html3-incognito') {
-        $Html3Incognito = $true
+    elseif ($a -ceq '--incognito') {
+        $Incognito = $true
     }
     elseif ($a -ceq '-c') {
         $SetCheckpoint = $true
@@ -281,8 +276,8 @@ if ($ShowHelp) {
     exit 0
 }
 
-if ($Html3Incognito -and $OpenMode -ne 'html3') {
-    [Console]::Error.WriteLine('Error: --html3-incognito requires --html3')
+if ($Incognito -and $OpenMode -ne 'html3') {
+    [Console]::Error.WriteLine('Error: --incognito requires --html3')
     exit 1
 }
 
@@ -1348,7 +1343,7 @@ function Get-ChannelThumbnailsConcurrent {
     return $result
 }
 
-# Fetch the Atom feeds for cached --html2 channels concurrently. A result is
+# Fetch the Atom feeds for cached --html3 channels concurrently. A result is
 # returned only for a usable feed with at least one parseable <published> value.
 # Anything else is deliberately absent from the result so the caller falls back
 # to yt-dlp. Once three feeds exhaust their retries, pending feeds are abandoned
@@ -1494,7 +1489,7 @@ function Get-Html3ChannelFragment {
 # Its token-protected
 # loopback callback starts the selected yy1/yy2 local PowerShell hooks.
 function New-VideoHtml {
-    param([string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$RefreshAll, [switch]$Incremental, [string]$ProgressPath, [string]$Html3FragmentsPath, [string]$OutputPath)
+    param([hashtable]$ChannelStatus, [switch]$RefreshAll, [string]$ProgressPath, [string]$Html3FragmentsPath)
     $exe = Get-YtDlpPath
     if ($exe -eq '') { [Console]::Error.WriteLine('Error: yt-dlp binary not found next to this script'); return $false }
     if (-not (Test-Path -LiteralPath $channelsFile)) { [Console]::Error.WriteLine("Error: $channelsFile does not exist"); return $false }
@@ -1508,14 +1503,14 @@ function New-VideoHtml {
     $scanCutoffSec = [Math]::Max(0, $checkpointDayStartSec - 86400)
     $checkpointAge = Format-RelativeVideoTime $checkpointMs
     $failures = 0
-    if ($ProgressPath -ne '') { $script:html3FailedChannels = New-Object System.Collections.ArrayList }
+    $script:html3FailedChannels = New-Object System.Collections.ArrayList
     $checkBatchMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $downloaded = @{}
     foreach ($item in @(Read-DownloadedVideos)) {
         $downloaded[([string]$item.channel_id + "`t" + [string]$item.video_id + "`t" + [string]$item.target)] = $true
     }
     $channelIdCache = Read-ChannelIdCache
-    $videoCache = if ($Incremental) { Read-HtmlVideoCache } else { @{} }
+    $videoCache = Read-HtmlVideoCache
     $htmlChannelIds = @{}
     $scanCutoffs = @{}
     $lastFullScans = @{}
@@ -1523,10 +1518,6 @@ function New-VideoHtml {
     $restoredSelections = 0
     Write-Host "Generating HTML from /videos tabs newer than checkpoint $checkpointMs ($checkpointAge)..."
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>YouTube Video Download</title><link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAB/lBMVEXdZJ6vV2CXWSfUpTbsY6K7jJHCO37n0rHHeFW+kB7DP4D/AP+9klr/AAC/NnzxcK2+QIWjMFiqVar/f/+4PYPoyWndrcONNz3/P7/28N3knb7LRYb+/f3jXJrsZKK5N3jaVJPEPYDBO33nYJ4AAAD+5nC5hRGueArux1GxRXfy5+mnKmfImCz99Zvoydbn1tLTplKWN1bw2ePVpzb62mnCQn7//KK8iimkahSzeS3PmLHp1a6XR0vGlBbZtHL/f3/r2Y6bVSzw5dbixZXQaJm6eJXuZaS3Vm28NnqaNWbaw6vKmVLmu0zddqfJiGn401jWt8T/VarGZ3G/P3+0WoN/AH+NJVTVpbfvZqTAOX21ZIisdFPBU3bmosHWubKnaizJp4ybLWuqVVXBPH+7Nnu0h2SaWxeTSy/cwpLWt4/mYZ6eYQ+waUvnYqLFhVjMmGrasEvou9Dcxsa4ilHiu2nPp3LFmY7Bjhu+OHu+Zmr0aKjx45OIHFXPjqx/AADijbQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALwSMuAAAAgHRSTlPp////kv+p////zQH/AZEV//8DAv////8E///+//7+/v/+/v4A//////////////////////////////////8C////////UP9L//////////8D/wT/Av//yMv//////////wNOJf//////Q///Jf/////////////I/7////8C/+cQjRsAAAVESURBVHjanZcHVxs5FIVF3fSySbbJtjTj8TQbFzyOewNsbDAl9BpgqYH0bHr76/skjRcb0CzJOz6M/KT7zdOVZI6QxqJ8XVus968ELhkr/fVF7WaZSxH780jT6hJ1MChh1LlMAOa1259kL5ubk/V8egZCDnik1aXFohfTSNpZZzUg7VftWD5bWipRee8xiFFZe+ZhF6088AAEnmlldK+8EpAYFQj654ZCc35pd2ClfA+BAUHWDopP5zMQpNNDoWkq64dPXUO3ETRkgUsPQ3Es7w+gP9Cxh96/UXkYMjf8HoRj1B/wB2GEH+Lck84NDYVCczQo6ff7A/0IBfyyCOLphwB4joPSIQGE/B4BFgAgjr3GeAEoWAAAc4P+LODjEAOEPv4sACzggOf4hwGYwksps4AB4pieZi8BwHRqM2qP4anxigCY45SnN+1XUxTT/wFQ+n3YB4HHfI8rYgrMBEjbLD28ibrrgK+d4cdTXO6zEfzJCxND07id5owxxmvHGQDe9HVGhU8hFKfR01x0DXcqzgBgoG2djh75zADOL6w9ay3kYBY5kqJyAJMu3H11+ro/P4O+wpsLJEWs2hrpfmMXADN9juDfmAc9MYFwHKfEG2NQuUoxlQMwf/MCxsvsSZouoeKUbAHA+C9fFEsBOMcttmiKNxbu7tuCkH85wgEqX4kYlgAwFR6nqMIBL8wH2y4gzmupLburgL0BhPbwkaMzTukxT42+zHetbVSyjBbfKrHnpjnKZaZjvuCTOEpOcOG7ddfYTeU8AAwi4n3/OAKQNx0nzlPxCAfsZ/qyW8KWdz1M8B8A2qmNK5PJJwIwIwAjLccx37KaIgIwmUwm0zfELOJ69ul4ikMQxuNXJlvmzIwZF5a5UwCSM8NSbzsAyazYpXakWCy+BwjGDLA+2WdCRMQMW60j4R2kAGBnk318K09GIPQ3YosbxaKuZ7d6OADfJ83C0/TLpNhx+SQfH3vSMk3IvMsm05z8hgEiGd7ePtmqFprkDhYAbFmkuZMoHAqL3sKqvd7Pxk2zL++LbaUjab6RtnUoO2JwpwpLzSaxLNwGMIRFyJdae6m3mdzsK/ns9WwknXaP5lE8nj4YYAdzCdSWULoAAVlyD3IsmzTNVgtO4UQmctWdN4vHiSX2kjVyquoAwFaw3O1vT4zmed2+Sd2tmh+UBAnDPo916LsBQBj2dcdIOq3vu+fSNx7GBIpEcgAmJOcW4WufRUPPVJ8us29fw5idmOFO/VkAToXJWm72dXR2IFGwXYKhH35pLuSWQajCDGqeAECQMA/ye68ofeSGUbhvQRZjBQqIhrE3oB13LKPq/iIcjROVpRQMFlnkkoAUyaYP1l+7vwFf4RdNHQN9rbsADwAmvcW0cbA+0TZ1mO+SHLk8oHD1fVE/6e0dmLVP13X5BwAJ/b2u60amd6lprdVqAzb8cyFn9J4AsgVnFhYxQwhbGTgAsDb48oAUqbICDKNKUi7xglGegIIAFFzAheEBUEnCYIBMQuwCCUCB/QGBzz8VQjIMcEIIS144DivoGv9+YRBmgmEcAkAW+Boa9AIUGKDgBRhEu4qqSnq5CdwCmV5VdtH8KhAkQXYyunFAiHSAsjqPtF0sB4SrunEYlgPwLtyZFj9ISyAwByMhr0BZXSzDpWsP7GKj+af7CYAMA1zUrxJF3YNLl/a31gC7JLGTOdmR9alKA8T84tlQFcmgcLUalnQpakNcPNnVd29QkSASCYlcGdxrX301KERrrKryiZwvXl1tcJkL0BZvat8atz5cFvDhVuObdn2RX///BQWVQ1G7ZU7MAAAAAElFTkSuQmCC">')
-    [void]$sb.AppendLine('<style>:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--acc:#58a6ff;--ok:#3fb950}*{box-sizing:border-box}body{margin:0;padding:16px 60px;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}h1{font-size:32px;margin:0 0 6px;color:var(--fg);border-bottom:3px solid var(--acc);padding-bottom:8px}h2{font-size:22px;margin:0;color:var(--acc)}.channel-title h2 a{color:var(--acc);text-decoration:underline;text-underline-offset:3px}p{color:var(--mut);font-size:12.5px;margin:0 0 16px}button{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}button:hover{border-color:var(--acc);background:#1c2230}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 28px}.card{background:var(--card);border:1px solid var(--bd);padding:10px;border-radius:10px}.video-link{display:block;color:var(--fg);text-decoration:none}.video-link:hover{color:var(--acc)}.preview{position:relative;aspect-ratio:16/9;background:#0b0f14;overflow:hidden;border-radius:6px}.preview img{width:100%;height:100%;object-fit:cover;transition:transform .2s ease,filter .2s ease}.card:hover .preview img{transform:scale(1.04);filter:brightness(.82)}.video-title{font-size:12px;line-height:1.4;margin-top:7px}.checks,.controls,.channel-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.checks{margin-top:8px;color:var(--mut)}.channel{margin-top:28px}.channel-title{padding-bottom:6px;border-bottom:1px solid var(--bd)}.controls button{padding:4px 9px}.job-log{max-height:190px;overflow:auto;background:#010409;border:1px solid var(--bd);border-radius:6px;padding:8px;color:var(--mut);white-space:pre-wrap;font:12px/1.4 Consolas,monospace}.back-to-top{position:fixed;bottom:24px;right:24px;width:48px;height:48px;border-radius:50%;background:var(--acc);color:var(--bg);border:none;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.45);display:none;font-size:34px;font-weight:700;line-height:1}.back-to-top.visible{display:flex;align-items:center;justify-content:center}.back-to-top:hover{background:#79c0ff}@media(max-width:1100px){body{padding:16px}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:650px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>')
-    [void]$sb.AppendLine('<style>.video-age{font-size:11px;color:var(--mut);margin-top:3px}.channel-bar{height:8px;background:var(--acc);margin:42px 0 12px}.channel-table{width:100%;border-collapse:collapse;margin-top:12px}.channel-table th,.channel-table td{padding:8px;border-bottom:1px solid var(--bd);text-align:left}.channel-table th{color:var(--mut)}.channel-table a{color:var(--acc)}#channel-add{width:27em}</style>')
-    [void]$sb.AppendLine('<h1>YouTube Video Download</h1><p>Select y1 and/or y2, then click DOWNLOAD SELECTED to run the matching local yy hook. <span id="checkpoint-value">Checkpoint: ' + $checkpointMs + '</span></p><div class="controls"><button id="download" type="button">DOWNLOAD SELECTED</button><button id="checkpoint" type="button">CHECKPOINT</button><button id="refresh" type="button">REFRESH</button><button id="refresh-all" type="button">REFRESH ALL</button><button id="stop" type="button">STOP SERVER</button><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div><p id="status"></p><pre id="job-log" class="job-log"></pre><main>')
     $channels = New-Object System.Collections.ArrayList
     $seenChannels = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
@@ -1534,7 +1525,9 @@ function New-VideoHtml {
         if ($channel -eq '' -or $channel.StartsWith('#')) { continue }
         if ($channel.StartsWith('@')) { $channel = $channel.Substring(1) }
         if (-not $seenChannels.Add($channel)) { continue }
-        if (-not ($Incremental -and $null -eq $videoCache[$channel]) -and
+        # A channel with no cache record is always scanned, so a newly added
+        # handle cannot be skipped for being "stale".
+        if ($null -ne $videoCache[$channel] -and
             -not (Test-ShouldScanHtmlChannel -Record $ChannelStatus[$channel] -RefreshAll:$RefreshAll)) {
             Write-Host "Skipping @$channel (latest video is 1.5 months old or older, or unknown)"
             continue
@@ -1544,13 +1537,13 @@ function New-VideoHtml {
             $resolved = Resolve-ChannelId -Handle $channel -ChannelUrl (Get-ChannelUrl $channel) -Cache $channelIdCache
             if ($resolved.Id -eq '') {
                 $failures++
-                if ($ProgressPath -ne '') { [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not resolve channel id'}) }
+                [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not resolve channel id'})
                 continue
             }
             $htmlChannelIds[$channel] = $resolved.Id
         }
         $channelCutoff = [long]$scanCutoffSec
-        if ($Incremental -and $null -ne $videoCache[$channel]) {
+        if ($null -ne $videoCache[$channel]) {
             $forceFullScan = ($null -ne $videoCache[$channel].PSObject.Properties[$forceFullScanProperty] -and
                 [bool]$videoCache[$channel].$forceFullScanProperty)
             $forceFullScans[$channel] = $forceFullScan
@@ -1578,40 +1571,38 @@ function New-VideoHtml {
     }
     $skipYtDlp = @{}
     $observedFeedNewest = @{}
-    if ($Incremental) {
-        $feedCandidates = @{}
-        foreach ($channel in $channels) {
-            $priorRecord = $videoCache[[string]$channel]
-            [long]$lastFullScanMs = if ($lastFullScans.ContainsKey([string]$channel)) { $lastFullScans[[string]$channel] } else { 0 }
-            $forceFullScan = ($forceFullScans.ContainsKey([string]$channel) -and $forceFullScans[[string]$channel])
-            if ($null -ne $priorRecord -and -not $forceFullScan -and $lastFullScanMs -gt 0 -and ($checkBatchMs - $lastFullScanMs) -lt $htmlFullScanIntervalMs) {
-                $feedCandidates[[string]$channel] = [string]$htmlChannelIds[[string]$channel]
-            }
+    $feedCandidates = @{}
+    foreach ($channel in $channels) {
+        $priorRecord = $videoCache[[string]$channel]
+        [long]$lastFullScanMs = if ($lastFullScans.ContainsKey([string]$channel)) { $lastFullScans[[string]$channel] } else { 0 }
+        $forceFullScan = ($forceFullScans.ContainsKey([string]$channel) -and $forceFullScans[[string]$channel])
+        if ($null -ne $priorRecord -and -not $forceFullScan -and $lastFullScanMs -gt 0 -and ($checkBatchMs - $lastFullScanMs) -lt $htmlFullScanIntervalMs) {
+            $feedCandidates[[string]$channel] = [string]$htmlChannelIds[[string]$channel]
         }
-        $feedNewest = Get-HtmlFeedNewestConcurrent $feedCandidates
-        foreach ($channel in $feedCandidates.Keys) {
-            if (-not $feedNewest.ContainsKey($channel)) { continue }
-            [long]$newestFeedMs = $feedNewest[$channel]
-            $observedFeedNewest[$channel] = $newestFeedMs
-            [long]$knownNewestMs = [long]$scanCutoffSec * 1000L
-            $priorRecord = $videoCache[$channel]
-            if ($null -ne $priorRecord.PSObject.Properties['feed_newest_ms']) {
-                [long]$priorFeedMs = 0
-                if ([long]::TryParse([string]$priorRecord.feed_newest_ms, [ref]$priorFeedMs) -and $priorFeedMs -gt $knownNewestMs) { $knownNewestMs = $priorFeedMs }
-            }
-            foreach ($entry in @($priorRecord.entries)) {
-                [long]$entryMs = 0
-                if ([long]::TryParse([string]$entry.timestamp_ms, [ref]$entryMs) -and $entryMs -gt $knownNewestMs) { $knownNewestMs = $entryMs }
-            }
-            if ($newestFeedMs -le $knownNewestMs) {
-                $skipYtDlp[$channel] = $true
-                Write-Host "@${channel}: public feed unchanged; reusing cached cards"
-            }
+    }
+    $feedNewest = Get-HtmlFeedNewestConcurrent $feedCandidates
+    foreach ($channel in $feedCandidates.Keys) {
+        if (-not $feedNewest.ContainsKey($channel)) { continue }
+        [long]$newestFeedMs = $feedNewest[$channel]
+        $observedFeedNewest[$channel] = $newestFeedMs
+        [long]$knownNewestMs = [long]$scanCutoffSec * 1000L
+        $priorRecord = $videoCache[$channel]
+        if ($null -ne $priorRecord.PSObject.Properties['feed_newest_ms']) {
+            [long]$priorFeedMs = 0
+            if ([long]::TryParse([string]$priorRecord.feed_newest_ms, [ref]$priorFeedMs) -and $priorFeedMs -gt $knownNewestMs) { $knownNewestMs = $priorFeedMs }
+        }
+        foreach ($entry in @($priorRecord.entries)) {
+            [long]$entryMs = 0
+            if ([long]::TryParse([string]$entry.timestamp_ms, [ref]$entryMs) -and $entryMs -gt $knownNewestMs) { $knownNewestMs = $entryMs }
+        }
+        if ($newestFeedMs -le $knownNewestMs) {
+            $skipYtDlp[$channel] = $true
+            Write-Host "@${channel}: public feed unchanged; reusing cached cards"
         }
     }
     $scanResults = New-Object object[] $channels.Count
     $html3Updates = New-Object System.Collections.ArrayList
-    if ($ProgressPath -ne '') { Write-Html3Progress -Path $ProgressPath -Completed 0 -Total $channels.Count }
+    Write-Html3Progress -Path $ProgressPath -Completed 0 -Total $channels.Count
     $completedScans = 0
     $workers = New-Object System.Collections.ArrayList
     $scanCookieFiles = New-Object System.Collections.ArrayList
@@ -1630,14 +1621,12 @@ function New-VideoHtml {
                 $channel = [string]$channels[$nextIndex]
                 if ($skipYtDlp.ContainsKey($channel)) {
                     $scanResults[$nextIndex] = @{ Output=@(); ExitCode=0; FeedOnly=$true }
-                    if ($ProgressPath -ne '') {
-                        $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @() -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
-                        $fragmentName = "$nextIndex.html"
-                        [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
-                        [void]$html3Updates.Add(@{ channel=$channel; fragment=$nextIndex })
-                        $completedScans++
-                        Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates)
-                    }
+                    $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @() -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
+                    $fragmentName = "$nextIndex.html"
+                    [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
+                    [void]$html3Updates.Add(@{ channel=$channel; fragment=$nextIndex })
+                    $completedScans++
+                    Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates)
                     $freeSlots.Enqueue($slot)
                     $nextIndex++
                     continue
@@ -1662,17 +1651,15 @@ function New-VideoHtml {
                     $worker = $workers[$workerIndex]
                     if (-not $worker.Done) { continue }
                     $scanResults[$worker.Index] = @{ Output = @($worker.Output); ExitCode = $worker.ExitCode }
-                    if ($ProgressPath -ne '') {
-                        $channel = [string]$channels[$worker.Index]
-                        $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @($worker.Output) -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
-                        $fragmentName = "$($worker.Index).html"
-                        [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
-                        [void]$html3Updates.Add(@{ channel=$channel; fragment=$worker.Index })
-                    }
+                    $channel = [string]$channels[$worker.Index]
+                    $fragment = Get-Html3ChannelFragment -Channel $channel -ChannelId ([string]$htmlChannelIds[$channel]) -ScanOutput @($worker.Output) -PriorRecord $videoCache[$channel] -Downloaded $downloaded -CutoffMs ($scanCutoffSec * 1000L)
+                    $fragmentName = "$($worker.Index).html"
+                    [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath $fragmentName), $fragment, (New-Object System.Text.UTF8Encoding($false)))
+                    [void]$html3Updates.Add(@{ channel=$channel; fragment=$worker.Index })
                     $freeSlots.Enqueue($worker.Slot)
                     $workers.RemoveAt($workerIndex)
                     $completedScans++
-                    if ($ProgressPath -ne '') { Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates) }
+                    Write-Html3Progress -Path $ProgressPath -Completed $completedScans -Total $channels.Count -Updates @($html3Updates)
                 }
             }
         }
@@ -1695,71 +1682,67 @@ function New-VideoHtml {
         # rather than resolving watch pages; this favors coverage over precision.
         $scan = $scanResults[$index]
         $scanSucceeded = $scan.ExitCode -in @(0, 101)
-        $feedOnly = $Incremental -and $scan.ContainsKey('FeedOnly') -and [bool]$scan.FeedOnly
+        $feedOnly = $scan.ContainsKey('FeedOnly') -and [bool]$scan.FeedOnly
         $fullScanSucceeded = $scanSucceeded -and -not $feedOnly
-        if ($Incremental) {
-            $merged = @{}
-            $priorRecord = $videoCache[$channel]
-            if ($null -ne $priorRecord) {
-                foreach ($entry in @($priorRecord.entries)) {
-                    if ($null -ne $entry -and [string]$entry.id -ne '') { $merged[[string]$entry.id] = $entry }
-                }
+        $merged = @{}
+        $priorRecord = $videoCache[$channel]
+        if ($null -ne $priorRecord) {
+            foreach ($entry in @($priorRecord.entries)) {
+                if ($null -ne $entry -and [string]$entry.id -ne '') { $merged[[string]$entry.id] = $entry }
             }
-            if ($scanSucceeded) {
-                foreach ($scanRow in @($scan.Output)) {
-                    $parts = [regex]::Split([string]$scanRow, "`t", 5)
-                    if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:')) { continue }
-                    [long]$entryMs = 0
-                    if (-not [long]::TryParse($parts[3], [ref]$entryMs)) { continue }
-                    if ($entryMs -lt 100000000000) { $entryMs *= 1000 }
-                    $entryId = $parts[0].Substring(5)
-                    $merged[$entryId] = [pscustomobject]@{ id=$entryId; url=$parts[1]; title=$parts[2]; timestamp_ms=$entryMs; availability=$parts[4] }
-                }
-            }
-            else {
-                [Console]::Error.WriteLine("Warning: could not incrementally scan the videos tab for @$channel; using cached entries")
-                $failures++
-                if ($ProgressPath -ne '') {
-                    [void]$script:html3FailedChannels.Add([pscustomobject]@{
-                        channel = $channel
-                        stage = 'could not scan videos tab; using cached entries'
-                    })
-                }
-            }
-            $cacheCheckedMs = if ($scanSucceeded) { $checkBatchMs } elseif ($null -ne $priorRecord) { [long]$priorRecord.checked_ms } else { [long]0 }
-            $lastFullScanMs = if ($fullScanSucceeded) { $checkBatchMs } elseif ($lastFullScans.ContainsKey($channel)) { [long]$lastFullScans[$channel] } else { [long]0 }
-            [long]$cacheFeedNewestMs = 0
-            if ($scanSucceeded -and $observedFeedNewest.ContainsKey($channel)) { $cacheFeedNewestMs = [long]$observedFeedNewest[$channel] }
-            elseif ($null -ne $priorRecord -and $null -ne $priorRecord.PSObject.Properties['feed_newest_ms']) { [void][long]::TryParse([string]$priorRecord.feed_newest_ms, [ref]$cacheFeedNewestMs) }
-            $keptEntries = @($merged.Values | Where-Object { [long]$_.timestamp_ms -ge ($scanCutoffSec * 1000L) } | Sort-Object {[long]$_.timestamp_ms} -Descending)
-            $videoCache[$channel] = [pscustomobject]@{
-                channel_id = [string]$htmlChannelIds[$channel]
-                checked_ms = $cacheCheckedMs
-                last_full_scan_ms = $lastFullScanMs
-                # Only a real scan proves these entries came from a
-                # UTF-8-forced yt-dlp; a cache hit carries the old stamp
-                # forward so it stays eligible for the rescan.
-                scan_encoding_version = $(
-                    if ($fullScanSucceeded) { $scanEncodingVersionCurrent }
-                    elseif ($null -ne $priorRecord -and
-                            $null -ne $priorRecord.PSObject.Properties['scan_encoding_version']) {
-                        [long]$priorRecord.scan_encoding_version
-                    }
-                    else { [long]0 }
-                )
-                feed_newest_ms = $cacheFeedNewestMs
-                entries = $keptEntries
-            }
-            $cachedRows = @()
-            foreach ($entry in $keptEntries) {
-                $cachedRows += "scan:$([string]$entry.id)`t$([string]$entry.url)`t$([string]$entry.title)`t$([long]$entry.timestamp_ms)`t$([string]$entry.availability)"
-            }
-            $scan = @{ Output = $cachedRows; ExitCode = 0 }
         }
+        if ($scanSucceeded) {
+            foreach ($scanRow in @($scan.Output)) {
+                $parts = [regex]::Split([string]$scanRow, "`t", 5)
+                if ($parts.Count -lt 5 -or -not $parts[0].StartsWith('scan:')) { continue }
+                [long]$entryMs = 0
+                if (-not [long]::TryParse($parts[3], [ref]$entryMs)) { continue }
+                if ($entryMs -lt 100000000000) { $entryMs *= 1000 }
+                $entryId = $parts[0].Substring(5)
+                $merged[$entryId] = [pscustomobject]@{ id=$entryId; url=$parts[1]; title=$parts[2]; timestamp_ms=$entryMs; availability=$parts[4] }
+            }
+        }
+        else {
+            [Console]::Error.WriteLine("Warning: could not incrementally scan the videos tab for @$channel; using cached entries")
+            $failures++
+            [void]$script:html3FailedChannels.Add([pscustomobject]@{
+                channel = $channel
+                stage = 'could not scan videos tab; using cached entries'
+            })
+        }
+        $cacheCheckedMs = if ($scanSucceeded) { $checkBatchMs } elseif ($null -ne $priorRecord) { [long]$priorRecord.checked_ms } else { [long]0 }
+        $lastFullScanMs = if ($fullScanSucceeded) { $checkBatchMs } elseif ($lastFullScans.ContainsKey($channel)) { [long]$lastFullScans[$channel] } else { [long]0 }
+        [long]$cacheFeedNewestMs = 0
+        if ($scanSucceeded -and $observedFeedNewest.ContainsKey($channel)) { $cacheFeedNewestMs = [long]$observedFeedNewest[$channel] }
+        elseif ($null -ne $priorRecord -and $null -ne $priorRecord.PSObject.Properties['feed_newest_ms']) { [void][long]::TryParse([string]$priorRecord.feed_newest_ms, [ref]$cacheFeedNewestMs) }
+        $keptEntries = @($merged.Values | Where-Object { [long]$_.timestamp_ms -ge ($scanCutoffSec * 1000L) } | Sort-Object {[long]$_.timestamp_ms} -Descending)
+        $videoCache[$channel] = [pscustomobject]@{
+            channel_id = [string]$htmlChannelIds[$channel]
+            checked_ms = $cacheCheckedMs
+            last_full_scan_ms = $lastFullScanMs
+            # Only a real scan proves these entries came from a
+            # UTF-8-forced yt-dlp; a cache hit carries the old stamp
+            # forward so it stays eligible for the rescan.
+            scan_encoding_version = $(
+                if ($fullScanSucceeded) { $scanEncodingVersionCurrent }
+                elseif ($null -ne $priorRecord -and
+                        $null -ne $priorRecord.PSObject.Properties['scan_encoding_version']) {
+                    [long]$priorRecord.scan_encoding_version
+                }
+                else { [long]0 }
+            )
+            feed_newest_ms = $cacheFeedNewestMs
+            entries = $keptEntries
+        }
+        $cachedRows = @()
+        foreach ($entry in $keptEntries) {
+            $cachedRows += "scan:$([string]$entry.id)`t$([string]$entry.url)`t$([string]$entry.title)`t$([long]$entry.timestamp_ms)`t$([string]$entry.availability)"
+        }
+        $scan = @{ Output = $cachedRows; ExitCode = 0 }
         if ($scan.ExitCode -notin @(0, 101)) {
             [Console]::Error.WriteLine("Warning: could not scan the videos tab for @$channel")
             $failures++
-            if ($ProgressPath -ne '') { [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not scan videos tab'}) }
+            [void]$script:html3FailedChannels.Add([pscustomobject]@{channel=$channel;stage='could not scan videos tab'})
             continue
         }
         $rows = New-Object System.Collections.ArrayList
@@ -1774,7 +1757,6 @@ function New-VideoHtml {
             $scanThumbnail = "https://i.ytimg.com/vi/$scanId/hqdefault.jpg"
             [void]$rows.Add("row:$scanId`t$($scanParts[1])`t$scanThumbnail`t$($scanParts[2])`t$approximateMs")
         }
-        $cards = New-Object System.Text.StringBuilder
         $newest = [long]0
         $qualifiedCount = 0
         foreach ($row in @($rows)) {
@@ -1784,37 +1766,23 @@ function New-VideoHtml {
             if (-not [long]::TryParse($parts[4], [ref]$videoMs)) { continue }
             if ($videoMs -lt 100000000000) { $videoMs *= 1000 }
             if ($videoMs -gt $newest) { $newest = $videoMs }
-            $id = $parts[0].Substring(4); $url = $parts[1]; $thumb = $parts[2]; $title = $parts[3]; $channelId = [string]$htmlChannelIds[$channel]; $age = Format-RelativeVideoTime $videoMs
-            if ($id -eq '' -or $url -eq '') { continue }
-            $eUrl = [System.Net.WebUtility]::HtmlEncode($url); $eThumb = [System.Net.WebUtility]::HtmlEncode($thumb); $eTitle = [System.Net.WebUtility]::HtmlEncode($title)
-            $downloadPath = [System.Net.WebUtility]::HtmlEncode('./' + $channel)
-            $checkedY1 = if ($downloaded.ContainsKey("$channelId`t$id`ty1")) { ' checked' } else { '' }
-            $checkedY2 = if ($downloaded.ContainsKey("$channelId`t$id`ty2")) { ' checked' } else { '' }
-            if ($checkedY1 -ne '') { $restoredSelections++ }
-            if ($checkedY2 -ne '') { $restoredSelections++ }
-            $card = '<article class="card"><a class="video-link" href="{2}" target="_blank" rel="noopener noreferrer"><div class="preview"><img src="{0}" alt=""></div><div class="video-title">{1}</div></a><div class="video-age">{3}</div><div class="checks"><label><input class="y1" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{7}> y1</label><label><input class="y2" data-url="{2}" data-path="{4}" data-channel-id="{5}" data-video-id="{6}" type="checkbox"{8}> y2</label></div></article>' -f $eThumb, $eTitle, $eUrl, ([System.Net.WebUtility]::HtmlEncode($age)), $downloadPath, ([System.Net.WebUtility]::HtmlEncode($channelId)), ([System.Net.WebUtility]::HtmlEncode($id)), $checkedY1, $checkedY2
-            [void]$cards.AppendLine($card)
+            $id = $parts[0].Substring(4); $channelId = [string]$htmlChannelIds[$channel]
+            if ($id -eq '' -or $parts[1] -eq '') { continue }
+            if ($downloaded.ContainsKey("$channelId`t$id`ty1")) { $restoredSelections++ }
+            if ($downloaded.ContainsKey("$channelId`t$id`ty2")) { $restoredSelections++ }
             $qualifiedCount++
         }
         Write-Host "@${channel}: $qualifiedCount visible video(s) in the checkpoint overlap"
-        if (-not $Incremental -or $scanSucceeded) {
+        if ($scanSucceeded) {
             Record-ChannelCheck $ChannelStatus $channel $newest $checkBatchMs -PreserveLatestWhenUnknown
         }
-        if ($cards.Length -gt 0) {
-            $headingChannelUrl = [System.Net.WebUtility]::HtmlEncode((Get-ChannelUrl $channel))
-            [void]$sb.AppendLine('<section class="channel"><div class="channel-title"><h2><a href="' + $headingChannelUrl + '" target="_blank" rel="noopener noreferrer">' + [System.Net.WebUtility]::HtmlEncode($channel) + '</a></h2><div class="controls"><button data-action="y1" type="button">y1</button><button data-action="y2" type="button">y2</button><button data-action="none" type="button">none</button></div></div><div class="grid">')
-            [void]$sb.Append($cards.ToString())
-            [void]$sb.AppendLine('</div></section>')
-        }
     }
-    if ($Incremental) { Save-HtmlVideoCache $videoCache }
+    Save-HtmlVideoCache $videoCache
     $channelIdsStart = $sb.Length
     [void]$sb.AppendLine('<section id="channel-ids" class="channel"><div class="channel-bar"></div><div class="channel-title"><h2>Channel IDs</h2></div><div class="controls"><input id="channel-add" placeholder="@channel or UC channel id"><button id="channel-add-button" type="button">add</button></div><table class="channel-table"><thead><tr><th>Profile</th><th>Channel</th><th>Last checked</th><th>Latest video</th><th></th></tr></thead><tbody>')
     $html3FailedChannelKeys = @{}
-    if ($ProgressPath -ne '') {
-        foreach ($failure in @($script:html3FailedChannels)) {
-            if ($null -ne $failure -and [string]$failure.channel -ne '') { $html3FailedChannelKeys[([string]$failure.channel).TrimStart('@')] = $true }
-        }
+    foreach ($failure in @($script:html3FailedChannels)) {
+        if ($null -ne $failure -and [string]$failure.channel -ne '') { $html3FailedChannelKeys[([string]$failure.channel).TrimStart('@')] = $true }
     }
     $managedChannels = @()
     foreach ($rawLine in @(Get-Content -LiteralPath $channelsFile -Encoding UTF8)) {
@@ -1846,35 +1814,16 @@ function New-VideoHtml {
             }
         }
         $avatar = if ($entry.Thumbnail) { '<img src="' + [System.Net.WebUtility]::HtmlEncode($entry.Thumbnail) + '" alt="" width="42" height="42" style="border-radius:50%;object-fit:cover">' } else { '' }
-        $rowClass = if ($ProgressPath -ne '' -and $html3FailedChannelKeys.ContainsKey($entry.Key)) { ' class="html3-channel-error"' } else { '' }
+        $rowClass = if ($html3FailedChannelKeys.ContainsKey($entry.Key)) { ' class="html3-channel-error"' } else { '' }
         [void]$sb.AppendLine('<tr' + $rowClass + '><td>' + $avatar + '</td><td><a href="' + [System.Net.WebUtility]::HtmlEncode($channelUrl) + '" target="_blank" rel="noopener noreferrer">' + [System.Net.WebUtility]::HtmlEncode($entry.Channel) + '</a></td><td>' + [System.Net.WebUtility]::HtmlEncode($checkedText) + '</td><td>' + [System.Net.WebUtility]::HtmlEncode($latestText) + '</td><td><button class="channel-delete" data-channel="' + [System.Net.WebUtility]::HtmlEncode($entry.Channel) + '" type="button">delete</button></td></tr>')
     }
     Save-ChannelCheckStatus $ChannelStatus
     [void]$sb.AppendLine('</tbody></table></section>')
-    if ($ProgressPath -ne '') {
-        $channelIdsHtml = $sb.ToString().Substring($channelIdsStart)
-        [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath 'channels.html'), $channelIdsHtml, (New-Object System.Text.UTF8Encoding($false)))
-    }
-    [void]$sb.AppendLine('<button id="back-to-top" class="back-to-top" type="button" onclick="window.scrollTo({top:0,behavior:''smooth''})" aria-label="Back to top" title="Back to top">&uarr;</button><script>const callback="' + $CallbackUrl + '",statusUrl="' + ($CallbackUrl -replace '/download/', '/status/') + '",stopUrl="' + ($CallbackUrl -replace '/download/', '/stop/') + '";const status=document.querySelector("#status"),jobLog=document.querySelector("#job-log"),setChecks=(root,action)=>root.querySelectorAll("input.y1,input.y2").forEach(x=>{if(action==="none")x.checked=false;else if(x.className===action)x.checked=true}),showJobs=async()=>{let again=false;try{const r=await fetch(statusUrl),b=await r.json(),p=[];if(b.running)p.push(b.running+" running");if(b.queued)p.push(b.queued+" queued");if(b.completed)p.push(b.completed+" completed");if(b.failed)p.push(b.failed+" failed");status.textContent=p.length?p.join(", ")+"." : "No download jobs yet.";jobLog.textContent=(b.logs||[]).join("\n");if(b.running||b.queued)again=true}catch(e){status.textContent="Status unavailable: "+e.message;again=true}finally{if(again)setTimeout(showJobs,1000)}};document.addEventListener("click",e=>{const b=e.target.closest("button[data-action]");if(b)setChecks(b.closest(".channel")||document,b.dataset.action)});document.querySelector("#download").onclick=async()=>{const items=[...document.querySelectorAll("input:checked")].map(x=>({target:x.className,url:x.dataset.url,path:x.dataset.path,channel_id:x.dataset.channelId,video_id:x.dataset.videoId}));if(!items.length){status.textContent="Select at least one video";return}status.textContent="Starting local downloads...";try{const r=await fetch(callback,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})}),b=await r.json();status.textContent=b.message||"Started";showJobs()}catch(e){status.textContent="Callback failed: "+e.message}};document.querySelector("#stop").onclick=async()=>{try{const r=await fetch(stopUrl,{method:"POST"}),b=await r.json();status.textContent=b.message||"Server stopped"}catch(e){status.textContent="Server stopped"}window.close();setTimeout(()=>location.replace("about:blank"),150)};showJobs();const backToTop=document.querySelector("#back-to-top"),toggleTop=()=>backToTop.classList.toggle("visible",window.scrollY>200);window.addEventListener("scroll",toggleTop,{passive:true});toggleTop();</script></main></body></html>')
-    $pageText = $sb.ToString().Replace('if(b.running||b.queued)again=true}catch', 'again=true}catch')
-    $pageText = $pageText.Replace('jobLog.textContent=(b.logs||[]).join("\n");', 'jobLog.textContent=(b.logs||[]).join("\n");jobLog.scrollTop=jobLog.scrollHeight;')
-    $heartbeatUrl = $CallbackUrl -replace '/download/', '/heartbeat/'
-    $pageText = $pageText.Replace('showJobs();const backToTop', 'setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop')
-    $pageText = $pageText.Replace('setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop', 'setInterval(()=>fetch("' + $heartbeatUrl + '",{method:"POST",keepalive:true}),2000);showJobs();const backToTop')
-    $channelUrl = $CallbackUrl -replace '/download/', '/channel/'; $checkpointUrl = $CallbackUrl -replace '/download/', '/checkpoint/'; $refreshUrl = $CallbackUrl -replace '/download/', '/refresh/'; $refreshAllUrl = $CallbackUrl -replace '/download/', '/refresh-all/'
-    $pageText = $pageText.Replace('</script></main>', '</script><script>const postJson=(u,x)=>fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(x)}),refreshPage=async(all=false)=>{status.textContent=all?"Refreshing all channels...":"Refreshing channels...";try{const b=await (await fetch(all?"' + $refreshAllUrl + '":"' + $refreshUrl + '",{method:"POST"})).json();status.textContent=b.message;if(!b.message||b.message==="Refreshing page.")location.reload()}catch(e){status.textContent="Refresh failed: "+e.message}};document.querySelector("#checkpoint").onclick=async()=>{const b=await (await fetch("' + $checkpointUrl + '",{method:"POST"})).json();status.textContent=b.message;if(b.checkpoint_ms)document.querySelector("#checkpoint-value").textContent="Checkpoint: "+b.checkpoint_ms};document.querySelector("#refresh").onclick=()=>refreshPage(false);document.querySelector("#refresh-all").onclick=()=>refreshPage(true);document.querySelector("#channel-add-button").onclick=async()=>{const x=document.querySelector("#channel-add").value.trim();if(x){await postJson("' + $channelUrl + '",{action:"add",channel:x});refreshPage()}};document.querySelectorAll(".channel-delete").forEach(b=>b.onclick=async()=>{await postJson("' + $channelUrl + '",{action:"delete",channel:b.dataset.channel});refreshPage()});</script></main>')
-    $sb.Clear() | Out-Null
-    [void]$sb.Append($pageText)
-    $path = if ($OutputPath -ne '') { $OutputPath } else { Join-Path $temporaryDirectory 'yy.html' }
-    # Keep the standalone HTML3 loading shell in place: it consumes the
-    # streamed channel fragments and the final Channel IDs fragment.
-    if ($ProgressPath -eq '') {
-        [System.IO.File]::WriteAllText($path, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
-    }
+    $channelIdsHtml = $sb.ToString().Substring($channelIdsStart)
+    [System.IO.File]::WriteAllText((Join-Path $Html3FragmentsPath 'channels.html'), $channelIdsHtml, (New-Object System.Text.UTF8Encoding($false)))
     Save-ChannelCheckStatus $ChannelStatus
     $script:htmlFailureCount = $failures
     Write-Host "Restored $restoredSelections downloaded target selection(s) in HTML."
-    Write-Host ('Generated ./' + [System.IO.Path]::GetFileName($path))
     return $true
 }
 
@@ -2032,8 +1981,7 @@ function Send-CallbackResponse {
     Send-CallbackJson $Context $StatusCode @{ message = $Message }
 }
 
-# --html3 has its own shell, state document, and channel fragments.  It never
-# reads or writes yy.html, which remains exclusively owned by --html/--html2.
+# --html3 has its own shell, state document, and channel fragments.
 function Format-Html3CheckpointText {
     param([long]$TimestampMs)
 
@@ -2161,7 +2109,7 @@ function Write-Html3WorkerLogs {
 }
 
 function Invoke-HtmlCallbackServer {
-    param([string]$Token, [string]$CallbackUrl, [hashtable]$ChannelStatus, [switch]$Incremental, [switch]$Html3)
+    param([string]$Token, [string]$CallbackUrl, [hashtable]$ChannelStatus)
 
     $listener = New-Object System.Net.HttpListener
     $listener.Prefixes.Add("http://127.0.0.1:$htmlListenPort/")
@@ -2185,8 +2133,8 @@ function Invoke-HtmlCallbackServer {
     }
     try {
         [Console]::add_CancelKeyPress($cancelHandler)
-        if ($Html3) { $html3Worker = Start-Html3Worker -Token $Token }
-        if ($Html3) { Open-Html3Url "http://127.0.0.1:$htmlListenPort/" -Incognito:$Html3Incognito }
+        $html3Worker = Start-Html3Worker -Token $Token
+        Open-Html3Url "http://127.0.0.1:$htmlListenPort/" -Incognito:$Incognito
         else { Open-Url "http://127.0.0.1:$htmlListenPort/" }
         Write-Host "Waiting for DOWNLOAD SELECTED on http://127.0.0.1:$htmlListenPort/ (Ctrl+C or STOP SERVER exits)"
         # A browser that navigates away, reloads, or is closed resets the
@@ -2200,7 +2148,7 @@ function Invoke-HtmlCallbackServer {
             $pending = $listener.BeginGetContext($null, $null)
             try {
                 while (-not $pending.AsyncWaitHandle.WaitOne(1000)) {
-                    if ($Html3) { Write-Html3WorkerLogs $html3Worker }
+                    Write-Html3WorkerLogs $html3Worker
                     if ($script:htmlStopRequested -or -not $listener.IsListening) { break }
                     # Never abandon a download that is still running or queued
                     # just because the browser throttled its timers while the
@@ -2224,7 +2172,7 @@ function Invoke-HtmlCallbackServer {
                 throw
             }
             if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq '/') {
-                $pageName = if ($Html3) { 'yy-html3.html' } else { 'yy.html' }
+                $pageName = 'yy-html3.html'
                 $body = [System.IO.File]::ReadAllBytes((Join-Path $temporaryDirectory $pageName))
                 $context.Response.ContentType = 'text/html; charset=utf-8'
                 $context.Response.ContentLength64 = $body.Length
@@ -2236,7 +2184,7 @@ function Invoke-HtmlCallbackServer {
                 Send-CallbackJson $context 200 (Get-DownloadJobStatus $jobs $serverLogs)
                 continue
             }
-            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/state") {
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/state") {
                 Write-Html3WorkerLogs $html3Worker
                 $progressPath = Join-Path $temporaryDirectory ('yy-html3-' + $Token + '.json')
                 if (Test-Path -LiteralPath $progressPath) {
@@ -2246,7 +2194,7 @@ function Invoke-HtmlCallbackServer {
                 else { Send-CallbackJson $context 503 @{status='running';success=$false;message='Preparing channels...';completed=0;total=0;updates=@()} }
                 continue
             }
-            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\d+)$')) {
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -match ('^/html3/' + [regex]::Escape($Token) + '/fragment/(\d+)$')) {
                 $fragmentPath = Join-Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token)) ($Matches[1] + '.html')
                 if (-not (Test-Path -LiteralPath $fragmentPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
                 $body = [System.IO.File]::ReadAllBytes($fragmentPath)
@@ -2256,7 +2204,7 @@ function Invoke-HtmlCallbackServer {
                 $context.Response.Close()
                 continue
             }
-            if ($Html3 -and $context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/channels") {
+            if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq "/html3/$Token/channels") {
                 $channelsPath = Join-Path (Join-Path $temporaryDirectory ('yy-html3-' + $Token)) 'channels.html'
                 if (-not (Test-Path -LiteralPath $channelsPath -PathType Leaf)) { $context.Response.StatusCode = 404; $context.Response.Close(); continue }
                 $body = [System.IO.File]::ReadAllBytes($channelsPath)
@@ -2291,30 +2239,10 @@ function Invoke-HtmlCallbackServer {
             }
             if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -in @("/refresh/$Token", "/refresh-all/$Token")) {
                 $refreshAll = $context.Request.Url.AbsolutePath -eq "/refresh-all/$Token"
-                if ($Html3) {
-                    if ($null -ne $html3Worker -and -not $html3Worker.Process.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
-                    Write-Html3LoadingPage -Token $Token -Message $(if ($refreshAll) { 'Refreshing all channels...' } else { 'Refreshing channels...' })
-                    $html3Worker = Start-Html3Worker -Token $Token -RefreshAll:$refreshAll
-                    Send-CallbackResponse $context 202 'Refreshing page.'
-                    continue
-                }
-                Write-Host $(if ($refreshAll) { 'Refreshing HTML page from all channels in channel-ids.txt...' } else { 'Refreshing HTML page from recent channels in channel-ids.txt...' })
-                # Reply before the potentially long channel scan. The browser
-                # immediately queues a reload, which this single-threaded server
-                # answers after yy.html has been regenerated.
+                if ($null -ne $html3Worker -and -not $html3Worker.Process.HasExited) { Send-CallbackResponse $context 409 'A page update is already running.'; continue }
+                Write-Html3LoadingPage -Token $Token -Message $(if ($refreshAll) { 'Refreshing all channels...' } else { 'Refreshing channels...' })
+                $html3Worker = Start-Html3Worker -Token $Token -RefreshAll:$refreshAll
                 Send-CallbackResponse $context 202 'Refreshing page.'
-                # A long-running server can outlive an external status repair or
-                # backfill. Merge the file again so a refresh cannot overwrite
-                # newer on-disk values with stale in-memory channel records.
-                $diskStatus = Read-ChannelCheckStatus
-                foreach ($key in $diskStatus.Keys) { $ChannelStatus[$key] = $diskStatus[$key] }
-                if (-not (New-VideoHtml -CallbackUrl $CallbackUrl -ChannelStatus $ChannelStatus -RefreshAll:$refreshAll -Incremental:$Incremental)) {
-                    [Console]::Error.WriteLine('Warning: could not refresh the page; keeping the previous page.')
-                }
-                # Heartbeats cannot be accepted while the single-threaded server
-                # is regenerating the page. Do not mistake that expected pause
-                # for the browser having closed as soon as generation finishes.
-                $lastHeartbeat = [System.DateTime]::UtcNow
                 continue
             }
             if ($context.Request.HttpMethod -eq 'POST' -and $context.Request.Url.AbsolutePath -eq "/channel/$Token") {
@@ -2523,7 +2451,6 @@ $checkpointAfterChecksMs = [long]0
 $channelCheckStatus = Read-ChannelCheckStatus
 Remove-StaleChannelCheckStatus $channelCheckStatus
 if ($OpenMode -eq 'html3-worker') {
-    $workerCallbackUrl = "http://127.0.0.1:$htmlListenPort/download/" + $Html3WorkerToken
     $workerStatus = Read-ChannelCheckStatus
     $workerProgressPath = Join-Path $temporaryDirectory ('yy-html3-' + $Html3WorkerToken + '.json')
     $workerFragmentsPath = Join-Path $temporaryDirectory ('yy-html3-' + $Html3WorkerToken)
@@ -2531,7 +2458,7 @@ if ($OpenMode -eq 'html3-worker') {
         if (Test-Path -LiteralPath $workerFragmentsPath) { Remove-Item -LiteralPath $workerFragmentsPath -Recurse -Force }
         New-Item -ItemType Directory -Path $workerFragmentsPath -Force | Out-Null
         Write-Html3Progress -Path $workerProgressPath -Completed 0 -Total 0
-        if (-not (New-VideoHtml -CallbackUrl $workerCallbackUrl -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -Incremental -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath -OutputPath (Join-Path $temporaryDirectory 'yy-html3.html'))) { throw 'Could not generate the HTML3 page.' }
+        if (-not (New-VideoHtml -ChannelStatus $workerStatus -RefreshAll:$Html3WorkerRefreshAll -ProgressPath $workerProgressPath -Html3FragmentsPath $workerFragmentsPath)) { throw 'Could not generate the HTML3 page.' }
         $failedChannels = @($script:html3FailedChannels)
         foreach ($failedChannel in $failedChannels) {
             Write-Host "HTML3 skipped failed channel @$($failedChannel.channel): $($failedChannel.stage)"
@@ -2550,19 +2477,14 @@ if ($OpenMode -eq 'html3-worker') {
     }
 }
 if ($OpenMode -ne '') {
-    if ($OpenMode -in @('html', 'html2', 'html3')) {
-        $incrementalHtml = $OpenMode -in @('html2', 'html3')
+    if ($OpenMode -eq 'html3') {
         $token = [guid]::NewGuid().ToString('N')
         $callbackUrl = "http://127.0.0.1:$htmlListenPort/download/" + $token
-        if ($OpenMode -eq 'html3') {
-            Remove-StaleTemporaryArtifacts
-            Write-Html3LoadingPage -Token $token -Message 'Loading channels...'
-            if (-not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental -Html3)) { $openFailures = 1 }
-        }
-        else {
-            if (-not (New-VideoHtml -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
-            if ($openFailures -eq 0 -and -not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus -Incremental:$incrementalHtml)) { $openFailures = 1 }
-        }
+        # The shell is written first and the scan runs in a worker, so the page
+        # is reachable immediately instead of after a full channel sweep.
+        Remove-StaleTemporaryArtifacts
+        Write-Html3LoadingPage -Token $token -Message 'Loading channels...'
+        if (-not (Invoke-HtmlCallbackServer -Token $token -CallbackUrl $callbackUrl -ChannelStatus $channelCheckStatus)) { $openFailures = 1 }
         if ($openFailures -eq 0) { $checkpointAfterChecksMs = [System.DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
         if ($htmlFailureCount -gt 0) { $openFailures = 1 }
     }
