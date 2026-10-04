@@ -2170,7 +2170,7 @@ def channel_thumbnails_concurrent(keys):
 def render_channel_fragment(channel, channel_id, entries, cutoff_ms, downloaded):
     """Render one channel's card section.
 
-    Returns (html, visible, dropped). Unlike --html/--html2, a video already
+    Returns (html, visible, dropped). A video already
     submitted for download loses its whole card rather than coming back with
     a restored checkbox, so either target being present drops it.
     """
@@ -2360,11 +2360,21 @@ def find_file_on_path(filename):
     return None
 
 
-def resolve_download_hook(name):
+def resolve_download_hook(name, merged=False):
     """Resolve the y1/y2 hook. Returns (argv_prefix, display) or (None, None).
 
-    On Windows the hooks are yy1.ps1 / yy2.ps1 -- that is what the PowerShell
-    build looks for -- and neither half of the obvious approach works:
+    With merged=True (--merge-download-action) the hooks are bypassed
+    entirely and both targets re-run *this* yy.py. That costs nothing here:
+    every card renders y1 and y2 with the same data-path, and submit() passes
+    that path through as -p, which overrides whatever default a hook carried.
+    So the two labels already meant the same destination in this build, and
+    the only thing the hook indirection still bought was the requirement to
+    install yy1/yy2 launchers on PATH. It stays opt-in because the PowerShell
+    build has real hooks that do diverge.
+
+    Otherwise the hook is looked up on PATH. On Windows the hooks are
+    yy1.ps1 / yy2.ps1 -- that is what the PowerShell build looks for -- and
+    neither half of the obvious approach works:
 
       * shutil.which(name) cannot find them. On Windows it only matches names
         whose extension is listed in PATHEXT, and .PS1 is not in the default
@@ -2380,6 +2390,12 @@ def resolve_download_hook(name):
     "hook was not found" error immediately after loading the download history,
     so the console shows one "Loaded N downloaded-video record(s)." and stops.
     """
+    if merged:
+        # sys.executable, not the launcher: the launcher only exists to find
+        # an interpreter, and we already are one. This also means the merged
+        # path needs nothing whatsoever on PATH.
+        return [sys.executable, str(SCRIPT_PATH)], display_path(SCRIPT_PATH)
+
     direct = shutil.which(name)
     if direct:
         return [direct], direct
@@ -2477,11 +2493,12 @@ def iter_process_lines(stream):
 class JobManager:
     """Runs y1/y2 hooks one at a time, y2 before y1."""
 
-    def __init__(self):
+    def __init__(self, merged=False):
         self.lock = threading.Lock()
         self.jobs = []
         self.logs = []
         self.worker = None
+        self.merged = merged
 
     def submit(self, items):
         """Queue validated selections. Returns (started, error)."""
@@ -2512,8 +2529,10 @@ class JobManager:
                 # different destinations. A shell alias or function is not
                 # accepted and cannot be: this is a child process that never
                 # sources a shell rc, so a hook has to be a real executable.
+                # Under --merge-download-action both targets re-run this
+                # script instead and nothing need be on PATH at all.
                 hook_name = "y" + pass_target
-                hook_argv, hook = resolve_download_hook(hook_name)
+                hook_argv, hook = resolve_download_hook(hook_name, self.merged)
                 if not hook:
                     looked_for = hook_name
                     if os.name == "nt":
@@ -3001,7 +3020,7 @@ def open_html3_url(url, incognito):
     return open_url(url)
 
 
-def run_html3(incognito):
+def run_html3(incognito, merged=False):
     """Serve the page until STOP SERVER, Ctrl-C, or the page stops answering."""
     import secrets
     from http.server import ThreadingHTTPServer
@@ -3011,7 +3030,7 @@ def run_html3(incognito):
 
     token = secrets.token_hex(16)
     state = Html3State()
-    jobs = JobManager()
+    jobs = JobManager(merged)
     control = ServerControl()
     handler = build_html3_handler(token, state, jobs, control)
 
@@ -3090,7 +3109,7 @@ yy.py - convenience wrapper around ./yt-dlp
 
 Usage:
   yy [<url>] [-t <temp_url>] [-p <path>] [-U] [--no-py]
-     [-o | -O | --html3] [--html3-incognito] [-c]
+     [-o | -O | --html3] [--incognito] [--merge-download-action] [-c]
   yy --sync | --sync-dry-run | --sync-override
   yy -h | --help
 
@@ -3109,9 +3128,7 @@ Options:
   --no-py             Switch this directory back to the shell build: fetch
                       yy.zsh and yy.ps1 from the root of master, back up the
                       current launchers into .tmp, and replace both, so the
-                      directory is never half of each build. Handled by the
-                      launcher itself, not here, so it still works when yy.py
-                      or the Python interpreter is the broken thing. The shell
+                      directory is never half of each build. The shell
                       build's --py is the inverse.
   -o                  For each channel in ./channel-ids.txt, open its /videos
                       tab only if it has a public video published after
@@ -3124,16 +3141,24 @@ Options:
                       opening a loading shell immediately and streaming one
                       fragment per channel from a background worker.
                       Already-downloaded video cards are dropped.
-  --html3-incognito   With --html3, open the page in a Chrome/Chromium
+  --incognito         With --html3, open the page in a Chrome/Chromium
                       incognito window instead of the default browser.
+  --merge-download-action
+                      With --html3, make both y1 and y2 re-run this yy.py
+                      instead of looking up yy1/yy2 on PATH, so no launcher
+                      has to be installed. The page still shows both boxes;
+                      they already resolved to the same destination here,
+                      because every card gives y1 and y2 the same path and
+                      that path is passed through as -p.
   -c                  Overwrite ./checkpoint.txt with the current epoch-ms
                       timestamp, then exit without downloading. Runs after
                       -o/-O, so "-o -c" means "open whatever is new, then mark
                       everything as seen". The checkpoint is held back if at
                       least three checks failed, or if every check failed.
-  --sync              Merge this machine's state with the shared private
-                      repo over git+SSH, write the result back here, push it,
-                      then exit. Covers checkpoint.txt, channel-ids.txt,
+  --sync              Merge this machine's state with the yy/ directory of
+                      the shared private kcc-state repo over git+SSH, write
+                      the result back here, push it, then exit. Covers
+                      checkpoint.txt, channel-ids.txt,
                       channel-id-cache.txt, downloaded-videos.json,
                       channel-check-status.json and current_url.json.
                       cookies.txt is never synced.
@@ -3156,7 +3181,8 @@ Examples:
   yy -o -c
   yy -O -c
   yy --html3
-  yy --html3 --html3-incognito
+  yy --html3 --incognito
+  yy --html3 --merge-download-action
   yy --sync
   yy --sync-dry-run
 """
@@ -3183,7 +3209,8 @@ class Options:
         self.do_update = False
         self.do_no_py = False
         self.open_mode = None
-        self.html3_incognito = False
+        self.incognito = False
+        self.merge_download_action = False
         self.set_checkpoint = False
         self.sync_mode = None
         self.show_help = False
@@ -3217,8 +3244,10 @@ def parse_args(argv):
             set_open_mode(opts, "open")
         elif arg == "--html3":
             set_open_mode(opts, "html3")
-        elif arg == "--html3-incognito":
-            opts.html3_incognito = True
+        elif arg == "--incognito":
+            opts.incognito = True
+        elif arg == "--merge-download-action":
+            opts.merge_download_action = True
         elif arg == "--sync":
             set_sync_mode(opts, "sync")
         elif arg == "--sync-dry-run":
@@ -3270,12 +3299,20 @@ def set_sync_mode(opts, mode):
 # ---------------------------------------------------------------------------
 
 SYNC_REMOTE = os.environ.get(
-    "YY_SYNC_REMOTE", "git@github.com:rikimberley/yt-dlp-wrapper-state.git"
+    "YY_SYNC_REMOTE", "git@github.com:rikimberley/kcc-state.git"
 )
 SYNC_BRANCH = os.environ.get("YY_SYNC_BRANCH", "master")
 SYNC_SSH_KEY = os.environ.get("YY_SYNC_SSH_KEY", "~/.ssh/rikimberley_github_ed25519")
 SYNC_USER_NAME = "rikimberley"
 SYNC_USER_EMAIL = "85369872+rikimberley@users.noreply.github.com"
+
+# kcc-state holds one directory per tool, so everything this wrapper owns
+# lives under yy/ and nothing else in the repo may be touched. Keep every
+# clone-relative path going through sync_clone_path(): writing straight to
+# SYNC_CLONE_DIR / name would scatter the state across the repo root and,
+# worse, make "git add -A" sweep up another tool's directory as if it were
+# ours. The local copies stay unprefixed -- the deployment directory is flat.
+SYNC_REPO_SUBDIR = "yy"
 
 SYNC_CLONE_DIR = TEMPORARY_DIRECTORY / "state-sync"
 # The state as of the end of the last successful sync. Without it a removal is
@@ -3283,6 +3320,11 @@ SYNC_CLONE_DIR = TEMPORARY_DIRECTORY / "state-sync"
 SYNC_BASE_DIR = TEMPORARY_DIRECTORY / "state-sync-base"
 SYNC_TOMBSTONE_NAME = "channel-ids-removed.txt"
 SYNC_PUSH_ATTEMPTS = 3
+
+
+def sync_clone_path(name):
+    """Where a state file lives inside the clone."""
+    return SYNC_CLONE_DIR / SYNC_REPO_SUBDIR / name
 
 
 class SyncError(Exception):
@@ -3399,7 +3441,14 @@ def sync_write_text(path, text):
     and this has to run on whatever interpreter the Windows box has. Pinning
     the newline matters either way -- the repo must hold LF, or every sync
     from Windows would look like a whole-file change.
+
+    The parent is created because the state lives in a subdirectory of the
+    clone: on a repo whose branch is still empty, yy/ does not exist yet and
+    the first seeding write would fail with ENOENT.
     """
+    parent = os.path.dirname(str(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(str(path), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
 
@@ -3649,11 +3698,10 @@ def sync_plan():
     if not had_commits:
         notes.append("Remote branch %s is empty; seeding it." % SYNC_BRANCH)
 
-    clone = SYNC_CLONE_DIR
 
     # checkpoint.txt -- newest wins
     local_cp = sync_parse_checkpoint(CHECKPOINT_FILE)
-    remote_cp = sync_parse_checkpoint(clone / "checkpoint.txt")
+    remote_cp = sync_parse_checkpoint(sync_clone_path("checkpoint.txt"))
     merged_cp = max(local_cp, remote_cp)
     files["checkpoint.txt"] = "%s\n" % merged_cp
     if merged_cp != local_cp:
@@ -3663,9 +3711,9 @@ def sync_plan():
 
     # channel-ids.txt -- union with tombstones
     local_ch = sync_parse_channels(CHANNELS_FILE)
-    remote_ch = sync_parse_channels(clone / "channel-ids.txt")
+    remote_ch = sync_parse_channels(sync_clone_path("channel-ids.txt"))
     base_ch = sync_parse_channels(SYNC_BASE_DIR / "channel-ids.txt")
-    tombstones = sync_parse_tombstones(clone / SYNC_TOMBSTONE_NAME)
+    tombstones = sync_parse_tombstones(sync_clone_path(SYNC_TOMBSTONE_NAME))
     merged_ch, tombstones, added, removed, restored = sync_merge_channels(
         local_ch, remote_ch, base_ch, tombstones
     )
@@ -3683,7 +3731,7 @@ def sync_plan():
 
     # channel-id-cache.txt -- union by handle
     local_cache = sync_parse_cache(CHANNEL_ID_CACHE_FILE)
-    remote_cache = sync_parse_cache(clone / "channel-id-cache.txt")
+    remote_cache = sync_parse_cache(sync_clone_path("channel-id-cache.txt"))
     merged_cache = sync_merge_cache(local_cache, remote_cache)
     files["channel-id-cache.txt"] = sync_format_cache(merged_cache)
     gained = len(merged_cache) - len(local_cache)
@@ -3692,7 +3740,7 @@ def sync_plan():
 
     # downloaded-videos.json -- union, earliest wins, then expire
     local_dl = sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE)
-    remote_dl = sync_parse_downloaded(clone / "downloaded-videos.json")
+    remote_dl = sync_parse_downloaded(sync_clone_path("downloaded-videos.json"))
     merged_dl, expired = sync_merge_downloaded(local_dl, remote_dl)
     files["downloaded-videos.json"] = sync_dump_json(merged_dl)
     if len(merged_dl) != len(local_dl):
@@ -3704,7 +3752,7 @@ def sync_plan():
 
     # channel-check-status.json -- newest per channel, then expire
     local_st = sync_parse_status(CHANNEL_STATUS_FILE)
-    remote_st = sync_parse_status(clone / "channel-check-status.json")
+    remote_st = sync_parse_status(sync_clone_path("channel-check-status.json"))
     merged_st = sync_merge_status(local_st, remote_st)
     files["channel-check-status.json"] = sync_dump_json(merged_st)
     if len(merged_st) != len(local_st):
@@ -3715,7 +3763,7 @@ def sync_plan():
 
     # current_url.json -- larger update_ts wins
     local_url = read_json_file(URL_JSON_FILE)
-    remote_url = read_json_file(clone / "current_url.json")
+    remote_url = read_json_file(sync_clone_path("current_url.json"))
     if not isinstance(local_url, dict) and URL_FILE.exists():
         # yy.zsh and yy.ps1 still write only the .txt, so there is no
         # update_ts to compare and no safe way to decide a winner.
@@ -3737,7 +3785,7 @@ def sync_plan():
     pushing = []
     updating = []
     for name in sorted(files):
-        if read_text_file(SYNC_CLONE_DIR / name) != files[name]:
+        if read_text_file(sync_clone_path(name)) != files[name]:
             pushing.append(name)
         target = sync_local_target(name)
         if target is not None and read_text_file(target) != files[name]:
@@ -3757,7 +3805,7 @@ def sync_local_target(name):
 def sync_apply(files):
     """Write the merged result to this machine and into the clone."""
     for name, text in sorted(files.items()):
-        sync_write_text(SYNC_CLONE_DIR / name, text)
+        sync_write_text(sync_clone_path(name), text)
         target = sync_local_target(name)
         if target is not None:
             write_atomic(target, text)
@@ -3775,9 +3823,14 @@ def sync_save_base(files):
 
 def sync_commit_and_push(message):
     """Commit the clone and push. Returns True when the remote now has it."""
-    run_git(["add", "-A"], cwd=SYNC_CLONE_DIR)
+    # Scoped to our own subdirectory. kcc-state carries a directory per tool,
+    # and a bare "add -A" would stage anything else that happened to differ --
+    # committing another tool's state, or a stray file, under a yy message.
+    run_git(["add", "-A", "--", SYNC_REPO_SUBDIR], cwd=SYNC_CLONE_DIR)
     rc, out, _ = run_git(
-        ["status", "--porcelain"], cwd=SYNC_CLONE_DIR, check=False
+        ["status", "--porcelain", "--", SYNC_REPO_SUBDIR],
+        cwd=SYNC_CLONE_DIR,
+        check=False,
     )
     if rc == 0 and not trim(out):
         print("Remote already matches; nothing to push.")
@@ -3838,7 +3891,7 @@ def sync_override():
     """
     sync_prepare_clone()
     local_channels = sync_parse_channels(CHANNELS_FILE) or []
-    remote_channels = sync_parse_channels(SYNC_CLONE_DIR / "channel-ids.txt") or []
+    remote_channels = sync_parse_channels(sync_clone_path("channel-ids.txt")) or []
     # Tombstone whatever the override drops. Without this the override only
     # cleans the remote: the other machine still has those handles locally, so
     # its very next sync would union them straight back in and the override
@@ -3868,7 +3921,7 @@ def sync_override():
     for name, text in sorted(local_files.items()):
         if name == SYNC_TOMBSTONE_NAME:
             continue  # reported in full below, as a removal rather than a diff
-        before = read_text_file(SYNC_CLONE_DIR / name)
+        before = read_text_file(sync_clone_path(name))
         if before == text:
             continue
         changed = True
@@ -3900,7 +3953,7 @@ def sync_override():
         return 0
 
     for name in local_files:
-        sync_write_text(SYNC_CLONE_DIR / name, local_files[name])
+        sync_write_text(sync_clone_path(name), local_files[name])
     if sync_commit_and_push("Override state from %s" % platform_label()):
         sync_save_base(local_files)
         print("Remote replaced with this machine's state.")
@@ -3958,8 +4011,12 @@ def main(argv):
         print_usage()
         return 0
 
-    if opts.html3_incognito and opts.open_mode != "html3":
-        sys.stderr.write("Error: --html3-incognito requires --html3\n")
+    if opts.incognito and opts.open_mode != "html3":
+        sys.stderr.write("Error: --incognito requires --html3\n")
+        return 1
+
+    if opts.merge_download_action and opts.open_mode != "html3":
+        sys.stderr.write("Error: --merge-download-action requires --html3\n")
         return 1
 
     # Ahead of -U deliberately: `yy -U --no-py` means "leave the Python build",
@@ -3990,7 +4047,7 @@ def main(argv):
     if opts.open_mode is not None:
         TEMPORARY_DIRECTORY.mkdir(parents=True, exist_ok=True)
         if opts.open_mode == "html3":
-            rc = run_html3(opts.html3_incognito)
+            rc = run_html3(opts.incognito, opts.merge_download_action)
             # The page's own CHECKPOINT button is the normal way to advance
             # the checkpoint here; -c still works and applies on exit.
             if opts.set_checkpoint and rc == 0:

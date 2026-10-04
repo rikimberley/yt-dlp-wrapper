@@ -52,8 +52,8 @@ re-exporting.
 ## Usage
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
-./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html | --html2 | --html3] [--html3-incognito] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html3] [--incognito] [-c]
+./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html3] [--incognito] [-c]
 
 # Full usage summary from either wrapper:
 ./yy.zsh --help
@@ -69,18 +69,17 @@ re-exporting.
 | `-p <path>` | Download into `<path>` instead of the automatic/default path |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
-| `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then generate and open `./.tmp/yy.html`, a 6-column grid with hover previews and y1/y2 checkboxes |
-| `--html2` | Generate the same page using a persistent incremental scan cache; the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check |
-| `--html3` | Open an independent streaming page in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. |
-| `--html3-incognito` | **Requires `--html3`.** Open HTML3 in a Chrome/Chromium incognito window. `yy.ps1` reuses an existing Windows Chrome Incognito window; `yy.zsh` also accepts `/Applications/Google Chrome.app` or a Chromium binary on `PATH`. If none is found, fall back to the default browser with a warning. |
-| `-c` | With `-o`, `--html`, `--html2`, or `--html3`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
+| `--html3` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then open a streaming 6-column grid with hover previews and y1/y2 checkboxes in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. The scan is incremental: the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check. |
+| `--incognito` | **Requires `--html3`.** Open the page in a Chrome/Chromium incognito window. `yy.ps1` reuses an existing Windows Chrome Incognito window; `yy.zsh` also accepts `/Applications/Google Chrome.app` or a Chromium binary on `PATH`. If none is found, fall back to the default browser with a warning. |
+| `--merge-download-action` | **Python build only; requires `--html3`.** Run `DOWNLOAD SELECTED` through this wrapper itself instead of external `yy1`/`yy2` hooks, so no hook has to exist on `PATH`. |
+| `-c` | With `-o` or `--html3`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
 | `--sync` | **Python build only.** Merge this machine's state with a private git repo, write the result back, push it, then exit |
 | `--sync-dry-run` | Show what `--sync` would change, writing and pushing nothing |
 | `--sync-override` | Replace the shared state with this machine's copy, after showing the difference and asking |
 | `-h`, `--help` | Print the usage summary and exit |
 
-Precedence: `-h`/`--help`, then `--py`, then `-U`, then `-o`/`-O`/HTML mode, then `-c`, then download. `-o`,
-`-O`, `--html`, `--html2`, and `--html3` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
+Precedence: `-h`/`--help`, then `--py`, then `-U`, then `-o`/`-O`/`--html3`, then `-c`, then download. `-o`,
+`-O`, and `--html3` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
 Without `-p`, a download URL containing a YouTube handle path such as
@@ -93,11 +92,11 @@ Run `-c` once to write a real checkpoint and narrow later runs.
 
 `./yy.zsh -o -c` means "open whatever is new, then mark everything as seen".
 The checkpoint is not updated if at least three channel checks fail, or if all
-listed channels fail to be checked. With `-o -c`, `--html -c`, and `--html2 -c`, the saved
+listed channels fail to be checked. With `-o -c` and `--html3 -c`, the saved
 timestamp is captured after the check pass, before channels/pages are opened;
 it is written when that operation returns (after the HTML server stops).
 
-`--html` scans each channel's `/videos` tab as a flat playlist using yt-dlp's
+`--html3` scans each channel's `/videos` tab as a flat playlist using yt-dlp's
 approximate tab dates. It starts at midnight UTC on the calendar day before the
 checkpoint's UTC date, so the approximate-date window covers the entire checkpoint
 date plus a one-day margin; consequently, the page can also include videos from
@@ -129,7 +128,7 @@ of its stored latest-video time. Both refresh actions reload the status file
 first, so an external repair or backfill made while the server is running is not
 replaced by stale in-memory values. The status file is decoded as UTF-8,
 preserving non-ASCII channel handles on Windows PowerShell 5.1.
-`--html` serves the page at `http://127.0.0.1:8090/` and keeps
+`--html3` serves the page at `http://127.0.0.1:8090/` and keeps
 the wrapper running so selections can be submitted repeatedly. The page sends its
 checked y1/y2 YouTube URLs, with a random per-run callback token, to the
 loopback listener; the wrapper validates the structured selections and starts a
@@ -143,12 +142,14 @@ the two labels different meanings — point them at this wrapper (optionally
 with different `-p` defaults) to decide where each one downloads. They must be
 real executables on `PATH`; a shell alias will not be found, because the
 wrapper runs non-interactively and never reads your shell startup files. A
-missing hook fails that download request. Jobs run sequentially: all y2 selections first, then y1 selections.
+missing hook fails that download request. In the Python build,
+`--merge-download-action` replaces both hooks with the wrapper itself, so
+nothing needs to be installed on `PATH`. Jobs run sequentially: all y2 selections first, then y1 selections.
 Download output keeps lifecycle messages, warnings, errors, and completion
 lines, while repetitive yt-dlp percentage updates are reduced to one snapshot
 per 10 percentage points for each transferred format. The browser displays the
 last 80 retained log entries and refreshes that view once per second.
-Use `STOP SERVER` in the page (HTML3 asks for confirmation first), or Ctrl+C in the wrapper console, to end the
+Use `STOP SERVER` in the page (it asks for confirmation first), or Ctrl+C in the wrapper console, to end the
 loopback server; the button attempts to close its page (and falls back to a
 blank page when the browser disallows programmatic closing). Closing the page
 also stops the server after five minutes without any page request. Every page
@@ -168,7 +169,7 @@ record are skipped instead of being queued again.
 The wrapper logs history loads, pruning and saves, new or duplicate completion
 records, and the number of target selections restored into each generated page.
 
-`--html2` leaves `--html` unchanged. It stores recent per-channel video metadata
+The incremental scan stores recent per-channel video metadata
 in `html-video-cache.json`.
 Missing or unreadable caches are rebuilt. Successful scans merge new metadata
 with cached cards; failed scans retain cached cards. `REFRESH` retains the
@@ -177,7 +178,7 @@ the same incremental boundary. Missing channel avatars are fetched concurrently
 and retained in `channel-check-status.json`. On startup, stale status and
 incremental-video cache records older than 45 days are pruned.
 
-Cached `--html2` channels that completed a yt-dlp scan within the last 24 hours
+Cached channels that completed a yt-dlp scan within the last 24 hours
 are first checked through their public Atom feeds concurrently.
 An unchanged feed reuses the cached cards without starting yt-dlp. A newer feed,
 an empty or malformed response, or any exhausted fetch failure falls back to the
@@ -185,7 +186,7 @@ normal cookie-backed yt-dlp scan. At least once every 24 hours each eligible
 channel receives a full yt-dlp scan even when its feed appears unchanged, so
 account-visible videos omitted by the public feed are eventually recovered.
 
-`--html3` leaves `--html` and `--html2` unchanged. It writes its
+`--html3` writes its
 own `yy-html3.html` shell and uses a token-scoped JSON state file plus one local
 fragment file per completed channel. The browser polls `/html3/<token>/state`
 and fetches fragments from `/html3/<token>/fragment/<index>`; it disables
@@ -208,7 +209,7 @@ folder—for example, `liguiHD` downloads to `./liguiHD`.
 
 The logged-out yt-dlp metadata lookups use a 30-second socket timeout and one
 retry. The small `-o` fallback also has a 30-second wall-clock deadline. The
-complete `/videos` traversal used by `--html` has no wall-clock deadline because
+complete `/videos` traversal used by `--html3` has no wall-clock deadline because
 large channels can require many continuation pages.
 
 ## Python build
@@ -234,9 +235,9 @@ To go back, from the Python build:
 ./yy.zsh --no-py   # or: ./yy.ps1 --no-py
 ```
 
-`--no-py` is handled by the launcher, not by `yy.py`, so it still works when
-`yy.py` is broken or no Python is installed — which is when you are most
-likely to want it. `yy.py` is left on disk, unused.
+`--no-py` is handled by `yy.py` itself, so it needs a working Python and a
+working `yy.py`. The shell wrapper is restored and `yy.py` is left on disk,
+unused.
 
 Both directions keep a `.bak` in `.tmp` and refuse to install a payload that
 does not start with the expected shebang, so a captive portal or an error page
@@ -244,8 +245,8 @@ cannot overwrite a working wrapper.
 
 Differences from the shell build, as of now:
 
-- `--html3` is implemented; **`--html` and `--html2` are not.** If you use
-  those, stay on the shell build.
+- `--sync`, `--sync-dry-run`, `--sync-override` and `--merge-download-action`
+  are Python-build only.
 - Everything else — downloads, `-o`/`-O`/`-c`, `-U`, the state files — behaves
   the same and shares the same files on disk, so you can switch back and forth
   without losing checkpoints, caches or history.
@@ -267,6 +268,11 @@ It syncs `checkpoint.txt`, `channel-ids.txt`, `channel-id-cache.txt`,
 `downloaded-videos.json`, `channel-check-status.json` and `current_url.json`.
 `html-video-cache.json` is skipped because it is a pure cache, and
 **`cookies.txt` is never synced** — it holds live session credentials.
+
+The remote holds one directory per tool, and this wrapper owns `yy/`, so a
+single private repo can carry several tools' state without them colliding.
+Locally the files stay flat beside the wrapper; only the clone side is
+prefixed.
 
 Point it at your own repo with `YY_SYNC_REMOTE`, and override the SSH key with
 `YY_SYNC_SSH_KEY` if it is not `~/.ssh/rikimberley_github_ed25519`. Git over
@@ -302,9 +308,8 @@ the other machine drops them too.
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |
 | `downloaded-videos.json` | Successful HTML downloads retained for 45 days *(gitignored)* |
 | `channel-check-status.json` | Per-channel last-checked time, latest video time and avatar; records older than 45 days are pruned on startup *(gitignored)* |
-| `html-video-cache.json` | `--html2` incremental video metadata; records older than 45 days are pruned when read *(gitignored)* |
+| `html-video-cache.json` | `--html3` incremental video metadata; records older than 45 days are pruned when read *(gitignored)* |
 | `current_url.txt` | Last URL *(gitignored)* |
-| `.tmp/yy.html` | Generated `--html` / `--html2` video grid *(gitignored)* |
 | `.tmp/yy-html3.html`, `.tmp/yy-html3-*.json`, `.tmp/yy-html3-*/` | Generated standalone `--html3` shell, state, and channel fragments *(gitignored)* |
 | `.tmp/` | Disposable yt-dlp captures, worker cookie copies, atomic-write files, and self-update backups. Starting `--html3` removes `yy-html*`/`yy-fetch*` artifacts and yt-dlp metadata captures older than 45 days; backups and unrelated files are retained *(gitignored)* |
 | `cookies.txt` | **Secret.** YouTube cookie jar *(gitignored)* |
