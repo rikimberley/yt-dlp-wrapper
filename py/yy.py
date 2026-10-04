@@ -94,11 +94,10 @@ USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 # ---------------------------------------------------------------------------
 # Paths
 #
-# This file may live in a py/ subdirectory during the migration and at the
-# repository root afterwards, and the state files, cookie jar and yt-dlp
-# binary always sit together at the root. Resolving the base directory by
-# search rather than by a fixed relative path means the same code works in
-# both layouts with no edit at cutover.
+# The base directory is the *deployment* directory: the one holding the yt-dlp
+# binary, the cookie jar, the state files and the downloads. It is deliberately
+# NOT derived from this file's location, because the two are not the same thing
+# once the Python build lives in a shared command repository.
 # ---------------------------------------------------------------------------
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -106,22 +105,54 @@ SCRIPT_DIR = SCRIPT_PATH.parent
 
 
 def resolve_base_dir():
+    """The deployment directory, which is simply the current directory.
+
+    Both shells already enter it before invoking yy: zsh runs
+    `( cd ~/Movies/y && ... )` and PowerShell runs
+    `Push-Location F:\\_WebDownloads\\y`. On Windows that is the *only* thing
+    that distinguishes the y and y2 targets from one another, so the current
+    directory is already the single source of truth on both machines, and
+    reading it here adds no new concept.
+
+    Deriving it from __file__ instead would be actively wrong once yy.py moves
+    into the kcc repository: a search upward from scripts/youtube/ finds kcc's
+    own .git, and the state files, t/ and channel-ids.txt would be scattered
+    through that working tree instead of the deployment directory.
+
+    YY_BASE overrides it, and is for tests: it lets a run be pointed at a
+    scratch directory without the caller having to chdir.
+    """
     override = os.environ.get("YY_BASE")
     if override:
         return Path(override).expanduser().resolve()
-    candidates = [SCRIPT_DIR] + list(SCRIPT_DIR.parents)[:2]
-    for candidate in candidates:
-        if (candidate / "yt-dlp").is_file() or (candidate / "yt-dlp.exe").is_file():
-            return candidate
-    # A fresh clone has no binary yet; fall back to the repository root so the
-    # state files are still found in the right place.
-    for candidate in candidates:
-        if (candidate / ".git").exists():
-            return candidate
-    return SCRIPT_DIR
+    return Path.cwd().resolve()
 
 
 BASE_DIR = resolve_base_dir()
+
+
+def ensure_base_dir():
+    """Refuse to run against a directory that is not a deployment.
+
+    Because the base directory is now the current directory, running from the
+    wrong one would otherwise be silent and destructive-by-omission: every
+    channel reads as new, the checkpoint reads as 0, and fresh state files are
+    created somewhere they do not belong. The yt-dlp binary is the marker
+    because every real deployment has one and nothing else does.
+
+    An explicit YY_BASE skips the check. It states intent, and the test
+    recipes point it at an empty scratch directory on purpose.
+    """
+    if os.environ.get("YY_BASE"):
+        return True
+    if (BASE_DIR / "yt-dlp").is_file() or (BASE_DIR / "yt-dlp.exe").is_file():
+        return True
+    sys.stderr.write("Error: no yt-dlp binary in %s\n" % BASE_DIR)
+    sys.stderr.write(
+        "yy operates on the current directory. cd to the download directory "
+        "first,\nor set YY_BASE to it.\n"
+    )
+    return False
 
 URL_FILE = BASE_DIR / "current_url.txt"          # legacy, read-only fallback
 URL_JSON_FILE = BASE_DIR / "current_url.json"
@@ -4170,6 +4201,13 @@ def main(argv):
 
     if opts.merge_download_action and opts.open_mode != "html":
         sys.stderr.write("Error: --merge-download-action requires --html\n")
+        return 1
+
+    # After the argument checks, so a usage mistake still reads as a usage
+    # mistake from any directory, and before every mode that touches the
+    # deployment: -U runs ./yt-dlp, --no-py rewrites the wrappers, and the
+    # rest read or write state.
+    if not ensure_base_dir():
         return 1
 
     # Ahead of -U deliberately: `yy -U --no-py` means "leave the Python build",
