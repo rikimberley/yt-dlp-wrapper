@@ -3060,6 +3060,17 @@ def sync_prepare_clone():
 # when the normal readers next load the file.
 
 
+def sync_dump_json(payload):
+    """Serialize deterministically.
+
+    sort_keys is not cosmetic: the merges build dicts by iterating a set, and
+    Python randomizes string hashing per process, so the key order -- and
+    therefore the file -- changed on every single run. That meant every sync
+    saw a diff, pushed a pointless commit, and never settled.
+    """
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
 def sync_write_text(path, text):
     """Write LF-terminated UTF-8.
 
@@ -3362,9 +3373,7 @@ def sync_plan():
     local_dl = sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE)
     remote_dl = sync_parse_downloaded(clone / "downloaded-videos.json")
     merged_dl, expired = sync_merge_downloaded(local_dl, remote_dl)
-    files["downloaded-videos.json"] = json.dumps(
-        merged_dl, ensure_ascii=False, indent=2
-    ) + "\n"
+    files["downloaded-videos.json"] = sync_dump_json(merged_dl)
     if len(merged_dl) != len(local_dl):
         notes.append(
             "downloaded-videos.json: %s -> %s record(s)" % (len(local_dl), len(merged_dl))
@@ -3376,9 +3385,7 @@ def sync_plan():
     local_st = sync_parse_status(CHANNEL_STATUS_FILE)
     remote_st = sync_parse_status(clone / "channel-check-status.json")
     merged_st = sync_merge_status(local_st, remote_st)
-    files["channel-check-status.json"] = json.dumps(
-        merged_st, ensure_ascii=False, indent=2
-    ) + "\n"
+    files["channel-check-status.json"] = sync_dump_json(merged_st)
     if len(merged_st) != len(local_st):
         notes.append(
             "channel-check-status.json: %s -> %s channel(s)"
@@ -3398,9 +3405,7 @@ def sync_plan():
     else:
         merged_url, took_remote = sync_merge_current_url(local_url, remote_url)
         if isinstance(merged_url, dict):
-            files["current_url.json"] = json.dumps(
-                merged_url, ensure_ascii=False, indent=2
-            ) + "\n"
+            files["current_url.json"] = sync_dump_json(merged_url)
             if took_remote:
                 notes.append("current_url.json: taking the remote URL (newer)")
 
@@ -3524,18 +3529,16 @@ def sync_override():
         "channel-ids.txt": "".join(h + "\n" for h in local_channels),
         SYNC_TOMBSTONE_NAME: sync_format_tombstones(tombstones),
         "channel-id-cache.txt": sync_format_cache(sync_parse_cache(CHANNEL_ID_CACHE_FILE)),
-        "downloaded-videos.json": json.dumps(
-            sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE), ensure_ascii=False, indent=2
-        ) + "\n",
-        "channel-check-status.json": json.dumps(
-            sync_parse_status(CHANNEL_STATUS_FILE), ensure_ascii=False, indent=2
-        ) + "\n",
+        "downloaded-videos.json": sync_dump_json(
+            sync_parse_downloaded(DOWNLOADED_VIDEOS_FILE)
+        ),
+        "channel-check-status.json": sync_dump_json(
+            sync_parse_status(CHANNEL_STATUS_FILE)
+        ),
     }
     local_url = read_json_file(URL_JSON_FILE)
     if isinstance(local_url, dict):
-        local_files["current_url.json"] = json.dumps(
-            local_url, ensure_ascii=False, indent=2
-        ) + "\n"
+        local_files["current_url.json"] = sync_dump_json(local_url)
 
     print("")
     print("OVERRIDE would replace the remote with this machine's state:")
