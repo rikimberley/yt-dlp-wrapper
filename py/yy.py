@@ -179,6 +179,24 @@ HTML_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000
 # yt-dlp stops with 101 when --break-match-filters trips, which is the normal
 # way a bounded scan ends and must not be read as a failure.
 YTDLP_BREAK_RC = 101
+# Force yt-dlp to encode its output as UTF-8 rather than the locale's.
+#
+# yt-dlp encodes everything it prints with `encoding or preferredencoding()`,
+# and crucially with errors='ignore'. On macOS the locale is already UTF-8 so
+# this is a no-op, which is exactly why the bug only ever showed up on
+# Windows: there preferredencoding() is the ANSI code page, and a Japanese
+# title comes back either as Shift-JIS bytes (which decode to U+FFFD) or, on
+# a cp1252 box, with every non-ASCII character silently *deleted*.
+#
+# Deleted characters are unrecoverable and undetectable downstream, so this
+# has to be fixed at the producer. Do not try PYTHONIOENCODING instead --
+# yt-dlp's own preferredencoding() takes precedence over it.
+YTDLP_ENCODING_ARGS = ("--encoding", "utf-8")
+# Bumped whenever a change invalidates previously cached scan text. A record
+# stamped lower is force-rescanned once, which is the only way to clear
+# damage that leaves no trace in the data itself.
+SCAN_ENCODING_VERSION = 1
+
 # Availability values that must never be offered for download.
 NON_PUBLIC_AVAILABILITY = frozenset(("subscriber_only", "private", "premium_only"))
 
@@ -593,9 +611,20 @@ def read_html_video_cache():
                 "channel_id": coerce_str(record.get("channel_id")),
                 "checked_ms": coerce_int(record.get("checked_ms")),
                 "last_full_scan_ms": coerce_int(record.get("last_full_scan_ms")),
+                "scan_encoding_version": coerce_int(
+                    record.get("scan_encoding_version")
+                ),
                 "feed_newest_ms": coerce_int(record.get("feed_newest_ms")),
                 "entries": entries,
             }
+            if cache[channel]["scan_encoding_version"] < SCAN_ENCODING_VERSION:
+                # Written before yt-dlp was forced to UTF-8, so the titles may
+                # be mojibaked. This cannot be detected by inspecting them: on
+                # a cp1252 console yt-dlp encodes with errors='ignore', which
+                # *deletes* every non-ASCII character rather than leaving a
+                # U+FFFD behind, so the damage is invisible and the check
+                # below would miss it entirely. Force one rescan instead.
+                cache[channel]["last_full_scan_ms"] = 0
             if any(REPLACEMENT_CHAR in entry["title"] for entry in entries):
                 # This row was decoded from the wrong code page and is already
                 # mojibaked. Clearing the full-scan stamp drops the channel out
@@ -728,12 +757,18 @@ def ytdlp_path():
 def decode_child_output(raw):
     """Decode a child process's captured stdout without manufacturing U+FFFD.
 
-    yt-dlp's standalone build is frozen with PyInstaller, which pins the
-    interpreter to UTF-8 mode, so it writes UTF-8 on every platform and
-    ignores PYTHONIOENCODING entirely - that is why forcing that variable is
-    not a fix here. UTF-8 is therefore tried first and is the normal case.
+    Second line of defence only. yt-dlp is now invoked with
+    YTDLP_ENCODING_ARGS, so its output is UTF-8 on every platform and the
+    first branch below is the normal case. This remains because the fallback
+    is cheap and the failure it guards against is expensive.
 
-    The old code decoded with errors="replace" and nothing else, which is
+    An earlier revision of this comment claimed the frozen PyInstaller build
+    pins the interpreter to UTF-8 mode. That was wrong, and the mistake is
+    worth recording: it was concluded from a macOS test, where the locale is
+    UTF-8 and so every encoding path looks identical. yt-dlp actually honours
+    preferredencoding(), which is why only Windows was affected.
+
+    The original code decoded with errors="replace" and nothing else, which is
     lossy in the one way that matters: any byte that is not valid UTF-8 is
     burned down to U+FFFD, the damaged title is written to
     html-video-cache.json, and the page then re-serves that corruption as
@@ -770,6 +805,10 @@ def run_ytdlp_metadata(args, deadline_sec=YTDLP_DEADLINE_SEC, progress_label=Non
     match the shell's convention.
     """
     cmd = [str(part) for part in args]
+    # Inject centrally so no call site can forget it. Guarded because the
+    # caller is free to pass its own --encoding.
+    if "--encoding" not in cmd:
+        cmd[1:1] = list(YTDLP_ENCODING_ARGS)
     try:
         completed = subprocess.run(
             cmd,
@@ -1807,6 +1846,14 @@ def scan_all_channels(
                         ),
                         "last_full_scan_ms": (
                             batch_ms if full_scan_ok else plan.last_full_ms
+                        ),
+                        # Only a real scan proves these entries came from a
+                        # UTF-8-forced yt-dlp; a cache hit carries the old
+                        # stamp forward so it stays eligible for the rescan.
+                        "scan_encoding_version": (
+                            SCAN_ENCODING_VERSION
+                            if full_scan_ok
+                            else prior.get("scan_encoding_version", 0)
                         ),
                         "feed_newest_ms": (
                             plan.feed_newest_ms
@@ -3802,6 +3849,11 @@ def download(opts):
     return run_cmd(
         [
             "./" + exe.name,
+            # See YTDLP_ENCODING_ARGS: without this yt-dlp encodes its output
+            # with the console code page, so a non-ASCII title is mangled in
+            # the progress lines the html3 job log captures.
+            YTDLP_ENCODING_ARGS[0],
+            YTDLP_ENCODING_ARGS[1],
             "--cookies",
             display_path(COOKIES_FILE),
             "--paths",

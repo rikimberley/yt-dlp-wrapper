@@ -1320,6 +1320,14 @@ run_ytdlp_metadata() {
     esac
   done
   ytdlp_output=""
+  # Force UTF-8 out of yt-dlp. It encodes its output with the locale's
+  # encoding and errors='ignore', so on a non-UTF-8 console non-ASCII titles
+  # come back as legacy bytes or are silently deleted. Harmless on macOS,
+  # where the locale is already UTF-8, but kept here so all three builds
+  # behave identically. Guarded so a caller may still pass its own value.
+  if [[ " $* " != *" --encoding "* ]]; then
+    set -- "$1" --encoding utf-8 "${@:2}"
+  fi
   tmp=$(mktemp "$temporary_directory/yt-dlp-metadata.XXXXXX") || return 1
   if (( show_progress )); then
     "$@" >"$tmp" 2> >(
@@ -3070,7 +3078,9 @@ if [[ -n "$run_url" ]]; then
     printf 'Error: %s does not exist; export YouTube cookies from a browser first\n' "$cookies_file" >&2
     exit 1
   fi
-  run_cmd "$exe" --cookies "$cookies_file" --paths "$output_path" "$run_url"
+  # --encoding utf-8: see run_ytdlp_metadata. yt-dlp otherwise encodes its
+  # progress output with the console's code page, mangling non-ASCII titles.
+  run_cmd "$exe" --encoding utf-8 --cookies "$cookies_file" --paths "$output_path" "$run_url"
 else
   printf 'Error: no URL provided, and %s does not exist or is empty\n' "$url_file" >&2
   exit 1

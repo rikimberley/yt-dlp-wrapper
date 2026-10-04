@@ -105,6 +105,11 @@ $htmlHeartbeatTimeoutSec = 30 * 60
 $downloadProgressStepPercent = 10
 $feedFailureLimit = 3
 $htmlFullScanIntervalMs = 24L * 60L * 60L * 1000L
+# Bumped whenever a change invalidates previously cached scan text. A record
+# stamped lower is force-rescanned once, which is the only way to clear damage
+# that leaves no trace in the data itself. Keep in step with
+# SCAN_ENCODING_VERSION in py/yy.py.
+$scanEncodingVersionCurrent = 1
 $feedFetchFailures = 0
 $skipFeedFetches = $false
 $feedFetchFailed = $false
@@ -847,6 +852,15 @@ function Invoke-YtDlpMetadata {
 
     $exe = Get-YtDlpPath
     if ($exe -eq '') { return @{ Output = @(); ExitCode = 1 } }
+    # Force UTF-8 out of yt-dlp. It encodes its output with the locale's
+    # encoding and errors='ignore', so on a cp932 console a Japanese title
+    # arrives as Shift-JIS bytes and on a cp1252 one every non-ASCII character
+    # is silently deleted -- damage no consumer-side decode can undo. This is
+    # why the earlier PYTHONIOENCODING attempt was useless: yt-dlp's own
+    # preferredencoding() wins over it. Guarded so a caller may override.
+    if ($Arguments -notcontains '--encoding') {
+        $Arguments = @('--encoding', 'utf-8') + $Arguments
+    }
     $token = [guid]::NewGuid().ToString('N')
     $stdout = Join-Path $temporaryDirectory "yt-dlp.$token.stdout"
     $stderr = Join-Path $temporaryDirectory "yt-dlp.$token.stderr"
@@ -1123,6 +1137,22 @@ function Read-HtmlVideoCache {
                 [void][long]::TryParse([string]$record.checked_ms, [ref]$checkedMs)
             }
             if ($checkedMs -gt 0 -and $checkedMs -lt $cutoffMs) { $changed = $true; continue }
+            # Written before yt-dlp was forced to UTF-8, so the titles may be
+            # mojibaked. That cannot be detected by inspecting them: on a
+            # cp1252 console yt-dlp encodes with errors='ignore', which
+            # *deletes* every non-ASCII character instead of leaving a U+FFFD,
+            # so the check below would miss it entirely. Force one rescan.
+            [long]$scanEncodingVersion = 0
+            if ($null -ne $record -and
+                $null -ne $record.PSObject.Properties['scan_encoding_version']) {
+                [void][long]::TryParse(
+                    [string]$record.scan_encoding_version, [ref]$scanEncodingVersion)
+            }
+            if ($null -ne $record -and $scanEncodingVersion -lt $scanEncodingVersionCurrent) {
+                $record | Add-Member -NotePropertyName 'last_full_scan_ms' `
+                    -NotePropertyValue 0 -Force
+                $changed = $true
+            }
             # A real title never contains U+FFFD, so one here proves the row was
             # decoded from the wrong code page. Clearing the full-scan stamp
             # drops the channel out of the feed gate, which would otherwise
@@ -1681,6 +1711,17 @@ function New-VideoHtml {
                 channel_id = [string]$htmlChannelIds[$channel]
                 checked_ms = $cacheCheckedMs
                 last_full_scan_ms = $lastFullScanMs
+                # Only a real scan proves these entries came from a
+                # UTF-8-forced yt-dlp; a cache hit carries the old stamp
+                # forward so it stays eligible for the rescan.
+                scan_encoding_version = $(
+                    if ($fullScanSucceeded) { $scanEncodingVersionCurrent }
+                    elseif ($null -ne $priorRecord -and
+                            $null -ne $priorRecord.PSObject.Properties['scan_encoding_version']) {
+                        [long]$priorRecord.scan_encoding_version
+                    }
+                    else { [long]0 }
+                )
                 feed_newest_ms = $cacheFeedNewestMs
                 entries = $keptEntries
             }
@@ -2536,7 +2577,9 @@ if (-not [string]::IsNullOrEmpty($runUrl)) {
         [Console]::Error.WriteLine("Error: $cookiesFile does not exist; export YouTube cookies from a browser first")
         exit 1
     }
-    Invoke-YCommand $exe --cookies $cookiesFile --paths $OutputPath $runUrl
+    # --encoding utf-8: see Invoke-YtDlpMetadata. Long form is mandatory here
+    # anyway, per the --paths/-P rule.
+    Invoke-YCommand $exe --encoding utf-8 --cookies $cookiesFile --paths $OutputPath $runUrl
 }
 else {
     [Console]::Error.WriteLine("Error: no URL provided, and $urlFile does not exist or is empty")
