@@ -2349,6 +2349,59 @@ def validate_video_selection(item):
     }
 
 
+def find_file_on_path(filename):
+    """Locate an exact filename on PATH, extension included."""
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def resolve_download_hook(name):
+    """Resolve the y1/y2 hook. Returns (argv_prefix, display) or (None, None).
+
+    On Windows the hooks are yy1.ps1 / yy2.ps1 -- that is what the PowerShell
+    build looks for -- and neither half of the obvious approach works:
+
+      * shutil.which(name) cannot find them. On Windows it only matches names
+        whose extension is listed in PATHEXT, and .PS1 is not in the default
+        PATHEXT. Asking it for "yy1.ps1" does not help either: because .ps1 is
+        absent from PATHEXT it appends the PATHEXT entries anyway and looks for
+        "yy1.ps1.EXE" and friends.
+      * Popen([script, ...]) cannot run one even when handed the full path.
+        Windows has no exec handler for .ps1, so it has to go through
+        powershell.exe, exactly as the PowerShell build does.
+
+    The result was that DOWNLOAD SELECTED did nothing on Windows under this
+    build and said so only in the page's status line: submit() returns the
+    "hook was not found" error immediately after loading the download history,
+    so the console shows one "Loaded N downloaded-video record(s)." and stops.
+    """
+    direct = shutil.which(name)
+    if direct:
+        return [direct], direct
+
+    if os.name == "nt":
+        script = find_file_on_path(name + ".ps1")
+        if script:
+            runner = shutil.which("powershell.exe") or "powershell.exe"
+            return (
+                [
+                    runner,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    script,
+                ],
+                script,
+            )
+    return None, None
+
+
 class DownloadJob:
     __slots__ = (
         "target",
@@ -2357,19 +2410,24 @@ class DownloadJob:
         "channel_id",
         "video_id",
         "hook",
+        "argv",
         "state",
         "succeeded",
         "last_percent",
         "last_bucket",
     )
 
-    def __init__(self, item, hook):
+    def __init__(self, item, hook, argv=None):
         self.target = item["target"]
         self.url = item["url"]
         self.path = item["path"]
         self.channel_id = item["channel_id"]
         self.video_id = item["video_id"]
         self.hook = hook
+        # The command to run, without the per-job -p/-t arguments. Normally
+        # just [hook]; on Windows a .ps1 hook carries its powershell.exe
+        # prefix here.
+        self.argv = list(argv) if argv else [hook]
         self.state = "queued"
         self.succeeded = False
         self.last_percent = -1
@@ -2455,10 +2513,21 @@ class JobManager:
                 # accepted and cannot be: this is a child process that never
                 # sources a shell rc, so a hook has to be a real executable.
                 hook_name = "y" + pass_target
-                hook = shutil.which(hook_name)
+                hook_argv, hook = resolve_download_hook(hook_name)
                 if not hook:
-                    return 0, "Local %s hook was not found on PATH" % hook_name
-                queued.append(DownloadJob(item, hook))
+                    looked_for = hook_name
+                    if os.name == "nt":
+                        looked_for = "%s or %s.ps1" % (hook_name, hook_name)
+                    message = "Local %s hook was not found on PATH (looked for %s)" % (
+                        hook_name,
+                        looked_for,
+                    )
+                    # Also say so on the console. Returning only to the page
+                    # left the server printing "Loaded N downloaded-video
+                    # record(s)." and nothing else, which reads as a no-op.
+                    sys.stderr.write("Error: %s\n" % message)
+                    return 0, message
+                queued.append(DownloadJob(item, hook, hook_argv))
 
         with self.lock:
             for job in queued:
@@ -2500,7 +2569,7 @@ class JobManager:
         print("Running: %s -p %s -t %s" % (job.hook, job.path, job.url))
         try:
             process = subprocess.Popen(
-                [job.hook, "-p", job.path, "-t", job.url],
+                job.argv + ["-p", job.path, "-t", job.url],
                 cwd=str(BASE_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
