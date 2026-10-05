@@ -138,10 +138,10 @@ Options:
   -O                  Open every channel in ./channel-ids.txt unconditionally,
                       then exit without downloading.
   --html             Generate a local 6-column video grid with y1/y2
-                      selections and serve it on http://127.0.0.1:8090,
-                      opening a loading shell immediately and streaming one
-                      fragment per channel from a background worker. Scanning
-                      is incremental: a persistent cache means later runs scan
+                      selections and serve it on http://127.0.0.1:8090. A
+                      loading shell opens immediately and a background worker
+                      streams one fragment per channel into it. The scan is
+                      incremental: a persistent cache means later runs scan
                       only a one-day overlap per channel. Already-downloaded
                       video cards are dropped.
   --incognito         With --html, open the page in a Chrome/Chromium
