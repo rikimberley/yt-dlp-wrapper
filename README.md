@@ -52,8 +52,8 @@ re-exporting.
 ## Usage
 
 ```
-./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html] [--incognito] [-c]
-./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py] [-o | -O | --html] [--incognito] [-c]
+./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html] [--incognito] [-c]
+./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [-o | -O | --html] [--incognito] [-c]
 
 # Full usage summary from either wrapper:
 ./yy.zsh --help
@@ -65,21 +65,15 @@ re-exporting.
 | *(no args)* | Re-download the URL in `current_url.txt` |
 | `-t <url>` | Download this URL once, without persisting it |
 | `-U` | Self-update the binary *and* this wrapper from `master`, then exit |
-| `--py` | Switch this directory to the [Python build](#python-build), then exit. Reversible with `--no-py` |
 | `-p <path>` | Download into `<path>` instead of the automatic/default path |
 | `-o` | Open each channel in `channel-ids.txt` that has a public video newer than `checkpoint.txt`, then exit |
 | `-O` | Open every channel unconditionally, then exit |
 | `--html` | Like `-o`, select channels with public videos newer than `checkpoint.txt`, then open a streaming 6-column grid with hover previews and y1/y2 checkboxes in the default browser. A worker writes token-scoped state and per-channel fragments, which the page adds as each channel completes; it omits previously downloaded video cards, prunes their empty channel sections, and restores the Channel IDs table (including latest-video status) when the worker finishes. The scan is incremental: the first scan is cold, while later startups and refreshes scan only a one-day overlap from the last successful check. |
 | `--incognito` | **Requires `--html`.** Open the page in a Chrome/Chromium incognito window. `yy.ps1` reuses an existing Windows Chrome Incognito window; `yy.zsh` also accepts `/Applications/Google Chrome.app` or a Chromium binary on `PATH`. If none is found, fall back to the default browser with a warning. |
-| `--merge-download-action` | **Python build only; requires `--html`.** Run `DOWNLOAD SELECTED` through this wrapper itself instead of external `yy1`/`yy2` hooks, so no hook has to exist on `PATH`. |
 | `-c` | With `-o` or `--html`, write the timestamp captured immediately after channel checks finish; otherwise write the current timestamp, then exit |
-| `--sync` | **Python build only.** Merge this machine's state with a private git repo, write the result back, push it, then exit |
-| `--sync-dry-run` | Show what `--sync` would change, writing and pushing nothing |
-| `--sync-override` | Replace the shared state with this machine's copy, after showing the difference and asking |
-| `--sync-override-local` | The mirror image: replace **this machine's** state with the shared copy, after showing the difference and asking. Fetches read-only — nothing is committed or pushed |
 | `-h`, `--help` | Print the usage summary and exit |
 
-Precedence: `-h`/`--help`, then `--py`, then `-U`, then `-o`/`-O`/`--html`, then `-c`, then download. `-o`,
+Precedence: `-h`/`--help`, then `-U`, then `-o`/`-O`/`--html`, then `-c`, then download. `-o`,
 `-O`, and `--html` are mutually exclusive. `-o` exits non-zero if any channel could not be checked, and
 `-U` exits non-zero if the wrapper could not be refreshed.
 
@@ -143,9 +137,7 @@ the two labels different meanings — point them at this wrapper (optionally
 with different `-p` defaults) to decide where each one downloads. They must be
 real executables on `PATH`; a shell alias will not be found, because the
 wrapper runs non-interactively and never reads your shell startup files. A
-missing hook fails that download request. In the Python build,
-`--merge-download-action` replaces both hooks with the wrapper itself, so
-nothing needs to be installed on `PATH`. Jobs run sequentially: all y2 selections first, then y1 selections.
+missing hook fails that download request. Jobs run sequentially: all y2 selections first, then y1 selections.
 Download output keeps lifecycle messages, warnings, errors, and completion
 lines, while repetitive yt-dlp percentage updates are reduced to one snapshot
 per 10 percentage points for each transferred format. The browser displays the
@@ -213,116 +205,11 @@ retry. The small `-o` fallback also has a 30-second wall-clock deadline. The
 complete `/videos` traversal used by `--html` has no wall-clock deadline because
 large channels can require many continuation pages.
 
-## Python build
-
-`yy.zsh` and `yy.ps1` are two hand-maintained ports of the same tool, which is
-why they can drift. `py/` holds a replacement: one implementation, `yy.py`
-(Python 3.9+, standard library only, no install step), behind a thin launcher
-for each shell that only locates an interpreter and hands off.
-
-It is opt-in and reversible. From a shell-build directory:
-
-```
-./yy.zsh --py      # or: ./yy.ps1 --py
-```
-
-That fetches `py/yy.py`, `py/yy.zsh` and `py/yy.ps1` from `master` and replaces
-`./yy.py`, `./yy.zsh` and `./yy.ps1`. **Both** wrappers are switched, so the
-directory is never half of each build. The previous copies are kept in `.tmp`.
-
-To go back, from the Python build:
-
-```
-./yy.zsh --no-py   # or: ./yy.ps1 --no-py
-```
-
-`--no-py` is handled by `yy.py` itself, so it needs a working Python and a
-working `yy.py`. The shell wrapper is restored and `yy.py` is left on disk,
-unused.
-
-Both directions keep a `.bak` in `.tmp` and refuse to install a payload that
-does not start with the expected shebang, so a captive portal or an error page
-cannot overwrite a working wrapper.
-
-Differences from the shell build, as of now:
-
-- `--sync`, `--sync-dry-run`, `--sync-override`, `--sync-override-local` and
-  `--merge-download-action` are Python-build only.
-- Everything else — downloads, `-o`/`-O`/`-c`, `-U`, the state files — behaves
-  the same and shares the same files on disk, so you can switch back and forth
-  without losing checkpoints, caches or history.
-
-`-U` in the Python build refreshes `yy.py` *and* the launcher beside it, since
-the build is two pieces.
-
-### Sharing state between machines
-
-`--sync` keeps two machines' state in step through a **separate private git
-repo** — not this one. It is Python-build only.
-
-```bash
-./yy.zsh --sync-dry-run   # show what would change, write and push nothing
-./yy.zsh --sync           # merge, write back, push
-```
-
-It syncs `checkpoint.txt`, `channel-ids.txt`, `channel-id-cache.txt`,
-`downloaded-videos.json`, `channel-check-status.json` and `current_url.json`.
-`html-video-cache.json` is skipped because it is a pure cache, and
-**`cookies.txt` is never synced** — it holds live session credentials.
-
-The remote holds one directory per tool, and this wrapper owns `yy/`, so a
-single private repo can carry several tools' state without them colliding.
-Locally the files stay flat beside the wrapper; only the clone side is
-prefixed.
-
-Point it at your own repo with `YY_SYNC_REMOTE`, and override the SSH key with
-`YY_SYNC_SSH_KEY` if it is not `~/.ssh/rikimberley_github_ed25519`. Git over
-SSH is the transport because a private repo cannot be read from the
-unauthenticated URL that `-U` uses.
-
-Every rule merges rather than overwrites, so neither machine can clobber the
-other: the checkpoint takes the newer timestamp, the download history unions
-and keeps the earliest copy of each entry, and the channel list unions. Because
-the rules are order-independent, a push that loses a race is simply re-pulled,
-re-merged and retried.
-
-Two cases need more than a union:
-
-- **Unsubscribing.** A plain union would re-add a removed channel from the
-  other machine forever, so a removal is recorded in `channel-ids-removed.txt`
-  and the handle stays gone until you deliberately add it back.
-- **Expiry.** The 45-day prune is re-applied *after* merging, so an entry this
-  machine has aged out cannot be resurrected by one that has not pruned yet.
-
-### Overriding
-
-`--sync` is a *union*, so by design it can never remove anything. The two
-override modes are the escape hatches, and they are mirror images:
-
-| | Destroys | Touches the remote? |
-|---|---|---|
-| `--sync-override` | the **other** machine's state | yes — commits and pushes |
-| `--sync-override-local` | **this** machine's state | no — fetches read-only |
-
-Both preview the exact difference and ask before doing anything.
-
-`--sync-override` also records the channels it drops, so the other machine
-drops them too — without that it would quietly undo itself on the next sync.
-
-`--sync-override-local` is the one to reach for when this machine's state is
-the wrong one. Note that reverting a bad commit in the state repo is *not*
-enough on its own: the local copy still holds those records, and the next
-`--sync` unions them straight back. Adopting the remote wholesale is the only
-way to actually drop them. It writes the same canonical, expiry-pruned form
-`--sync` computes, so the following sync reports "Everything is already in
-sync" rather than pushing a reformatting commit.
-
 ## Files
 
 | Path | Role |
 |---|---|
 | `yy.zsh` / `yy.ps1` | The wrappers. Behaviourally identical; keep them in sync. |
-| `py/` | The [Python build](#python-build): `yy.py` plus a thin launcher per shell. Opt in with `--py`, back out with `--no-py`. |
 | `channel-ids.txt` | One channel handle (or raw `UC…` id) per line; `#` comments and blank lines ignored *(gitignored)* |
 | `checkpoint.txt` | Epoch timestamp `-o` compares against; missing or empty means "no checkpoint" (0), so every video counts as new *(gitignored)* |
 | `channel-id-cache.txt` | Generated handle → `UC…` cache; safe to delete *(gitignored)* |

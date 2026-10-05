@@ -104,8 +104,7 @@ $feedFailureLimit = 3
 $htmlFullScanIntervalMs = 24L * 60L * 60L * 1000L
 # Bumped whenever a change invalidates previously cached scan text. A record
 # stamped lower is force-rescanned once, which is the only way to clear damage
-# that leaves no trace in the data itself. Keep in step with
-# SCAN_ENCODING_VERSION in py/yy.py.
+# that leaves no trace in the data itself. Keep in step with yy.zsh.
 $scanEncodingVersionCurrent = 1
 # In-memory marker meaning "these cached rows are known-bad, re-fetch the whole
 # window". Deliberately not persisted. Zeroing last_full_scan_ms was tried
@@ -119,7 +118,7 @@ $feedFetchFailed = $false
 $feedFailureCountedForChannel = $false
 # Head of master in the wrapper's own repo, used by -U to refresh this script.
 $scriptRawBase = 'https://raw.githubusercontent.com/rikimberley/yt-dlp-wrapper/master'
-# Loopback port for --html. Keep in sync with yy.zsh and py/yy.py.
+# Loopback port for --html. Keep in sync with yy.zsh.
 $htmlListenPort = 8090
 
 $Url = ''
@@ -127,7 +126,6 @@ $TempUrl = ''
 $OutputPath = './t'
 $OutputPathPassed = $false
 $Update = $false
-$SwitchToPy = $false
 $OpenMode = ''
 $SetCheckpoint = $false
 $htmlFailureCount = 0
@@ -141,7 +139,7 @@ function Write-Usage {
 yy.ps1 - convenience wrapper around ./yt-dlp
 
 Usage:
-  ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
+  ./yy.ps1 [<url>] [-t <temp_url>] [-p <path>] [-U]
            [-o | -O | --html] [--incognito] [-c]
   ./yy.ps1 -h | --help
 
@@ -156,14 +154,6 @@ Options:
   -U                  Update ./yt-dlp and refresh this script from the head of
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
-  --py                Switch this directory to the Python build: fetch
-                      py/yy.py, py/yy.zsh and py/yy.ps1 from master, back up
-                      the current copies into .tmp, and replace ./yy.py,
-                      ./yy.zsh and ./yy.ps1. Both wrappers are switched, not
-                      just this one, so the directory is never half of each
-                      build. Exits without downloading. Takes precedence over
-                      -U, which would otherwise refresh the script this
-                      replaces.
   -o                  Open each channel in ./channel-ids.txt that published a
                       public video after ./checkpoint.txt, then exit without
                       downloading. Exits non-zero if a channel check failed.
@@ -185,7 +175,7 @@ Options:
   -h, --help          Show this help and exit.
 
 -o, -O and --html are mutually exclusive.
-Flag precedence: -h, then --py, then -U, then -o/-O/--html, then -c, then
+Flag precedence: -h, then -U, then -o/-O/--html, then -c, then
 download.
 
 Examples:
@@ -224,9 +214,6 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     }
     elseif ($a -ceq '-U') {
         $Update = $true
-    }
-    elseif ($a -ceq '--py') {
-        $SwitchToPy = $true
     }
     elseif ($a -ceq '-o' -or $a -ceq '-O') {
         if ($OpenMode -ne '') {
@@ -578,14 +565,10 @@ function Get-WebContent {
 # because writing it would leave the machine with no working wrapper at all.
 # Returns $true on success (including "already up to date").
 function Update-Self {
-    param([string]$Name, [string]$Sentinel, [string]$Remote = '')
+    param([string]$Name, [string]$Sentinel)
 
-    # $Remote is the path under master to fetch. It defaults to $Name and
-    # differs only for --py, where the payload for ./yy.ps1 comes from
-    # py/yy.ps1.
-    if ($Remote -eq '') { $Remote = $Name }
-    $uri = "$scriptRawBase/$Remote"
-    $body = Get-WebContent $uri "$Remote from master"
+    $uri = "$scriptRawBase/$Name"
+    $body = Get-WebContent $uri "$Name from master"
     if ($null -eq $body -or $body -eq '') {
         [Console]::Error.WriteLine("Warning: could not refresh $Name from master")
         return $false
@@ -621,8 +604,7 @@ function Update-Self {
         }
         Move-Item -LiteralPath $temp -Destination $target -Force
         # A .zsh wrapper must stay runnable. On Windows this is a no-op, but
-        # --py/--no-py under pwsh on macOS can create a yy.zsh that never
-        # existed here, and it would arrive without its execute bit.
+        # under pwsh on macOS the refreshed file must keep its execute bit.
         if ($Name.EndsWith('.zsh') -and (Get-Command chmod -ErrorAction SilentlyContinue)) {
             & chmod +x $target 2>$null | Out-Null
         }
@@ -2394,44 +2376,6 @@ if (-not [string]::IsNullOrEmpty($TempUrl)) {
 if (-not $OutputPathPassed -and
     $runUrl -match '^https?://(?:[^/]+\.)?youtube\.com/@([^/?#]+)') {
     $OutputPath = './' + $Matches[1]
-}
-
-if ($SwitchToPy) {
-    # The implementation is fetched first and the launchers only if it lands.
-    # The reverse order can leave ./yy.ps1 as a launcher with no ./yy.py beside
-    # it, which is a directory with no working wrapper and no way back.
-    if (-not (Update-Self 'yy.py' '#!/usr/bin/env python3' 'py/yy.py')) {
-        [Console]::Error.WriteLine(
-            'Error: could not fetch py/yy.py; ./yy.ps1 left untouched')
-        exit 1
-    }
-    # Both wrappers are switched, not just the one that is running. A directory
-    # holding a yy.ps1 launcher next to a shell-build yy.zsh is two different
-    # builds sharing one state directory, and whichever wrapper the next run
-    # picks would decide which build it got.
-    #
-    # The *other* wrapper goes first and this one last, so a failure leaves the
-    # wrapper the user just invoked still able to understand --py and retry.
-    # The reverse order replaces ./yy.ps1 with a launcher that rejects --py,
-    # and the only way forward would be the other wrapper or a manual download.
-    if (-not (Update-Self 'yy.zsh' '#!/bin/zsh' 'py/yy.zsh')) {
-        [Console]::Error.WriteLine(
-            'Error: could not fetch py/yy.zsh; ./yy.py was replaced but both')
-        [Console]::Error.WriteLine(
-            '       wrappers are still the shell build. Re-run --py.')
-        exit 1
-    }
-    if (-not (Update-Self 'yy.ps1' '#!/usr/bin/env pwsh' 'py/yy.ps1')) {
-        [Console]::Error.WriteLine(
-            'Error: could not fetch py/yy.ps1; ./yy.py and ./yy.zsh are now the')
-        [Console]::Error.WriteLine(
-            '       Python build but ./yy.ps1 is still the shell build.')
-        [Console]::Error.WriteLine(
-            '       Re-run --py; what already landed is left alone.')
-        exit 1
-    }
-    Write-Host 'Switched to the Python build. Previous copies are in .tmp.'
-    exit 0
 }
 
 if ($Update) {

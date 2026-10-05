@@ -102,7 +102,6 @@ temp_url=""
 output_path="./t"
 output_path_passed=0
 do_update=0
-switch_to_py=0
 open_mode=""
 # zsh does not expand $'\t' inside an array subscript; use this when building keys.
 tab_char=$'\t'
@@ -118,7 +117,7 @@ print_usage() {
 yy.zsh - convenience wrapper around ./yt-dlp
 
 Usage:
-  ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U] [--py]
+  ./yy.zsh [<url>] [-t <temp_url>] [-p <path>] [-U]
            [-o | -O | --html] [--incognito] [-c]
   ./yy.zsh -h | --help
 
@@ -133,14 +132,6 @@ Options:
   -U                  Update ./yt-dlp and refresh this script from the head of
                       master on GitHub, then exit without downloading.
                       Exits non-zero if the refresh failed.
-  --py                Switch this directory to the Python build: fetch
-                      py/yy.py, py/yy.zsh and py/yy.ps1 from master, back up
-                      the current copies into .tmp, and replace ./yy.py,
-                      ./yy.zsh and ./yy.ps1. Both wrappers are switched, not
-                      just this one, so the directory is never half of each
-                      build. Exits without downloading. Takes precedence over
-                      -U, which would otherwise refresh the script this
-                      replaces.
   -o                  Open each channel in ./channel-ids.txt that published a
                       public video after ./checkpoint.txt, then exit without
                       downloading. Exits non-zero if a channel check failed.
@@ -162,7 +153,7 @@ Options:
   -h, --help          Show this help and exit.
 
 -o, -O and --html are mutually exclusive.
-Flag precedence: -h, then --py, then -U, then -o/-O/--html, then -c, then
+Flag precedence: -h, then -U, then -o/-O/--html, then -c, then
 download.
 
 Examples:
@@ -200,9 +191,6 @@ while (( $# > 0 )); do
       ;;
     -U)
       do_update=1
-      ;;
-    --py)
-      switch_to_py=1
       ;;
     -o|-O)
       if [[ -n "$open_mode" ]]; then
@@ -1196,13 +1184,11 @@ fetch_urls_concurrent() {
 # living outside a git clone (the Windows box) still tracks the repo. $2 is the
 # first line the payload must start with; anything else is assumed to be an
 # error page or a captive-portal interstitial and is refused, because writing it
-# would leave the machine with no working wrapper at all. $3 is the path under
-# master to fetch, which defaults to $1 and differs only for --py, where the
-# payload for ./yy.zsh comes from py/yy.zsh.
+# would leave the machine with no working wrapper at all.
 update_self() {
-  local name=$1 sentinel=$2 remote=${3:-$1} url body tmp
-  url="${script_raw_base}/${remote}"
-  body=$(fetch_url "$url" "${remote} from master") || {
+  local name=$1 sentinel=$2 url body tmp
+  url="${script_raw_base}/${name}"
+  body=$(fetch_url "$url" "${name} from master") || {
     printf 'Warning: could not refresh %s from master\n' "$name" >&2
     return 1
   }
@@ -1218,9 +1204,8 @@ update_self() {
   # Keep update scratch files and the recoverable previous copy under ./.tmp.
   tmp="$temporary_directory/${name}.new.$$"
   print -r -- "$body" > "$tmp" || return 1
-  # A .zsh wrapper is always made executable: --py and --no-py can create one
-  # in a directory that never had it, and -x on the absent target would leave
-  # the new file unrunnable.
+  # A .zsh wrapper is always made executable, because -x on an absent target
+  # would leave the new file unrunnable.
   if [[ -x "./$name" || "$name" == *.zsh ]]; then chmod +x "$tmp" || true; fi
   [[ -f "./$name" ]] && { cp -p -- "./$name" "$temporary_directory/${name}.bak" || true }
   mv -f -- "$tmp" "./$name" || return 1
@@ -2829,38 +2814,6 @@ run_url=$current_url
 
 if (( ! output_path_passed )) && [[ "$run_url" =~ '^https?://([^/]+\.)?youtube\.com/@([^/?#]+)' ]]; then
   output_path="./${match[2]}"
-fi
-
-if (( switch_to_py )); then
-  # The implementation is fetched first and the launchers only if it lands.
-  # The reverse order can leave ./yy.zsh as a launcher with no ./yy.py beside
-  # it, which is a directory with no working wrapper and no way back.
-  if ! update_self 'yy.py' '#!/usr/bin/env python3' 'py/yy.py'; then
-    printf 'Error: could not fetch py/yy.py; ./yy.zsh left untouched\n' >&2
-    exit 1
-  fi
-  # Both wrappers are switched, not just the one that is running. A directory
-  # holding a yy.zsh launcher next to a shell-build yy.ps1 is two different
-  # builds sharing one state directory, and whichever wrapper the next run
-  # picks would decide which build it got.
-  #
-  # The *other* wrapper goes first and this one last, so a failure leaves the
-  # wrapper the user just invoked still able to understand --py and retry. The
-  # reverse order replaces ./yy.zsh with a launcher that rejects --py, and the
-  # only way forward would be the other wrapper or a manual download.
-  if ! update_self 'yy.ps1' '#!/usr/bin/env pwsh' 'py/yy.ps1'; then
-    printf 'Error: could not fetch py/yy.ps1; ./yy.py was replaced but both\n' >&2
-    printf '       wrappers are still the shell build. Re-run --py.\n' >&2
-    exit 1
-  fi
-  if ! update_self 'yy.zsh' '#!/bin/zsh' 'py/yy.zsh'; then
-    printf 'Error: could not fetch py/yy.zsh; ./yy.py and ./yy.ps1 are now the\n' >&2
-    printf '       Python build but ./yy.zsh is still the shell build.\n' >&2
-    printf '       Re-run --py; what already landed is left alone.\n' >&2
-    exit 1
-  fi
-  printf 'Switched to the Python build. Previous copies are in .tmp.\n'
-  exit 0
 fi
 
 if (( do_update )); then
